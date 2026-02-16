@@ -25,6 +25,7 @@
 package io.questdb.cutlass.pgwire;
 
 import io.questdb.FactoryProvider;
+import io.questdb.ServerTlsConfiguration;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreakerConfiguration;
 import io.questdb.mp.WorkerPoolConfiguration;
 import io.questdb.network.IODispatcherConfiguration;
@@ -86,6 +87,10 @@ public interface PGConfiguration extends IODispatcherConfiguration, WorkerPoolCo
     String getReadOnlyPassword();
 
     String getReadOnlyUsername();
+
+    default ServerTlsConfiguration getServerTlsConfiguration() {
+        return null;
+    }
 
     String getServerVersion();
 

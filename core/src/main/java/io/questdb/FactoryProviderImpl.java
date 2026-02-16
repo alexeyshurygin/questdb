@@ -51,12 +51,16 @@ import io.questdb.cutlass.pgwire.DefaultPGAuthenticatorFactory;
 import io.questdb.cutlass.pgwire.PGAuthenticatorFactory;
 import io.questdb.cutlass.pgwire.PGConfiguration;
 import io.questdb.cutlass.pgwire.ReadOnlyUsersAwareSecurityContextFactory;
+import io.questdb.cairo.CairoException;
+import io.questdb.network.JavaTlsServerSocketFactory;
+import io.questdb.network.PemReader;
 import io.questdb.network.PlainSocketFactory;
 import io.questdb.network.SocketFactory;
 import io.questdb.std.CharSequenceObjHashMap;
 import io.questdb.std.Chars;
 import org.jetbrains.annotations.NotNull;
 
+import javax.net.ssl.SSLContext;
 import java.io.File;
 import java.security.PublicKey;
 
@@ -64,9 +68,13 @@ public class FactoryProviderImpl implements FactoryProvider {
     private final DefaultWalJobFactory defaultWalJobFactory = new DefaultWalJobFactory();
     private final HttpAuthenticatorFactory httpAuthenticatorFactory;
     private final HttpCookieHandler httpCookieHandler;
+    private final SocketFactory httpMinSocketFactory;
     private final HttpSessionStore httpSessionStore;
+    private final SocketFactory httpSocketFactory;
     private final LineAuthenticatorFactory lineAuthenticatorFactory;
+    private final SocketFactory lineSocketFactory;
     private final PGAuthenticatorFactory pgAuthenticatorFactory;
+    private final SocketFactory pgWireSocketFactory;
     private final SecurityContextFactory securityContextFactory;
 
     public FactoryProviderImpl(ServerConfiguration configuration) {
@@ -76,6 +84,18 @@ public class FactoryProviderImpl implements FactoryProvider {
         securityContextFactory = getSecurityContextFactory(configuration);
         pgAuthenticatorFactory = new DefaultPGAuthenticatorFactory(configuration);
         httpAuthenticatorFactory = getHttpAuthenticatorFactory(configuration);
+        httpSocketFactory = createSocketFactory(
+                configuration.getHttpServerConfiguration().getServerTlsConfiguration()
+        );
+        httpMinSocketFactory = createSocketFactory(
+                configuration.getHttpMinServerConfiguration().getServerTlsConfiguration()
+        );
+        lineSocketFactory = createSocketFactory(
+                configuration.getLineTcpReceiverConfiguration().getServerTlsConfiguration()
+        );
+        pgWireSocketFactory = createSocketFactory(
+                configuration.getPGWireConfiguration().getServerTlsConfiguration()
+        );
     }
 
     public static LineAuthenticatorFactory getLineAuthenticatorFactory(ServerConfiguration configuration) {
@@ -110,7 +130,7 @@ public class FactoryProviderImpl implements FactoryProvider {
 
     @Override
     public @NotNull SocketFactory getHttpMinSocketFactory() {
-        return PlainSocketFactory.INSTANCE;
+        return httpMinSocketFactory;
     }
 
     @Override
@@ -120,7 +140,7 @@ public class FactoryProviderImpl implements FactoryProvider {
 
     @Override
     public @NotNull SocketFactory getHttpSocketFactory() {
-        return PlainSocketFactory.INSTANCE;
+        return httpSocketFactory;
     }
 
     @Override
@@ -130,12 +150,12 @@ public class FactoryProviderImpl implements FactoryProvider {
 
     @Override
     public @NotNull SocketFactory getLineSocketFactory() {
-        return PlainSocketFactory.INSTANCE;
+        return lineSocketFactory;
     }
 
     @Override
     public @NotNull SocketFactory getPGWireSocketFactory() {
-        return PlainSocketFactory.INSTANCE;
+        return pgWireSocketFactory;
     }
 
     @Override
@@ -156,6 +176,18 @@ public class FactoryProviderImpl implements FactoryProvider {
     @Override
     public @NotNull TickCalendarServiceFactory getTickCalendarServiceFactory() {
         return DefaultTickCalendarServiceFactory.INSTANCE;
+    }
+
+    private static SocketFactory createSocketFactory(ServerTlsConfiguration tls) {
+        if (tls == null || !tls.isEnabled()) {
+            return PlainSocketFactory.INSTANCE;
+        }
+        try {
+            final var ctx = PemReader.createServerSslContext(tls.getCertPath(), tls.getPrivateKeyPath());
+            return new JavaTlsServerSocketFactory(ctx);
+        } catch (Exception e) {
+            throw CairoException.critical(0).put("failed to initialize TLS: ").put(e.getMessage());
+        }
     }
 
     private static HttpAuthenticatorFactory getHttpAuthenticatorFactory(ServerConfiguration configuration) {

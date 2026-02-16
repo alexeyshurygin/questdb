@@ -518,6 +518,11 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final long telemetryDbSizeEstimateTimeout;
     private final boolean telemetryDisableCompletely;
     private final CharSequence tempRenamePendingTablePrefix;
+    private final ServerTlsConfiguration globalTlsConfig;
+    private final ServerTlsConfiguration httpMinTlsConfig;
+    private final ServerTlsConfiguration httpTlsConfig;
+    private final ServerTlsConfiguration lineTcpTlsConfig;
+    private final ServerTlsConfiguration pgTlsConfig;
     private final int textAnalysisMaxLines;
     private final TextConfiguration textConfiguration = new PropTextConfiguration();
     private final int textLexerStringPoolCapacity;
@@ -1951,6 +1956,32 @@ public class PropServerConfiguration implements ServerConfiguration {
             this.buildInformation = buildInformation;
             this.binaryEncodingMaxLength = getInt(properties, env, PropertyKey.BINARYDATA_ENCODING_MAXLENGTH, 32768);
         }
+        this.globalTlsConfig = parseTlsConfig(
+                properties, env, installRoot,
+                PropertyKey.TLS_ENABLED, PropertyKey.TLS_CERT_PATH, PropertyKey.TLS_PRIVATE_KEY_PATH,
+                ServerTlsConfiguration.DISABLED
+        );
+        this.httpTlsConfig = parseTlsConfig(
+                properties, env, installRoot,
+                PropertyKey.HTTP_TLS_ENABLED, PropertyKey.HTTP_TLS_CERT_PATH, PropertyKey.HTTP_TLS_PRIVATE_KEY_PATH,
+                globalTlsConfig
+        );
+        this.httpMinTlsConfig = parseTlsConfig(
+                properties, env, installRoot,
+                PropertyKey.HTTP_MIN_TLS_ENABLED, PropertyKey.HTTP_MIN_TLS_CERT_PATH, PropertyKey.HTTP_MIN_TLS_PRIVATE_KEY_PATH,
+                globalTlsConfig
+        );
+        this.lineTcpTlsConfig = parseTlsConfig(
+                properties, env, installRoot,
+                PropertyKey.LINE_TCP_TLS_ENABLED, PropertyKey.LINE_TCP_TLS_CERT_PATH, PropertyKey.LINE_TCP_TLS_PRIVATE_KEY_PATH,
+                globalTlsConfig
+        );
+        this.pgTlsConfig = parseTlsConfig(
+                properties, env, installRoot,
+                PropertyKey.PG_TLS_ENABLED, PropertyKey.PG_TLS_CERT_PATH, PropertyKey.PG_TLS_PRIVATE_KEY_PATH,
+                globalTlsConfig
+        );
+
         this.ilpProtoTransports = initIlpTransport();
         this.acceptingWrites = initAcceptingWrites();
         this.allowTableRegistrySharedWrite = getBoolean(properties, env, PropertyKey.DEBUG_ALLOW_TABLE_REGISTRY_SHARED_WRITE, false);
@@ -2243,20 +2274,19 @@ public class PropServerConfiguration implements ServerConfiguration {
         return SqlJitMode.JIT_MODE_ENABLED;
     }
 
-    // The enterprise version needs to add tcps and https
     private String initIlpTransport() {
         StringSink sink = Misc.getThreadLocalSink();
         sink.put('[');
         boolean addComma = false;
         if (lineTcpEnabled) {
             addComma = true;
-            sink.put("\"tcp\"");
+            sink.put(lineTcpTlsConfig.isEnabled() ? "\"tcps\"" : "\"tcp\"");
         }
         if (lineHttpEnabled && httpServerEnabled) {
             if (addComma) {
                 sink.put(", ");
             }
-            sink.put("\"http\"");
+            sink.put(httpTlsConfig.isEnabled() ? "\"https\"" : "\"http\"");
             addComma = true;
         }
         if (lineUdpEnabled) {
@@ -2267,6 +2297,57 @@ public class PropServerConfiguration implements ServerConfiguration {
         }
         sink.put(']');
         return sink.toString();
+    }
+
+    private ServerTlsConfiguration parseTlsConfig(
+            Properties properties,
+            @Nullable Map<String, String> env,
+            String rootDir,
+            ConfigPropertyKey enabledKey,
+            ConfigPropertyKey certKey,
+            ConfigPropertyKey keyKey,
+            ServerTlsConfiguration fallback
+    ) throws ServerConfigurationException {
+        final var enabledStr = getString(properties, env, enabledKey, null);
+        final var enabled = enabledStr != null
+                ? Boolean.parseBoolean(enabledStr)
+                : fallback.isEnabled();
+        var certPath = getString(properties, env, certKey, fallback.getCertPath());
+        var keyPath = getString(properties, env, keyKey, fallback.getPrivateKeyPath());
+        if (!enabled) {
+            return new ServerTlsConfiguration(false, certPath, keyPath);
+        }
+        if (certPath == null || certPath.isEmpty()) {
+            throw new ServerConfigurationException(
+                    "TLS enabled but certificate path is not set [key=" + certKey.getPropertyPath() + "]"
+            );
+        }
+        if (keyPath == null || keyPath.isEmpty()) {
+            throw new ServerConfigurationException(
+                    "TLS enabled but private key path is not set [key=" + keyKey.getPropertyPath() + "]"
+            );
+        }
+        var certFile = new File(certPath);
+        if (!certFile.isAbsolute()) {
+            certFile = new File(rootDir, certPath);
+        }
+        certPath = certFile.getAbsolutePath();
+        var keyFile = new File(keyPath);
+        if (!keyFile.isAbsolute()) {
+            keyFile = new File(rootDir, keyPath);
+        }
+        keyPath = keyFile.getAbsolutePath();
+        if (!certFile.exists() || !certFile.canRead()) {
+            throw new ServerConfigurationException(
+                    "TLS certificate file not found or not readable [path=" + certPath + "]"
+            );
+        }
+        if (!keyFile.exists() || !keyFile.canRead()) {
+            throw new ServerConfigurationException(
+                    "TLS private key file not found or not readable [path=" + keyPath + "]"
+            );
+        }
+        return new ServerTlsConfiguration(true, certPath, keyPath);
     }
 
     private boolean pathEquals(String p1, String p2) {
@@ -4869,6 +4950,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         }
 
         @Override
+        public ServerTlsConfiguration getServerTlsConfiguration() {
+            return httpMinTlsConfig;
+        }
+
+        @Override
         public SelectFacade getSelectFacade() {
             return SelectFacadeImpl.INSTANCE;
         }
@@ -5129,6 +5215,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public byte getRequiredAuthType() {
             return httpHealthCheckAuthType;
+        }
+
+        @Override
+        public ServerTlsConfiguration getServerTlsConfiguration() {
+            return httpTlsConfig;
         }
 
         @Override
@@ -5608,6 +5699,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public SelectFacade getSelectFacade() {
             return SelectFacadeImpl.INSTANCE;
+        }
+
+        @Override
+        public ServerTlsConfiguration getServerTlsConfiguration() {
+            return lineTcpTlsConfig;
         }
 
         @Override
@@ -6100,6 +6196,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public int getSendBufferSize() {
             return pgSendBufferSize;
+        }
+
+        @Override
+        public ServerTlsConfiguration getServerTlsConfiguration() {
+            return pgTlsConfig;
         }
 
         @Override

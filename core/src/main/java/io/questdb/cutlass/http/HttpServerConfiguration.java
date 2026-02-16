@@ -25,6 +25,7 @@
 package io.questdb.cutlass.http;
 
 import io.questdb.FactoryProvider;
+import io.questdb.ServerTlsConfiguration;
 import io.questdb.mp.WorkerPoolConfiguration;
 import io.questdb.network.IODispatcherConfiguration;
 import io.questdb.std.ObjHashSet;
@@ -48,6 +49,10 @@ public interface HttpServerConfiguration extends IODispatcherConfiguration, Work
     HttpContextConfiguration getHttpContextConfiguration();
 
     byte getRequiredAuthType();
+
+    default ServerTlsConfiguration getServerTlsConfiguration() {
+        return null;
+    }
 
     WaitProcessorConfiguration getWaitProcessorConfiguration();
 

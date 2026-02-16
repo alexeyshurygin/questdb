@@ -26,6 +26,7 @@ package io.questdb.cutlass.line.tcp;
 
 import io.questdb.FactoryProvider;
 import io.questdb.Metrics;
+import io.questdb.ServerTlsConfiguration;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.mp.WorkerPoolConfiguration;
 import io.questdb.network.IODispatcherConfiguration;
@@ -89,6 +90,10 @@ public interface LineTcpReceiverConfiguration extends IODispatcherConfiguration 
     NetworkFacade getNetworkFacade();
 
     WorkerPoolConfiguration getNetworkWorkerPoolConfiguration();
+
+    default ServerTlsConfiguration getServerTlsConfiguration() {
+        return null;
+    }
 
     long getSymbolCacheWaitBeforeReload();
 
