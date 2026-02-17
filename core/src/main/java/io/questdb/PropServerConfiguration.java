@@ -243,6 +243,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final PropHttpConcurrentCacheConfiguration httpMinConcurrentCacheConfiguration = new PropHttpConcurrentCacheConfiguration();
     private final PropHttpContextConfiguration httpMinContextConfiguration;
     private final boolean httpMinServerEnabled;
+    private final ServerTlsConfiguration httpMinServerTlsConfiguration;
     private final long httpNetAcceptLoopTimeout;
     private final boolean httpNetConnectionHint;
     private final String httpPassword;
@@ -250,6 +251,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final long httpRecvMaxBufferSize;
     private final int httpSendBufferSize;
     private final boolean httpServerEnabled;
+    private final ServerTlsConfiguration httpServerTlsConfiguration;
     private final boolean httpSettingsReadOnly;
     private final int httpSqlCacheBlockCount;
     private final boolean httpSqlCacheEnabled;
@@ -292,6 +294,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final LineHttpProcessorConfiguration lineHttpProcessorConfiguration = new PropLineHttpProcessorConfiguration();
     private final String lineTcpAuthDB;
     private final boolean lineTcpEnabled;
+    private final ServerTlsConfiguration lineTcpTlsConfiguration;
     private final WorkerPoolConfiguration lineTcpIOWorkerPoolConfiguration = new PropLineTcpIOWorkerPoolConfiguration();
     private final LineTcpReceiverConfiguration lineTcpReceiverConfiguration = new PropLineTcpReceiverConfiguration();
     private final WorkerPoolConfiguration lineTcpWriterWorkerPoolConfiguration = new PropLineTcpWriterWorkerPoolConfiguration();
@@ -383,6 +386,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final int partitionEncoderParquetVersion;
     private final PGConfiguration pgConfiguration = new PropPGConfiguration();
     private final boolean pgEnabled;
+    private final ServerTlsConfiguration pgWireTlsConfiguration;
     private final PropPGWireConcurrentCacheConfiguration pgWireConcurrentCacheConfiguration = new PropPGWireConcurrentCacheConfiguration();
     private final int poolSegmentSize;
     private final String posthogApiKey;
@@ -392,6 +396,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final PublicPassthroughConfiguration publicPassthroughConfiguration = new PropPublicPassthroughConfiguration();
     private final int queryCacheEventQueueCapacity;
     private final boolean queryWithinLatestByOptimisationEnabled;
+    private final ServerTlsConfiguration tlsConfiguration;
     private final int readerPoolMaxSegments;
     private final int recentWriteTrackerCapacity;
     private final Utf8SequenceObjHashMap<Utf8Sequence> redirectMap;
@@ -1833,6 +1838,53 @@ public class PropServerConfiguration implements ServerConfiguration {
                 }
             }
 
+            final String rootDir = resolveRootDir(dbRoot);
+            this.tlsConfiguration = parseTlsConfiguration(
+                    properties,
+                    env,
+                    PropertyKey.TLS_ENABLED,
+                    PropertyKey.TLS_CERT_PATH,
+                    PropertyKey.TLS_PRIVATE_KEY_PATH,
+                    ServerTlsConfiguration.DISABLED,
+                    rootDir
+            );
+            this.httpServerTlsConfiguration = parseTlsConfiguration(
+                    properties,
+                    env,
+                    PropertyKey.HTTP_TLS_ENABLED,
+                    PropertyKey.HTTP_TLS_CERT_PATH,
+                    PropertyKey.HTTP_TLS_PRIVATE_KEY_PATH,
+                    tlsConfiguration,
+                    rootDir
+            );
+            this.httpMinServerTlsConfiguration = parseTlsConfiguration(
+                    properties,
+                    env,
+                    PropertyKey.HTTP_MIN_TLS_ENABLED,
+                    PropertyKey.HTTP_MIN_TLS_CERT_PATH,
+                    PropertyKey.HTTP_MIN_TLS_PRIVATE_KEY_PATH,
+                    tlsConfiguration,
+                    rootDir
+            );
+            this.lineTcpTlsConfiguration = parseTlsConfiguration(
+                    properties,
+                    env,
+                    PropertyKey.LINE_TCP_TLS_ENABLED,
+                    PropertyKey.LINE_TCP_TLS_CERT_PATH,
+                    PropertyKey.LINE_TCP_TLS_PRIVATE_KEY_PATH,
+                    tlsConfiguration,
+                    rootDir
+            );
+            this.pgWireTlsConfiguration = parseTlsConfiguration(
+                    properties,
+                    env,
+                    PropertyKey.PG_TLS_ENABLED,
+                    PropertyKey.PG_TLS_CERT_PATH,
+                    PropertyKey.PG_TLS_PRIVATE_KEY_PATH,
+                    tlsConfiguration,
+                    rootDir
+            );
+
             this.ilpAutoCreateNewColumns = getBoolean(properties, env, PropertyKey.LINE_AUTO_CREATE_NEW_COLUMNS, true);
             this.ilpAutoCreateNewTables = getBoolean(properties, env, PropertyKey.LINE_AUTO_CREATE_NEW_TABLES, true);
 
@@ -2243,20 +2295,105 @@ public class PropServerConfiguration implements ServerConfiguration {
         return SqlJitMode.JIT_MODE_ENABLED;
     }
 
-    // The enterprise version needs to add tcps and https
+    private ServerTlsConfiguration parseTlsConfiguration(
+            Properties properties,
+            @Nullable Map<String, String> env,
+            PropertyKey enabledPropertyKey,
+            PropertyKey certPathPropertyKey,
+            PropertyKey privateKeyPathPropertyKey,
+            ServerTlsConfiguration inheritedConfiguration,
+            String rootDir
+    ) throws ServerConfigurationException {
+        final boolean enabled = getBoolean(properties, env, enabledPropertyKey, inheritedConfiguration.isEnabled());
+        final String certPath = resolveTlsPath(
+                getString(properties, env, certPathPropertyKey, inheritedConfiguration.getCertPath()),
+                rootDir
+        );
+        final String privateKeyPath = resolveTlsPath(
+                getString(properties, env, privateKeyPathPropertyKey, inheritedConfiguration.getPrivateKeyPath()),
+                rootDir
+        );
+        final ServerTlsConfiguration tlsConfiguration = new ServerTlsConfiguration(enabled, certPath, privateKeyPath);
+        validateTlsConfiguration(tlsConfiguration, enabledPropertyKey, certPathPropertyKey, privateKeyPathPropertyKey);
+        return tlsConfiguration;
+    }
+
+    private String resolveRootDir(String dbRoot) {
+        File absoluteDbRoot = new File(dbRoot).getAbsoluteFile();
+        File rootDir = absoluteDbRoot.getParentFile();
+        return rootDir != null ? rootDir.getAbsolutePath() : absoluteDbRoot.getAbsolutePath();
+    }
+
+    private String resolveTlsPath(String path, String rootDir) {
+        if (path == null || path.isEmpty()) {
+            return path;
+        }
+        File file = new File(path);
+        if (file.isAbsolute()) {
+            return file.getAbsolutePath();
+        }
+        return new File(rootDir, path).getAbsolutePath();
+    }
+
+    private void validateTlsConfiguration(
+            ServerTlsConfiguration tlsConfiguration,
+            PropertyKey enabledPropertyKey,
+            PropertyKey certPathPropertyKey,
+            PropertyKey privateKeyPathPropertyKey
+    ) throws ServerConfigurationException {
+        if (!tlsConfiguration.isEnabled()) {
+            return;
+        }
+
+        final String certPath = tlsConfiguration.getCertPath();
+        final String privateKeyPath = tlsConfiguration.getPrivateKeyPath();
+        if (certPath == null || certPath.isEmpty()) {
+            throw new ServerConfigurationException(
+                    certPathPropertyKey.getPropertyPath() + " must be configured when " + enabledPropertyKey.getPropertyPath() + "=true"
+            );
+        }
+        if (privateKeyPath == null || privateKeyPath.isEmpty()) {
+            throw new ServerConfigurationException(
+                    privateKeyPathPropertyKey.getPropertyPath() + " must be configured when " + enabledPropertyKey.getPropertyPath() + "=true"
+            );
+        }
+
+        validateTlsFile(certPathPropertyKey, certPath);
+        validateTlsFile(privateKeyPathPropertyKey, privateKeyPath);
+    }
+
+    private void validateTlsFile(PropertyKey key, String path) throws ServerConfigurationException {
+        final File file = new File(path);
+        if (!file.exists()) {
+            throw new ServerConfigurationException(
+                    key.getPropertyPath() + " does not exist [path=" + file.getAbsolutePath() + "]"
+            );
+        }
+        if (!file.isFile()) {
+            throw new ServerConfigurationException(
+                    key.getPropertyPath() + " is not a regular file [path=" + file.getAbsolutePath() + "]"
+            );
+        }
+        if (!file.canRead()) {
+            throw new ServerConfigurationException(
+                    key.getPropertyPath() + " is not readable [path=" + file.getAbsolutePath() + "]"
+            );
+        }
+    }
+
     private String initIlpTransport() {
         StringSink sink = Misc.getThreadLocalSink();
         sink.put('[');
         boolean addComma = false;
         if (lineTcpEnabled) {
             addComma = true;
-            sink.put("\"tcp\"");
+            sink.put(lineTcpTlsConfiguration.isEnabled() ? "\"tcps\"" : "\"tcp\"");
         }
         if (lineHttpEnabled && httpServerEnabled) {
             if (addComma) {
                 sink.put(", ");
             }
-            sink.put("\"http\"");
+            sink.put(httpServerTlsConfiguration.isEnabled() ? "\"https\"" : "\"http\"");
             addComma = true;
         }
         if (lineUdpEnabled) {
@@ -4814,6 +4951,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         }
 
         @Override
+        public ServerTlsConfiguration getServerTlsConfiguration() {
+            return httpMinServerTlsConfiguration;
+        }
+
+        @Override
         public KqueueFacade getKqueueFacade() {
             return KqueueFacadeImpl.INSTANCE;
         }
@@ -5059,6 +5201,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public HttpContextConfiguration getHttpContextConfiguration() {
             return httpContextConfiguration;
+        }
+
+        @Override
+        public ServerTlsConfiguration getServerTlsConfiguration() {
+            return httpServerTlsConfiguration;
         }
 
         @Override
@@ -5596,6 +5743,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         }
 
         @Override
+        public ServerTlsConfiguration getServerTlsConfiguration() {
+            return lineTcpTlsConfiguration;
+        }
+
+        @Override
         public long getQueueTimeout() {
             return lineTcpNetConnectionQueueTimeout;
         }
@@ -5970,6 +6122,11 @@ public class PropServerConfiguration implements ServerConfiguration {
         @Override
         public FactoryProvider getFactoryProvider() {
             return factoryProvider;
+        }
+
+        @Override
+        public ServerTlsConfiguration getServerTlsConfiguration() {
+            return pgWireTlsConfiguration;
         }
 
         @Override

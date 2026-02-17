@@ -26,6 +26,7 @@ package io.questdb.cutlass.pgwire;
 
 import io.questdb.FactoryProvider;
 import io.questdb.Metrics;
+import io.questdb.ServerTlsConfiguration;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreakerConfiguration;
 import io.questdb.metrics.Counter;
 import io.questdb.metrics.LongGauge;
@@ -142,6 +143,11 @@ public class PGConfigurationWrapper implements PGConfiguration {
     @Override
     public FactoryProvider getFactoryProvider() {
         return getDelegate().getFactoryProvider();
+    }
+
+    @Override
+    public ServerTlsConfiguration getServerTlsConfiguration() {
+        return getDelegate().getServerTlsConfiguration();
     }
 
     @Override

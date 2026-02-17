@@ -26,6 +26,7 @@ package io.questdb.cutlass.http;
 
 import io.questdb.FactoryProvider;
 import io.questdb.Metrics;
+import io.questdb.ServerTlsConfiguration;
 import io.questdb.cutlass.http.processors.JsonQueryProcessorConfiguration;
 import io.questdb.cutlass.http.processors.LineHttpProcessorConfiguration;
 import io.questdb.cutlass.http.processors.StaticContentProcessorConfiguration;
@@ -148,6 +149,11 @@ public class HttpServerConfigurationWrapper implements HttpFullFatServerConfigur
     @Override
     public FactoryProvider getFactoryProvider() {
         return getDelegate().getFactoryProvider();
+    }
+
+    @Override
+    public ServerTlsConfiguration getServerTlsConfiguration() {
+        return getDelegate().getServerTlsConfiguration();
     }
 
     @Override

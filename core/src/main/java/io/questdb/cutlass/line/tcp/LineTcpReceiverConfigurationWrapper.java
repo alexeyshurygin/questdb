@@ -26,6 +26,7 @@ package io.questdb.cutlass.line.tcp;
 
 import io.questdb.FactoryProvider;
 import io.questdb.Metrics;
+import io.questdb.ServerTlsConfiguration;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.metrics.Counter;
 import io.questdb.metrics.LongGauge;
@@ -257,6 +258,11 @@ public class LineTcpReceiverConfigurationWrapper implements LineTcpReceiverConfi
     @Override
     public WorkerPoolConfiguration getNetworkWorkerPoolConfiguration() {
         return getDelegate().getNetworkWorkerPoolConfiguration();
+    }
+
+    @Override
+    public ServerTlsConfiguration getServerTlsConfiguration() {
+        return getDelegate().getServerTlsConfiguration();
     }
 
     @Override

@@ -732,6 +732,9 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "circuit.breaker.buffer.size\tQDB_CIRCUIT_BREAKER_BUFFER_SIZE\t64\tdefault\tfalse\tfalse\n" +
                                     "circuit.breaker.throttle\tQDB_CIRCUIT_BREAKER_THROTTLE\t2000000\tdefault\tfalse\tfalse\n" +
                                     "config.reload.enabled\tQDB_CONFIG_RELOAD_ENABLED\ttrue\tdefault\tfalse\tfalse\n" +
+                                    "tls.enabled\tQDB_TLS_ENABLED\tfalse\tdefault\tfalse\tfalse\n" +
+                                    "tls.cert.path\tQDB_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "tls.private.key.path\tQDB_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
                                     "config.validation.strict\tQDB_CONFIG_VALIDATION_STRICT\tfalse\tdefault\tfalse\tfalse\n" +
                                     "http.allow.deflate.before.send\tQDB_HTTP_ALLOW_DEFLATE_BEFORE_SEND\tfalse\tdefault\tfalse\tfalse\n" +
                                     "http.bind.to\tQDB_HTTP_BIND_TO\t0.0.0.0:" + HTTP_PORT + "\tconf\tfalse\tfalse\n" +
@@ -746,6 +749,9 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "http.net.accept.loop.timeout\tQDB_HTTP_NET_ACCEPT_LOOP_TIMEOUT\t500\tdefault\tfalse\tfalse\n" +
                                     "http.export.timeout\tQDB_HTTP_EXPORT_TIMEOUT\t300000\tdefault\tfalse\tfalse\n" +
                                     "http.enabled\tQDB_HTTP_ENABLED\ttrue\tconf\tfalse\tfalse\n" +
+                                    "http.tls.enabled\tQDB_HTTP_TLS_ENABLED\tfalse\tdefault\tfalse\tfalse\n" +
+                                    "http.tls.cert.path\tQDB_HTTP_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "http.tls.private.key.path\tQDB_HTTP_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
                                     "http.frozen.clock\tQDB_HTTP_FROZEN_CLOCK\ttrue\tconf\tfalse\tfalse\n" +
                                     "http.health.check.authentication.required\tQDB_HTTP_HEALTH_CHECK_AUTHENTICATION_REQUIRED\ttrue\tdefault\tfalse\tfalse\n" +
                                     "http.json.query.connection.check.frequency\tQDB_HTTP_JSON_QUERY_CONNECTION_CHECK_FREQUENCY\t1000000\tdefault\tfalse\tfalse\n" +
@@ -753,6 +759,9 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "http.keep-alive.timeout\tQDB_HTTP_KEEP-ALIVE_TIMEOUT\t5\tdefault\tfalse\tfalse\n" +
                                     "http.min.bind.to\tQDB_HTTP_MIN_BIND_TO\t0.0.0.0:9003\tdefault\tfalse\tfalse\n" +
                                     "http.min.enabled\tQDB_HTTP_MIN_ENABLED\ttrue\tconf\tfalse\tfalse\n" +
+                                    "http.min.tls.enabled\tQDB_HTTP_MIN_TLS_ENABLED\tfalse\tdefault\tfalse\tfalse\n" +
+                                    "http.min.tls.cert.path\tQDB_HTTP_MIN_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "http.min.tls.private.key.path\tQDB_HTTP_MIN_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
                                     "http.min.net.bind.to\tQDB_HTTP_MIN_NET_BIND_TO\t0.0.0.0:" + HTTP_MIN_PORT + "\tconf\tfalse\tfalse\n" +
                                     "http.min.net.connection.hint\tQDB_HTTP_MIN_NET_CONNECTION_HINT\tfalse\tdefault\tfalse\tfalse\n" +
                                     "http.min.net.connection.limit\tQDB_HTTP_MIN_NET_CONNECTION_LIMIT\t64\tdefault\tfalse\tfalse\n" +
@@ -839,6 +848,9 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "line.tcp.default.partition.by\tQDB_LINE_TCP_DEFAULT_PARTITION_BY\tDAY\tdefault\tfalse\tfalse\n" +
                                     "line.tcp.disconnect.on.error\tQDB_LINE_TCP_DISCONNECT_ON_ERROR\ttrue\tdefault\tfalse\tfalse\n" +
                                     "line.tcp.enabled\tQDB_LINE_TCP_ENABLED\ttrue\tconf\tfalse\tfalse\n" +
+                                    "line.tcp.tls.enabled\tQDB_LINE_TCP_TLS_ENABLED\tfalse\tdefault\tfalse\tfalse\n" +
+                                    "line.tcp.tls.cert.path\tQDB_LINE_TCP_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "line.tcp.tls.private.key.path\tQDB_LINE_TCP_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
                                     "line.tcp.io.halt.on.error\tQDB_LINE_TCP_IO_HALT_ON_ERROR\tfalse\tdefault\tfalse\tfalse\n" +
                                     "line.tcp.io.worker.affinity\tQDB_LINE_TCP_IO_WORKER_AFFINITY\t\tdefault\tfalse\tfalse\n" +
                                     "line.tcp.io.worker.sleep.threshold\tQDB_LINE_TCP_IO_WORKER_SLEEP_THRESHOLD\t10000\tdefault\tfalse\tfalse\n" +
@@ -920,6 +932,9 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "pg.daemon.pool\tQDB_PG_DAEMON_POOL\ttrue\tdefault\tfalse\tfalse\n" +
                                     "pg.date.locale\tQDB_PG_DATE_LOCALE\ten\tdefault\tfalse\tfalse\n" +
                                     "pg.enabled\tQDB_PG_ENABLED\ttrue\tconf\tfalse\tfalse\n" +
+                                    "pg.tls.enabled\tQDB_PG_TLS_ENABLED\tfalse\tdefault\tfalse\tfalse\n" +
+                                    "pg.tls.cert.path\tQDB_PG_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "pg.tls.private.key.path\tQDB_PG_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
                                     "pg.halt.on.error\tQDB_PG_HALT_ON_ERROR\tfalse\tdefault\tfalse\tfalse\n" +
                                     "pg.insert.cache.block.count\tQDB_PG_INSERT_CACHE_BLOCK_COUNT\t4\tdefault\tfalse\tfalse\n" +
                                     "pg.insert.cache.enabled\tQDB_PG_INSERT_CACHE_ENABLED\tfalse\tconf\tfalse\tfalse\n" +

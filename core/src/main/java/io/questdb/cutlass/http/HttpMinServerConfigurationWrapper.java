@@ -26,6 +26,7 @@ package io.questdb.cutlass.http;
 
 import io.questdb.FactoryProvider;
 import io.questdb.Metrics;
+import io.questdb.ServerTlsConfiguration;
 import io.questdb.metrics.Counter;
 import io.questdb.metrics.LongGauge;
 import io.questdb.network.EpollFacade;
@@ -88,6 +89,11 @@ public class HttpMinServerConfigurationWrapper implements HttpServerConfiguratio
     @Override
     public FactoryProvider getFactoryProvider() {
         return getDelegate().getFactoryProvider();
+    }
+
+    @Override
+    public ServerTlsConfiguration getServerTlsConfiguration() {
+        return getDelegate().getServerTlsConfiguration();
     }
 
     @Override

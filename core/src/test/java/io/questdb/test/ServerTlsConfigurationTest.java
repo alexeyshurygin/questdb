@@ -22,41 +22,31 @@
  *
  ******************************************************************************/
 
-package io.questdb.cutlass.http;
+package io.questdb.test;
 
-import io.questdb.FactoryProvider;
 import io.questdb.ServerTlsConfiguration;
-import io.questdb.mp.WorkerPoolConfiguration;
-import io.questdb.network.IODispatcherConfiguration;
-import io.questdb.std.ObjHashSet;
+import org.junit.Test;
 
-public interface HttpServerConfiguration extends IODispatcherConfiguration, WorkerPoolConfiguration {
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
 
-    default ObjHashSet<String> getContextPathMetrics() {
-        return new ObjHashSet<>() {{
-            add("/metrics");
-        }};
+public class ServerTlsConfigurationTest {
+
+    @Test
+    public void testDisabledConstant() {
+        final var disabled = ServerTlsConfiguration.DISABLED;
+        assertFalse(disabled.isEnabled());
+        assertNull(disabled.getCertPath());
+        assertNull(disabled.getPrivateKeyPath());
     }
 
-    default ObjHashSet<String> getContextPathStatus() {
-        return new ObjHashSet<>() {{
-            add(getHttpContextConfiguration().getMetrics().isEnabled() ? "/status" : "*");
-        }};
+    @Test
+    public void testValues() {
+        final var configuration = new ServerTlsConfiguration(true, "/tmp/cert.pem", "/tmp/key.pem");
+        assertTrue(configuration.isEnabled());
+        assertEquals("/tmp/cert.pem", configuration.getCertPath());
+        assertEquals("/tmp/key.pem", configuration.getPrivateKeyPath());
     }
-
-    FactoryProvider getFactoryProvider();
-
-    HttpContextConfiguration getHttpContextConfiguration();
-
-    default ServerTlsConfiguration getServerTlsConfiguration() {
-        return ServerTlsConfiguration.DISABLED;
-    }
-
-    byte getRequiredAuthType();
-
-    WaitProcessorConfiguration getWaitProcessorConfiguration();
-
-    boolean isPessimisticHealthCheckEnabled();
-
-    boolean preAllocateBuffers();
 }
