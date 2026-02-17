@@ -172,7 +172,9 @@ public final class JavaTlsServerSocket implements Socket {
 
     @Override
     public int recv(long bufferPtr, int bufferLen) {
-        assert sslEngine != null;
+        if (sslEngine == null) {
+            return delegate.recv(bufferPtr, bufferLen);
+        }
         morePlaintextBuffered = false;
         resetBufferToPointer(unwrapOutputBuffer, bufferPtr, bufferLen);
         unwrapOutputBuffer.position(0);
@@ -228,6 +230,9 @@ public final class JavaTlsServerSocket implements Socket {
 
     @Override
     public int send(long bufferPtr, int bufferLen) {
+        if (sslEngine == null) {
+            return delegate.send(bufferPtr, bufferLen);
+        }
         try {
             resetBufferToPointer(wrapInputBuffer, bufferPtr, bufferLen);
             wrapInputBuffer.position(0);
@@ -306,6 +311,9 @@ public final class JavaTlsServerSocket implements Socket {
                                     if (n < 0) {
                                         throw TlsSessionInitFailedException.instance("socket write error");
                                     }
+                                    if (n == 0) {
+                                        throw TlsSessionInitFailedException.instance("socket not ready for write during TLS handshake");
+                                    }
                                     written += n;
                                 }
                                 wrapOutputBuffer.clear();
@@ -319,6 +327,9 @@ public final class JavaTlsServerSocket implements Socket {
                         final int n = readFromSocket();
                         if (n < 0) {
                             throw TlsSessionInitFailedException.instance("socket read error");
+                        }
+                        if (n == 0 && unwrapInputBuffer.limit() == 0) {
+                            throw TlsSessionInitFailedException.instance("socket not ready for read during TLS handshake");
                         }
                         final SSLEngineResult result = sslEngine.unwrap(unwrapInputBuffer, unwrapOutputBuffer);
                         handshakeStatus = result.getHandshakeStatus();
