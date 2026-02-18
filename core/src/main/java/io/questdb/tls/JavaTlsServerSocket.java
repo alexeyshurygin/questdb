@@ -179,7 +179,7 @@ public final class JavaTlsServerSocket implements Socket {
                 plainBytesReceived += result.bytesProduced();
                 final var bytesConsumed = result.bytesConsumed();
                 final var bytesRemaining = bytesAvailable - bytesConsumed;
-                Vect.memcpy(unwrapInputBufferPtr, unwrapInputBufferPtr + bytesConsumed, bytesRemaining);
+                Vect.memmove(unwrapInputBufferPtr, unwrapInputBufferPtr + bytesConsumed, bytesRemaining);
                 unwrapInputBuffer.position(0);
                 unwrapInputBuffer.limit(bytesRemaining);
                 switch (result.getStatus()) {
@@ -293,9 +293,6 @@ public final class JavaTlsServerSocket implements Socket {
                                     if (n < 0) {
                                         throw TlsSessionInitFailedException.instance("socket write error");
                                     }
-                                    if (n == 0) {
-                                        throw TlsSessionInitFailedException.instance("socket not ready for write during TLS handshake");
-                                    }
                                     written += n;
                                 }
                                 wrapOutputBuffer.clear();
@@ -309,9 +306,6 @@ public final class JavaTlsServerSocket implements Socket {
                         final var n = readFromSocket();
                         if (n < 0) {
                             throw TlsSessionInitFailedException.instance("socket read error");
-                        }
-                        if (n == 0 && unwrapInputBuffer.limit() == 0) {
-                            throw TlsSessionInitFailedException.instance("socket not ready for read during TLS handshake");
                         }
                         final var result = sslEngine.unwrap(unwrapInputBuffer, unwrapOutputBuffer);
                         handshakeStatus = result.getHandshakeStatus();
@@ -329,8 +323,16 @@ public final class JavaTlsServerSocket implements Socket {
                     break;
                 }
             }
+            // compact the unwrap input buffer — there may be application data
+            // that arrived in the same TCP segment as the final handshake message
+            final var consumed = unwrapInputBuffer.position();
+            final var remaining = unwrapInputBuffer.limit() - consumed;
+            if (remaining > 0) {
+                Vect.memmove(unwrapInputBufferPtr, unwrapInputBufferPtr + consumed, remaining);
+            }
             unwrapInputBuffer.position(0);
-            unwrapInputBuffer.limit(0);
+            unwrapInputBuffer.limit(remaining);
+            morePlaintextBuffered = remaining > 0;
             unwrapOutputBuffer.clear();
             wrapOutputBuffer.clear();
             state = STATE_TLS;
