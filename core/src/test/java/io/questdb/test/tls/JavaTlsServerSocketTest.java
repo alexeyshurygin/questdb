@@ -204,6 +204,68 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testHandshakeTimesOutOnPartialClientHello() throws Exception {
+        Assume.assumeTrue("openssl not available", opensslAvailable);
+        TestUtils.assertMemoryLeak(() -> {
+            final var sslContext = PemReader.createServerSslContext(certPath, keyPath);
+            final var port = PORT_COUNTER.getAndIncrement();
+            final var serverFd = Net.socketTcp(true);
+            assertTrue(serverFd > 0);
+            try {
+                assertTrue(Net.bindTcp(serverFd, 0, port));
+                Net.listen(serverFd, 1);
+                final var clientFd = Net.socketTcp(true);
+                assertTrue(clientFd > 0);
+                try {
+                    final var addr = Net.sockaddr("127.0.0.1", port);
+                    Net.connect(clientFd, addr);
+                    Net.freeSockAddr(addr);
+                    final var acceptedFd = Net.accept(serverFd);
+                    assertTrue(acceptedFd > 0);
+                    Net.configureNonBlocking(acceptedFd);
+                    // Send a partial TLS ClientHello — just the record header (5 bytes)
+                    // and a few bytes of the handshake, then stop.
+                    // TLS record: ContentType=22(handshake), Version=0x0301, Length=0x00FF
+                    final var partial = new byte[]{0x16, 0x03, 0x01, 0x00, (byte) 0xFF, 0x01, 0x00};
+                    final var sendBuf = io.questdb.std.Unsafe.malloc(partial.length, io.questdb.std.MemoryTag.NATIVE_DEFAULT);
+                    try {
+                        for (var i = 0; i < partial.length; i++) {
+                            io.questdb.std.Unsafe.getUnsafe().putByte(sendBuf + i, partial[i]);
+                        }
+                        Net.send(clientFd, sendBuf, partial.length);
+                    } finally {
+                        io.questdb.std.Unsafe.free(sendBuf, partial.length, io.questdb.std.MemoryTag.NATIVE_DEFAULT);
+                    }
+                    Thread.sleep(50); // let partial data arrive
+                    final var tlsSocket = new JavaTlsServerSocket(
+                            NetworkFacadeImpl.INSTANCE, LOG, sslContext
+                    );
+                    tlsSocket.of(acceptedFd);
+                    // The server reads the partial data into the buffer (limit > 0),
+                    // then readFromSocket returns 0 on subsequent reads.
+                    // Without the fix, this would spin forever because limit > 0
+                    // bypassed the zero-progress check.
+                    try {
+                        tlsSocket.startTlsSession(null);
+                        fail("expected TlsSessionInitFailedException");
+                    } catch (TlsSessionInitFailedException e) {
+                        assertTrue(
+                                "expected 'not making progress' message, got: " + e.getMessage(),
+                                e.getMessage().contains("not making progress")
+                        );
+                    }
+                    assertFalse("sslEngine must be cleared after failure", tlsSocket.isTlsSessionStarted());
+                    tlsSocket.close();
+                } finally {
+                    Net.close(clientFd);
+                }
+            } finally {
+                Net.close(serverFd);
+            }
+        });
+    }
+
+    @Test
     public void testPlaintextRecvBeforeHandshake() throws Exception {
         Assume.assumeTrue("openssl not available", opensslAvailable);
         TestUtils.assertMemoryLeak(() -> {

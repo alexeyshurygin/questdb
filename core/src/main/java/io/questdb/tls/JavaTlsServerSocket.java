@@ -319,15 +319,18 @@ public final class JavaTlsServerSocket implements Socket {
                         if (n < 0) {
                             throw TlsSessionInitFailedException.instance("socket read error");
                         }
-                        if (n == 0 && unwrapInputBuffer.limit() == 0) {
+                        if (n == 0) {
                             zeroProgressCount++;
                             if (zeroProgressCount > HANDSHAKE_SPIN_LIMIT) {
                                 throw TlsSessionInitFailedException.instance("socket not making progress during TLS handshake read");
                             }
                             Thread.yield();
-                            break;
+                            if (unwrapInputBuffer.limit() == 0) {
+                                break;
+                            }
+                        } else {
+                            zeroProgressCount = 0;
                         }
-                        zeroProgressCount = 0;
                         final var result = sslEngine.unwrap(unwrapInputBuffer, unwrapOutputBuffer);
                         handshakeStatus = result.getHandshakeStatus();
                         switch (result.getStatus()) {
