@@ -111,3 +111,83 @@ tls.enabled=true
 tls.cert.path=/path/to/server.crt
 tls.private.key.path=/path/to/server.key
 ```
+
+## Docker
+
+### Generate certificate
+
+```bash
+cd core/docker-tls
+openssl req -x509 -newkey rsa:2048 \
+  -keyout server.key -out server.crt \
+  -days 365 -nodes -subj "/CN=localhost"
+```
+
+The `-nodes` flag produces a PKCS8-format key directly — no conversion needed.
+
+### Build the Docker image
+
+```bash
+# Build QuestDB JAR first
+mvn clean package -DskipTests -pl core
+
+# Copy JAR to Docker build context
+cp core/target/questdb-*-SNAPSHOT.jar core/docker-tls/questdb.jar
+
+# Build image
+cd core/docker-tls
+docker build -t questdb-tls .
+```
+
+### Run the container
+
+```bash
+docker run -d --name questdb-tls \
+  -p 9000:9000 \
+  -p 8812:8812 \
+  -p 9009:9009 \
+  questdb-tls
+```
+
+### Verify TLS works
+
+```bash
+# HTTPS
+curl -sk 'https://localhost:9000/exec?query=SELECT+1'
+
+# PGWire with TLS
+PGPASSWORD=quest psql "host=localhost port=8812 dbname=qdb user=admin sslmode=require" \
+  -c "SELECT 1"
+
+# Verify SSL connection
+PGPASSWORD=quest psql "host=localhost port=8812 dbname=qdb user=admin sslmode=require" \
+  -c "\conninfo"
+```
+
+### Run the test suite
+
+```bash
+cd core/docker-tls
+bash test-tls.sh
+```
+
+### Use custom certificates
+
+Mount your own certs at `/app/tls/`:
+
+```bash
+docker run -d --name questdb-tls \
+  -p 9000:9000 -p 8812:8812 -p 9009:9009 \
+  -v /path/to/your/certs:/app/tls \
+  questdb-tls
+```
+
+The volume must contain `server.crt` and `server.key`.
+
+### JDBC connection string
+
+```
+jdbc:postgresql://localhost:8812/qdb?user=admin&password=quest&sslmode=require&ssl=true
+```
+
+Default credentials: user `admin`, password `quest`.
