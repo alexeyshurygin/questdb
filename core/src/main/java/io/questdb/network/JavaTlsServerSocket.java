@@ -124,7 +124,7 @@ public final class JavaTlsServerSocket implements Socket {
                     sslEngine.wrap(wrapInputBuffer, wrapOutputBuffer);
                     while (wantsTlsWrite()) {
                         final int n = tlsIO(Socket.WRITE_FLAG);
-                        if (n < 0) {
+                        if (n <= 0) {
                             log.debug().$("could not send TLS close_notify").$();
                             break;
                         }
@@ -136,6 +136,7 @@ public final class JavaTlsServerSocket implements Socket {
             } // fall through
             case STATE_PLAINTEXT:
                 state = STATE_CLOSING;
+                sslEngine = null;
                 freeInternalBuffers();
                 delegate.close();
                 state = STATE_EMPTY;
@@ -197,7 +198,7 @@ public final class JavaTlsServerSocket implements Socket {
                 plainBytesReceived += result.bytesProduced();
                 final int bytesConsumed = result.bytesConsumed();
                 final int bytesRemaining = bytesAvailable - bytesConsumed;
-                Vect.memcpy(unwrapInputBufferPtr, unwrapInputBufferPtr + bytesConsumed, bytesRemaining);
+                Vect.memmove(unwrapInputBufferPtr, unwrapInputBufferPtr + bytesConsumed, bytesRemaining);
                 unwrapInputBuffer.position(0);
                 unwrapInputBuffer.limit(bytesRemaining);
                 switch (result.getStatus()) {
@@ -285,6 +286,7 @@ public final class JavaTlsServerSocket implements Socket {
         try {
             this.sslEngine = createSslEngine();
             this.sslEngine.beginHandshake();
+            int zeroProgressCount = 0;
             SSLEngineResult.HandshakeStatus handshakeStatus = sslEngine.getHandshakeStatus();
             while (handshakeStatus != SSLEngineResult.HandshakeStatus.FINISHED) {
                 switch (handshakeStatus) {
@@ -312,7 +314,13 @@ public final class JavaTlsServerSocket implements Socket {
                                         throw TlsSessionInitFailedException.instance("socket write error");
                                     }
                                     if (n == 0) {
-                                        throw TlsSessionInitFailedException.instance("socket not ready for write during TLS handshake");
+                                        zeroProgressCount++;
+                                        if (zeroProgressCount > 1000) {
+                                            throw TlsSessionInitFailedException.instance("socket not making progress during TLS handshake write");
+                                        }
+                                        Thread.yield();
+                                    } else {
+                                        zeroProgressCount = 0;
                                     }
                                     written += n;
                                 }
@@ -329,8 +337,14 @@ public final class JavaTlsServerSocket implements Socket {
                             throw TlsSessionInitFailedException.instance("socket read error");
                         }
                         if (n == 0 && unwrapInputBuffer.limit() == 0) {
-                            throw TlsSessionInitFailedException.instance("socket not ready for read during TLS handshake");
+                            zeroProgressCount++;
+                            if (zeroProgressCount > 1000) {
+                                throw TlsSessionInitFailedException.instance("socket not making progress during TLS handshake read");
+                            }
+                            Thread.yield();
+                            break;
                         }
+                        zeroProgressCount = 0;
                         final SSLEngineResult result = sslEngine.unwrap(unwrapInputBuffer, unwrapOutputBuffer);
                         handshakeStatus = result.getHandshakeStatus();
                         switch (result.getStatus()) {
@@ -347,13 +361,25 @@ public final class JavaTlsServerSocket implements Socket {
                     break;
                 }
             }
+            // compact the unwrap input buffer — there may be application data
+            // that arrived in the same TCP segment as the final handshake message
+            final int consumed = unwrapInputBuffer.position();
+            final int remaining = unwrapInputBuffer.limit() - consumed;
+            if (remaining > 0) {
+                Vect.memmove(unwrapInputBufferPtr, unwrapInputBufferPtr + consumed, remaining);
+            }
             unwrapInputBuffer.position(0);
-            unwrapInputBuffer.limit(0);
+            unwrapInputBuffer.limit(remaining);
+            morePlaintextBuffered = remaining > 0;
             unwrapOutputBuffer.clear();
             wrapOutputBuffer.clear();
             state = STATE_TLS;
         } catch (SSLException e) {
+            sslEngine = null;
             throw TlsSessionInitFailedException.instance("TLS session creation failed [error=").put(e.getMessage()).put(']');
+        } catch (TlsSessionInitFailedException e) {
+            sslEngine = null;
+            throw e;
         }
     }
 
