@@ -91,6 +91,48 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# Test 7: QWP WebSocket upgrade works over TLS (wss)
+echo -n "Test 7: QWP ingress WebSocket upgrade over TLS... "
+RESULT=$(curl -sk --http1.1 -i -N --max-time 5 \
+    -H "Connection: Upgrade" -H "Upgrade: websocket" \
+    -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==" \
+    "https://localhost:$HTTPS_PORT/write/v4" 2>&1 || true)
+if echo "$RESULT" | grep -q "101 Switching Protocols" && echo "$RESULT" | grep -q "X-QWP-Version"; then
+    echo "PASS"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: $RESULT"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 8: QWP egress WebSocket upgrade works over TLS (wss)
+echo -n "Test 8: QWP egress WebSocket upgrade over TLS... "
+RESULT=$(curl -sk --http1.1 -i -N --max-time 5 \
+    -H "Connection: Upgrade" -H "Upgrade: websocket" \
+    -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==" \
+    "https://localhost:$HTTPS_PORT/read/v1" 2>&1 | LC_ALL=C tr -d '\0' || true)
+if echo "$RESULT" | grep -q "101 Switching Protocols"; then
+    echo "PASS"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: $RESULT"
+    FAIL=$((FAIL + 1))
+fi
+
+# Test 9: Plaintext QWP WebSocket upgrade is rejected
+echo -n "Test 9: Plaintext QWP upgrade rejected... "
+RESULT=$(curl -s --http1.1 -i --max-time 5 \
+    -H "Connection: Upgrade" -H "Upgrade: websocket" \
+    -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: x3JJHMbDL1EzLkh9GBhXDw==" \
+    "http://localhost:$HTTPS_PORT/write/v4" 2>&1 || true)
+if echo "$RESULT" | grep -q "101 Switching Protocols"; then
+    echo "FAIL: plaintext QWP upgrade should be rejected"
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS"
+    PASS=$((PASS + 1))
+fi
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 
