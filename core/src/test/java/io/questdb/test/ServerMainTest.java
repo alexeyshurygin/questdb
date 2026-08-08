@@ -1256,7 +1256,22 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "cairo.partition.encoder.parquet.o3.rewrite.unused.ratio\tQDB_CAIRO_PARTITION_ENCODER_PARQUET_O3_REWRITE_UNUSED_RATIO\t0.5\tdefault\tfalse\tfalse\n" +
                                     "cairo.wal.apply.suspended.write.denied\tQDB_CAIRO_WAL_APPLY_SUSPENDED_WRITE_DENIED\tfalse\tdefault\tfalse\ttrue\n" +
                                     "cairo.wal.apply.suspended.tables\tQDB_CAIRO_WAL_APPLY_SUSPENDED_TABLES\t\tdefault\tfalse\ttrue\n" +
-                                    "griffin.query.continuation.wake.interval\tQDB_GRIFFIN_QUERY_CONTINUATION_WAKE_INTERVAL\t1000\tdefault\tfalse\tfalse"
+                                    "griffin.query.continuation.wake.interval\tQDB_GRIFFIN_QUERY_CONTINUATION_WAKE_INTERVAL\t1000\tdefault\tfalse\tfalse\n" +
+                                    "tls.enabled\tQDB_TLS_ENABLED\t\tdefault\tfalse\tfalse\n" +
+                                    "tls.cert.path\tQDB_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "tls.private.key.path\tQDB_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "http.tls.enabled\tQDB_HTTP_TLS_ENABLED\t\tdefault\tfalse\tfalse\n" +
+                                    "http.tls.cert.path\tQDB_HTTP_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "http.tls.private.key.path\tQDB_HTTP_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "http.min.tls.enabled\tQDB_HTTP_MIN_TLS_ENABLED\t\tdefault\tfalse\tfalse\n" +
+                                    "http.min.tls.cert.path\tQDB_HTTP_MIN_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "http.min.tls.private.key.path\tQDB_HTTP_MIN_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "line.tcp.tls.enabled\tQDB_LINE_TCP_TLS_ENABLED\t\tdefault\tfalse\tfalse\n" +
+                                    "line.tcp.tls.cert.path\tQDB_LINE_TCP_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "line.tcp.tls.private.key.path\tQDB_LINE_TCP_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "pg.tls.enabled\tQDB_PG_TLS_ENABLED\t\tdefault\tfalse\tfalse\n" +
+                                    "pg.tls.cert.path\tQDB_PG_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
+                                    "pg.tls.private.key.path\tQDB_PG_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse"
                     )
                             .split("\n");
 
