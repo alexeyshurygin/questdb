@@ -730,7 +730,22 @@ public enum PropertyKey implements ConfigPropertyKey {
     DEBUG_MAT_VIEW_REFRESH_MISSING_WAL_FILES_FATAL("debug.mat.view.refresh.missing.wal.files.fatal", false, true),
     CAIRO_QUERY_MEMORY_LIMIT_BYTES("cairo.query.memory.limit.bytes"),
     CAIRO_MAT_VIEW_REFRESH_MEMORY_LIMIT_BYTES("cairo.mat.view.refresh.memory.limit.bytes"),
-    CAIRO_WAL_APPLY_MEMORY_LIMIT_BYTES("cairo.wal.apply.memory.limit.bytes");
+    CAIRO_WAL_APPLY_MEMORY_LIMIT_BYTES("cairo.wal.apply.memory.limit.bytes"),
+    TLS_ENABLED("tls.enabled"),
+    TLS_CERT_PATH("tls.cert.path"),
+    TLS_PRIVATE_KEY_PATH("tls.private.key.path"),
+    HTTP_TLS_ENABLED("http.tls.enabled"),
+    HTTP_TLS_CERT_PATH("http.tls.cert.path"),
+    HTTP_TLS_PRIVATE_KEY_PATH("http.tls.private.key.path"),
+    HTTP_MIN_TLS_ENABLED("http.min.tls.enabled"),
+    HTTP_MIN_TLS_CERT_PATH("http.min.tls.cert.path"),
+    HTTP_MIN_TLS_PRIVATE_KEY_PATH("http.min.tls.private.key.path"),
+    LINE_TCP_TLS_ENABLED("line.tcp.tls.enabled"),
+    LINE_TCP_TLS_CERT_PATH("line.tcp.tls.cert.path"),
+    LINE_TCP_TLS_PRIVATE_KEY_PATH("line.tcp.tls.private.key.path"),
+    PG_TLS_ENABLED("pg.tls.enabled"),
+    PG_TLS_CERT_PATH("pg.tls.cert.path"),
+    PG_TLS_PRIVATE_KEY_PATH("pg.tls.private.key.path");
 
     private static final Map<String, PropertyKey> nameMapping;
     private final boolean debug;

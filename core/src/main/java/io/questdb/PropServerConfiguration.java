@@ -24,6 +24,8 @@
 
 package io.questdb;
 
+import io.questdb.tls.ServerTlsConfiguration;
+import io.questdb.tls.TlsFactoryProviderFactory;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
@@ -624,6 +626,11 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final long telemetryDbSizeEstimateTimeout;
     private final boolean telemetryDisableCompletely;
     private final CharSequence tempRenamePendingTablePrefix;
+    private final ServerTlsConfiguration globalTlsConfig;
+    private final ServerTlsConfiguration httpMinTlsConfig;
+    private final ServerTlsConfiguration httpTlsConfig;
+    private final ServerTlsConfiguration lineTcpTlsConfig;
+    private final ServerTlsConfiguration pgTlsConfig;
     private final int textAnalysisMaxLines;
     private final TextConfiguration textConfiguration = new PropTextConfiguration();
     private final int textLexerStringPoolCapacity;
@@ -2339,6 +2346,40 @@ public class PropServerConfiguration implements ServerConfiguration {
             this.buildInformation = buildInformation;
             this.binaryEncodingMaxLength = getInt(properties, env, PropertyKey.BINARYDATA_ENCODING_MAXLENGTH, 32768);
         }
+        final ServerTlsConfiguration.GetStringFn getStringFn = this::getString;
+        this.globalTlsConfig = ServerTlsConfiguration.parse(
+                properties, env, installRoot,
+                PropertyKey.TLS_ENABLED, PropertyKey.TLS_CERT_PATH, PropertyKey.TLS_PRIVATE_KEY_PATH,
+                ServerTlsConfiguration.DISABLED, getStringFn
+        );
+        this.httpTlsConfig = ServerTlsConfiguration.parse(
+                properties, env, installRoot,
+                PropertyKey.HTTP_TLS_ENABLED, PropertyKey.HTTP_TLS_CERT_PATH, PropertyKey.HTTP_TLS_PRIVATE_KEY_PATH,
+                globalTlsConfig, getStringFn
+        );
+        this.httpMinTlsConfig = ServerTlsConfiguration.parse(
+                properties, env, installRoot,
+                PropertyKey.HTTP_MIN_TLS_ENABLED, PropertyKey.HTTP_MIN_TLS_CERT_PATH, PropertyKey.HTTP_MIN_TLS_PRIVATE_KEY_PATH,
+                globalTlsConfig, getStringFn
+        );
+        this.lineTcpTlsConfig = ServerTlsConfiguration.parse(
+                properties, env, installRoot,
+                PropertyKey.LINE_TCP_TLS_ENABLED, PropertyKey.LINE_TCP_TLS_CERT_PATH, PropertyKey.LINE_TCP_TLS_PRIVATE_KEY_PATH,
+                globalTlsConfig, getStringFn
+        );
+        this.pgTlsConfig = ServerTlsConfiguration.parse(
+                properties, env, installRoot,
+                PropertyKey.PG_TLS_ENABLED, PropertyKey.PG_TLS_CERT_PATH, PropertyKey.PG_TLS_PRIVATE_KEY_PATH,
+                globalTlsConfig, getStringFn
+        );
+        if (globalTlsConfig.isEnabled() || httpTlsConfig.isEnabled() || httpMinTlsConfig.isEnabled()
+                || lineTcpTlsConfig.isEnabled() || pgTlsConfig.isEnabled()) {
+            if (!(fpf instanceof TlsFactoryProviderFactory)) {
+                throw new ServerConfigurationException(
+                        "TLS is enabled but server was started without TLS support. Use io.questdb.tls.TlsServerMain as the entry point."
+                );
+            }
+        }
         this.ilpProtoTransports = initIlpTransport();
         this.acceptingWrites = initAcceptingWrites();
         this.allowTableRegistrySharedWrite = getBoolean(properties, env, PropertyKey.DEBUG_ALLOW_TABLE_REGISTRY_SHARED_WRITE, false);
@@ -2780,20 +2821,19 @@ public class PropServerConfiguration implements ServerConfiguration {
         throw ServerConfigurationException.forInvalidKey(key.getPropertyPath(), mode);
     }
 
-    // The enterprise version needs to add tcps and https
     private String initIlpTransport() {
         StringSink sink = Misc.getThreadLocalSink();
         sink.put('[');
         boolean addComma = false;
         if (lineTcpEnabled) {
             addComma = true;
-            sink.put("\"tcp\"");
+            sink.put(lineTcpTlsConfig.isEnabled() ? "\"tcps\"" : "\"tcp\"");
         }
         if (lineHttpEnabled && httpServerEnabled) {
             if (addComma) {
                 sink.put(", ");
             }
-            sink.put("\"http\"");
+            sink.put(httpTlsConfig.isEnabled() ? "\"https\"" : "\"http\"");
             addComma = true;
         }
         if (lineUdpEnabled) {
