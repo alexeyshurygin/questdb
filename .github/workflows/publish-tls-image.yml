@@ -151,7 +151,8 @@ jobs:
             curl -sf "http://localhost:9000/exec?query=SELECT+42" >/dev/null && break
             sleep 2
           done
-          curl -sf "http://localhost:9000/exec?query=SELECT+42" | grep -q '\[\[42\]\]'
+          curl -sf "http://localhost:9000/exec?query=SELECT+42" | grep -q '\[\[42\]\]' \
+            || { echo "=== container log ==="; docker logs qdb-smoke; exit 1; }
           docker rm -f qdb-smoke
 
       - name: Smoke test TLS start
@@ -163,6 +164,9 @@ jobs:
           openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
             -subj "/CN=localhost" \
             -keyout /tmp/tls/server.key -out /tmp/tls/server.crt
+          # The container drops privileges to uid 10001; openssl writes the key
+          # 0600 for the runner user, which leaves it unreadable in-container.
+          chmod 644 /tmp/tls/server.key /tmp/tls/server.crt
           cat > /tmp/conf/server.conf <<EOF
           tls.enabled=true
           tls.cert.path=/etc/questdb/tls/server.crt
@@ -185,5 +189,6 @@ jobs:
             curl -sfk "https://localhost:9443/exec?query=SELECT+42" >/dev/null && break
             sleep 2
           done
-          curl -sfk "https://localhost:9443/exec?query=SELECT+42" | grep -q '\[\[42\]\]'
+          curl -sfk "https://localhost:9443/exec?query=SELECT+42" | grep -q '\[\[42\]\]' \
+            || { echo "=== TLS container log ==="; docker logs qdb-tls; exit 1; }
           docker rm -f qdb-tls
