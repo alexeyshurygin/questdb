@@ -1,0 +1,173 @@
+name: Publish QuestDB TLS image
+
+# Builds the QuestDB image from THIS branch using the upstream core/Dockerfile
+# unmodified, and publishes a multi-arch image to GHCR.
+#
+# The image ships no certificates and no TLS configuration. TLS is opt-in at run
+# time by overriding the command to select io.questdb.tls.TlsServerMain; with no
+# override the image behaves as a stock QuestDB 10.0.1.
+#
+# Each architecture builds on a native runner. jlink (core/pom.xml:468) emits an
+# architecture-specific runtime, so cross-building would mean emulating a full
+# GraalVM + Maven + npm + cmake compile - far slower than two native jobs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (e.g. 10.0.1-tls)"
+        required: true
+        default: "10.0.1-tls"
+  push:
+    tags:
+      - "*-tls"
+
+env:
+  REGISTRY: ghcr.io
+  # Set to alexeyshurygin/questdb to publish into the personal namespace.
+  # Pushing to alphanovatech/* from a repo outside that org requires
+  # secrets.GHCR_TOKEN; from inside the org the built-in token is enough.
+  IMAGE_NAME: alphanovatech/questdb
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # fetch-depth: 0 because buildnumber-maven-plugin (core/pom.xml:195) runs
+      # git during `validate` to embed the HEAD revision, and pom.xml:34 declares
+      # an <scm> connection. actions/checkout gives a real .git directory, so the
+      # worktree pointer-file problem that breaks local builds does not apply here.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: false   # client 1.3.7 is released; resolved from Maven Central
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.arch }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: core/Dockerfile
+          target: questdb
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          build-args: |
+            tag_name=${{ steps.meta.outputs.tag }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}-${{ matrix.arch }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+  manifest:
+    name: merge and smoke test
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          set -eux
+          BASE="${REGISTRY}/${IMAGE_NAME}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          docker buildx imagetools create -t "${BASE}:${TAG}" \
+            "${BASE}:${TAG}-amd64" \
+            "${BASE}:${TAG}-arm64"
+          docker buildx imagetools inspect "${BASE}:${TAG}"
+
+      # Runs on amd64, so this exercises the amd64 variant only. The arm64
+      # variant is covered by dbperf's own integration suite on your Mac.
+      - name: Smoke test plaintext start
+        run: |
+          set -eux
+          BASE="${REGISTRY}/${IMAGE_NAME}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          docker run -d --name qdb-smoke -p 9000:9000 "${BASE}:${TAG}"
+          for i in $(seq 1 60); do
+            curl -sf "http://localhost:9000/exec?query=SELECT+42" >/dev/null && break
+            sleep 2
+          done
+          curl -sf "http://localhost:9000/exec?query=SELECT+42" | grep -q '\[\[42\]\]'
+          docker rm -f qdb-smoke
+
+      - name: Smoke test TLS start
+        run: |
+          set -eux
+          BASE="${REGISTRY}/${IMAGE_NAME}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          mkdir -p /tmp/tls /tmp/conf
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -subj "/CN=localhost" \
+            -keyout /tmp/tls/server.key -out /tmp/tls/server.crt
+          cat > /tmp/conf/server.conf <<EOF
+          tls.enabled=true
+          tls.cert.path=/etc/questdb/tls/server.crt
+          tls.private.key.path=/etc/questdb/tls/server.key
+          http.bind.to=0.0.0.0:9000
+          EOF
+          docker run -d --name qdb-tls -p 9443:9000 \
+            -v /tmp/tls:/etc/questdb/tls:ro \
+            -v /tmp/conf:/var/lib/questdb/conf \
+            "${BASE}:${TAG}" \
+            -ea -Dnoebug -XX:+UseParallelGC \
+            --sun-misc-unsafe-memory-access=allow --enable-native-access=io.questdb \
+            --add-opens=java.base/java.lang=io.questdb \
+            --add-opens=java.base/java.lang.reflect=io.questdb \
+            --add-opens=java.base/java.nio=io.questdb \
+            --add-opens=java.base/java.time.zone=io.questdb \
+            --add-exports=java.base/jdk.internal.vm=io.questdb \
+            -m io.questdb/io.questdb.tls.TlsServerMain -d /var/lib/questdb
+          for i in $(seq 1 60); do
+            curl -sfk "https://localhost:9443/exec?query=SELECT+42" >/dev/null && break
+            sleep 2
+          done
+          curl -sfk "https://localhost:9443/exec?query=SELECT+42" | grep -q '\[\[42\]\]'
+          docker rm -f qdb-tls
