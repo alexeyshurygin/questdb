@@ -127,6 +127,16 @@ jobs:
           docker buildx imagetools create -t "${BASE}:${TAG}" \
             "${BASE}:${TAG}-amd64" \
             "${BASE}:${TAG}-arm64"
+          # Immutable pin for consumers: Testcontainers and deploy configs
+          # reference this tag, since a re-published mutable tag is never
+          # re-pulled by Testcontainers on machines that already have it.
+          SHORT="${GITHUB_SHA:0:9}"
+          docker buildx imagetools create -t "${BASE}:${TAG}-${SHORT}" \
+            "${BASE}:${TAG}-amd64" \
+            "${BASE}:${TAG}-arm64"
+          echo "### Published tags" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${BASE}:${TAG}\` (mutable)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${BASE}:${TAG}-${SHORT}\` (immutable pin - use this in consumers)" >> "$GITHUB_STEP_SUMMARY"
           docker buildx imagetools inspect "${BASE}:${TAG}"
 
       # Runs on amd64, so this exercises the amd64 variant only. The arm64
