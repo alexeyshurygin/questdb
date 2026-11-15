@@ -46,6 +46,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Object store failures at each step of replication, and recovery from them.
@@ -446,11 +447,16 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
             writeConfiguration(p, "primary", PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000");
             writeConfiguration(r, "replica");
             final AtomicBoolean isStoreDown = new AtomicBoolean();
+            // when the store last let an index write through
+            final AtomicLong lastIndexWriteNanos = new AtomicLong();
             try (TestServerMain primary = startFaulty(p, new FaultyObjectStore.Hook() {
                 @Override
                 public void before(String op, String key) {
                     if (isStoreDown.get()) {
                         throw ObjectStoreException.retryable("injected store outage", null);
+                    }
+                    if (op.equals("put") && key.equals(IndexClient.INDEX_KEY)) {
+                        lastIndexWriteNanos.set(System.nanoTime());
                     }
                 }
             }); TestServerMain replica = start(r)) {
@@ -463,13 +469,17 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
                 // the store goes away. Writes are accepted while the lease is current, and refused once it
                 // is two and a half keepalive intervals old: another node may take over half an interval later
                 isStoreDown.set(true);
-                final long outageStart = System.nanoTime();
                 primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
-                TestUtils.assertEventually(() -> Assert.assertEquals(EngineRole.PRIMARY_CATCHUP, role(primary)), 30);
-                final long lapsedAfterMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - outageStart);
-                // the lease is 2.5 s here and the last renewal was at most a little over one keepalive interval
-                // (1 s) before the outage: not at once, and not as late as the 3 s after which another node may take over
-                Assert.assertTrue("lapsed after " + lapsedAfterMillis + " ms", lapsedAfterMillis >= 1_000 && lapsedAfterMillis < 6_000);
+                final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+                while (role(primary) != EngineRole.PRIMARY_CATCHUP) {
+                    Assert.assertTrue("the lease did not lapse", System.nanoTime() < deadline);
+                    Os.sleep(1);
+                }
+                // The lease counts from the moment the node sent its last accepted index write, a moment
+                // before the store saw it. It lasts 2.5 s here: less than the 3 s after which another node
+                // may take over, which is what keeps two primaries from accepting writes at once.
+                final long leaseMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastIndexWriteNanos.get());
+                Assert.assertTrue("the lease lasted " + leaseMillis + " ms", leaseMillis >= 2_400 && leaseMillis < 3_000);
                 final io.questdb.replication.ReplicatedCairoEngine engine = (io.questdb.replication.ReplicatedCairoEngine) primary.getEngine();
                 Assert.assertTrue(engine.isPrimaryRole());
                 Assert.assertTrue(engine.isLeaseLapsed());
@@ -535,6 +545,62 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
             final ReplicationIndex index = readIndex();
             Assert.assertEquals("another-primary", index.getOwnerInstanceId());
             Assert.assertEquals(foreignSequence, index.getSequence());
+        });
+    }
+
+    @Test
+    public void testLeaseLapsesWhenTheCoordinatorIsStuck() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            writeConfiguration(p, "primary");
+            final AtomicBoolean isBlocking = new AtomicBoolean();
+            final CountDownLatch blocked = new CountDownLatch(1);
+            final CountDownLatch release = new CountDownLatch(1);
+            try (TestServerMain primary = startFaulty(p, blockingUploads(isBlocking, blocked, release))) {
+                try {
+                    awaitRole(primary, EngineRole.PRIMARY);
+                    primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                    primary.execute("INSERT INTO t VALUES ('2024-01-01', 0)");
+                    awaitUploaded(primary, "t");
+                    TestUtils.assertEventually(() -> Assert.assertEquals(1, lastTxn(readIndex(), "t")), 30);
+                    // three keepalive intervals without a sign of life, and the keeper gives the coordinator up
+                    primary.getReplicationService().setStallLimitForTesting(3_000);
+                    final long sequenceBefore = readIndex().getSequence();
+                    isBlocking.set(true);
+                    primary.execute("INSERT INTO t VALUES ('2024-01-02', 1)");
+                    Assert.assertTrue("no upload started", blocked.await(30, TimeUnit.SECONDS));
+
+                    // the only request in flight never returns. The keeper renews the lease at first, then
+                    // stops: a node that replicates nothing must not stay the writable primary for ever
+                    TestUtils.assertEventually(() -> Assert.assertEquals(EngineRole.PRIMARY_CATCHUP, role(primary)), 30);
+                    final io.questdb.replication.ReplicatedCairoEngine engine = (io.questdb.replication.ReplicatedCairoEngine) primary.getEngine();
+                    Assert.assertTrue(engine.isLeaseLapsed());
+                    Assert.assertNull(engine.getFenceReason());
+                    final long sequenceAtLapse = readIndex().getSequence();
+                    Assert.assertTrue("sequence " + sequenceBefore + " -> " + sequenceAtLapse, sequenceAtLapse > sequenceBefore);
+                    // and it stays that way: no renewal for two more keepalive intervals
+                    final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(2_000);
+                    while (System.nanoTime() < deadline) {
+                        Assert.assertEquals(EngineRole.PRIMARY_CATCHUP, role(primary));
+                        Os.sleep(20);
+                    }
+                    Assert.assertEquals(sequenceAtLapse, readIndex().getSequence());
+                    Assert.assertEquals("the upload ended", 1, release.getCount());
+                    try {
+                        primary.execute("INSERT INTO t VALUES ('2024-01-03', 2)");
+                        Assert.fail("a primary with a lapsed lease must refuse writes");
+                    } catch (Throwable e) {
+                        TestUtils.assertContains(String.valueOf(e.getMessage()) + e.getCause(), io.questdb.cairo.CairoException.READ_ONLY_ACCESS_MESSAGE);
+                    }
+                } finally {
+                    release.countDown();
+                }
+                // the coordinator comes back, nobody took the store: the node is the primary again
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("INSERT INTO t VALUES ('2024-01-03', 2)");
+                awaitUploaded(primary, "t");
+                Assert.assertEquals(3, lastTxn(readIndex(), "t"));
+            }
         });
     }
 

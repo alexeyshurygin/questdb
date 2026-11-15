@@ -133,7 +133,12 @@ them.
    write renews the lease; when a long upload or cleanup round leaves the index
    unwritten for one and a half keepalive intervals, a separate thread renews
    it with an index that carries nothing new, so a slow round on a reachable
-   store does not make the primary read-only. A lapsed primary becomes
+   store does not make the primary read-only. That thread renews only while
+   replication is alive: when the coordinator neither passes through its loop
+   nor gets an answer to any upload or cleanup request for a minute (20
+   keepalive intervals or three request timeouts, if longer), the lease is left
+   to lapse, so a node that replicates nothing does not stay the writable
+   primary. A lapsed primary becomes
    writable again by itself, and only through an index write the store accepts:
    the store accepts it only if no other node wrote the index in between. If one
    did, the node fences itself and leaves the store as that node wrote it. A

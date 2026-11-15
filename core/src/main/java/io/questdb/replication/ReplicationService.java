@@ -37,6 +37,7 @@ import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.replication.codec.IndexTable;
 import io.questdb.replication.codec.ReplicationIndex;
+import io.questdb.replication.store.ActivityObjectStore;
 import io.questdb.replication.store.ObjectStore;
 import io.questdb.replication.store.ObjectStoreException;
 import io.questdb.std.FilesFacade;
@@ -112,7 +113,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private final HashMap<String, TableReplayer> replayers = new HashMap<>();
     // dropped tables the store still lists, carried over into every index until the cleaner removes them
     private final ConcurrentHashMap<String, IndexTable> retainedEntries = new ConcurrentHashMap<>();
-    private final ObjectStore store;
+    // every request but the index's goes through it: see leaseKeeperMain()
+    private final ActivityObjectStore store;
     private final ConcurrentHashMap<String, TableUploader> uploaders = new ConcurrentHashMap<>();
     private final Condition wakeUp = lock.newCondition();
     // closes of segments and WALs (segment WHOLE_WAL) of tables without an uploader yet: {walId, segmentId, lastTxn}
@@ -147,6 +149,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private long nextCheckpointUploadNanos;
     private long nextCleanerRunNanos;
     private volatile long sequence;
+    // how long the lease keeper renews for a coordinator that shows no sign of life
+    private volatile long stallLimitMillis;
     private volatile String status = "starting";
     private volatile Runnable takeoverHook;
     // the index version acquireLease() saw unchanged for the whole wait; null when it did not have to wait
@@ -156,13 +160,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     public ReplicationService(@NotNull ReplicatedCairoEngine engine, @NotNull ObjectStore store) {
         this.engine = engine;
         this.config = engine.getReplicationConfiguration();
-        this.store = store;
+        this.store = new ActivityObjectStore(store);
         this.isPrimary = config.getRole() == ReplicationRole.PRIMARY;
         final CairoConfiguration cairoConfig = engine.getConfiguration();
         this.workDir = Paths.get(cairoConfig.getInstallRoot(), ".replication").toString();
         this.isChecksum = ObjectIO.isChecksum(config.getChecksumMode(), store);
+        // the index bypasses the activity record: the lease keeper's own writes must not count as progress
         this.indexClient = new IndexClient(store, isChecksum);
-        this.cleaner = new WalCleaner(config, store);
+        this.cleaner = new WalCleaner(config, this.store);
+        this.stallLimitMillis = Math.max(60_000, Math.max(20 * config.getKeepaliveInterval(), 3 * config.getRequestBaseTimeout()));
         this.configuredCheckpointListener = cairoConfig.getCheckpointListener();
         this.pins = isPrimary ? null : new ReplicaSegmentPins(10 * 60_000L);
         this.policy = new ReplicationWalDirectoryPolicy(cairoConfig.getFilesFacade(), isPrimary ? this : null, pins);
@@ -286,6 +292,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     @org.jetbrains.annotations.TestOnly
     public int getWorkerContextCount() {
         return allWorkers.size();
+    }
+
+    /**
+     * Test seam: how long the lease keeper keeps renewing the lease while neither the coordinator nor
+     * its upload and cleanup requests make progress.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setStallLimitForTesting(long millis) {
+        this.stallLimitMillis = millis;
     }
 
     /**
@@ -728,13 +743,27 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      * the lease lapses. This thread renews the lease for it when no index was written for one and a
      * half keepalive intervals, so a reachable store never makes a healthy primary read-only. The
      * store accepts its write, like any index write, only if no other node wrote the index.
+     * <p>
+     * It renews only for a coordinator that is alive: one that passes through its loop, or whose
+     * upload and cleanup requests keep returning. When neither happens for the stall limit, the
+     * coordinator is stuck, nothing is being replicated, and the lease is left to lapse: the node
+     * turns read-only and another node can take the store over.
      */
     private void leaseKeeperMain() {
         final long dueNanos = TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval()) * 3 / 2;
         final long pauseMillis = Math.max(1, config.getKeepaliveInterval() / 4);
+        boolean isStalled = false;
         try {
             while (isRunning && engine.isPrimaryRole()) {
-                if (System.nanoTime() - lastIndexWriteNanos >= dueNanos) {
+                final long idleNanos = System.nanoTime() - store.getLastActivityNanos();
+                if (idleNanos >= TimeUnit.MILLISECONDS.toNanos(stallLimitMillis)) {
+                    if (!isStalled) {
+                        isStalled = true;
+                        LOG.critical().$("the replication coordinator made no progress, its lease is left to lapse [idleMs=")
+                                .$(TimeUnit.NANOSECONDS.toMillis(idleNanos)).I$();
+                    }
+                } else if (System.nanoTime() - lastIndexWriteNanos >= dueNanos) {
+                    isStalled = false;
                     try {
                         if (renewLeaseOnly(dueNanos)) {
                             LOG.info().$("replication lease renewed while the coordinator is busy [sequence=").$(sequence).I$();
@@ -1050,13 +1079,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             status = "primary catching up";
             try {
                 idx = indexClient.read();
-                if (idx != null) {
-                    checkMayBecomePrimary(idx);
-                    if (!engine.getDataID().isInitialized()) {
-                        throw ReplicationException.divergence("this primary has no database id");
-                    }
-                    adoptDataId(idx);
-                }
+                checkStore(idx);
                 if (!catchUp(idx)) {
                     fence("tables could not catch up with the object store; see the log");
                     return;
@@ -1076,6 +1099,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                             .$(idx.getOwnerInstanceId()).I$();
                     continue;
                 }
+                // this may be another index than the one checked above: the store had none then, or the
+                // one it had changed hands
+                checkStore(idx);
                 if (!catchUp(idx)) {
                     fence("tables could not catch up with the object store; see the log");
                     return;
@@ -1113,10 +1139,12 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         LOG.advisory().$("replication primary is writable [epoch=").$(epoch).$(", instance=").$(instanceId)
                 .$(", store=").$(store.getDescription()).I$();
         isMigrationAllowed = false;
+        store.touch();
         startLeaseKeeper();
         long firstDirtyNanos = 0;
         boolean wasLeaseLapsed = false;
         while (isRunning) {
+            store.touch();
             final long window = config.getThrottleWindowDuration();
             if (engine.isLeaseLapsed()) {
                 // The node refuses writes by now. Another node may have taken the store over, so nothing
@@ -1229,6 +1257,17 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
 
     private long shutdownTimeoutMillis() {
         return Math.max(5_000, 3 * config.getRequestBaseTimeout());
+    }
+
+    // what a node must pass before it takes over the store that holds this index
+    private void checkStore(@Nullable ReplicationIndex idx) {
+        if (idx != null) {
+            checkMayBecomePrimary(idx);
+            if (!engine.getDataID().isInitialized()) {
+                throw ReplicationException.divergence("this primary has no database id");
+            }
+            adoptDataId(idx);
+        }
     }
 
     /**

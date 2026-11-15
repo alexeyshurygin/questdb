@@ -408,6 +408,46 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testStoreThatGetsAnOwnerDuringStartupNeedsTheMarker() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            writeConfiguration(a, "primary");
+            final AtomicInteger decisions = new AtomicInteger();
+            try (TestServerMain node = new TestServerMain(io.questdb.Bootstrap.getServerMainArgs(a))) {
+                // the store is empty when the node first looks, so nothing stands in its way. Before it
+                // takes the store, another primary creates the index and stops, releasing its lease
+                node.getReplicationService().setTakeoverHookForTesting(() -> {
+                    if (decisions.incrementAndGet() == 1) {
+                        final io.questdb.cairo.DataID dataID = node.getEngine().getDataID();
+                        try (io.questdb.replication.store.FsObjectStore store = new io.questdb.replication.store.FsObjectStore(
+                                io.questdb.replication.store.ObjectStoreSettings.parse("fs::root=" + storeRoot + ';'),
+                                new io.questdb.replication.ReplicationConfigurationImpl());
+                             io.questdb.replication.IndexClient client = new io.questdb.replication.IndexClient(store, true)) {
+                            Assert.assertNull(client.read());
+                            final io.questdb.replication.codec.ReplicationIndex idx = new io.questdb.replication.codec.ReplicationIndex();
+                            idx.setDataId(dataID.getHi(), dataID.getLo());
+                            idx.setOwner("another-primary", 1, 1, 1, true);
+                            client.write(idx, 1);
+                        }
+                    }
+                });
+                node.start();
+                // a released lease is free to take, but not by a node the store does not belong to
+                awaitRole(node, EngineRole.FENCED);
+                final String reason = ((io.questdb.replication.ReplicatedCairoEngine) node.getEngine()).getFenceReason();
+                TestUtils.assertContains(reason, "the object store belongs to another primary [owner=another-primary]");
+                TestUtils.assertContains(reason, "create an empty " + io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE + " file in");
+                Assert.assertEquals(1, decisions.get());
+            }
+            final io.questdb.replication.codec.ReplicationIndex untouched = readIndex();
+            Assert.assertEquals("another-primary", untouched.getOwnerInstanceId());
+            Assert.assertEquals(1, untouched.getSequence());
+            Assert.assertEquals(1, untouched.getEpoch());
+            Assert.assertTrue(untouched.isReleased());
+        });
+    }
+
+    @Test
     public void testTakeoverStartsOverWhenTheOwnerWritesAgain() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = nodeRoot("a");
