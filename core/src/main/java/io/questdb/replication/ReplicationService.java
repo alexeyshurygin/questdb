@@ -112,6 +112,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private volatile boolean isClosed;
     private volatile boolean isCrashed;
     private volatile boolean isNonDataPending;
+    private volatile boolean isRestoredAtBoot;
     private volatile boolean isRunning;
     private volatile boolean isStarted;
     private io.questdb.replication.codec.CheckpointHistory checkpointHistory;
@@ -245,9 +246,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      */
     public void installHooks() {
         engine.setWalDirectoryPolicy(policy);
-        if (config.isCheckpointHistoryEnabled()) {
-            engine.setCheckpointListener(this);
-        }
+        // also tells this service when a checkpoint restore ran: a restored copy is a new instance
+        engine.setCheckpointListener(this);
         if (isPrimary) {
             engine.setWalListener(new ReplicationWalListener(this));
         }
@@ -269,23 +269,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         try {
             configuredCheckpointListener.onCheckpointReleased(timestampMicros, tableDirNamesToSeqTxn);
         } finally {
-            final io.questdb.replication.codec.CheckpointHistory.Checkpoint c = new io.questdb.replication.codec.CheckpointHistory.Checkpoint(timestampMicros);
-            final ObjList<CharSequence> keys = tableDirNamesToSeqTxn.keys();
-            for (int i = 0, n = keys.size(); i < n; i++) {
-                final CharSequence dir = keys.getQuick(i);
-                final long seqTxn = tableDirNamesToSeqTxn.get(dir);
-                if (seqTxn != io.questdb.std.Numbers.LONG_NULL && seqTxn >= 0) {
-                    c.addTable(dir.toString(), seqTxn);
-                }
+            if (config.isCheckpointHistoryEnabled()) {
+                recordCheckpoint(timestampMicros, tableDirNamesToSeqTxn);
             }
-            pendingCheckpoints.add(c);
-            nextCheckpointUploadNanos = 0;
-            wake();
         }
     }
 
     @Override
     public void onCheckpointRestoreComplete() {
+        isRestoredAtBoot = true;
         configuredCheckpointListener.onCheckpointRestoreComplete();
     }
 
@@ -535,7 +527,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             final java.nio.file.Path dir = Paths.get(workDir);
             Files.createDirectories(dir);
             final java.nio.file.Path file = dir.resolve(INSTANCE_FILE);
-            if (Files.exists(file)) {
+            // a node restored from a checkpoint copy may carry its source's id: it is another instance
+            if (Files.exists(file) && !isRestoredAtBoot) {
                 final String id = Files.readString(file, StandardCharsets.UTF_8).trim();
                 if (!id.isEmpty()) {
                     return id;
@@ -545,6 +538,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             final java.nio.file.Path tmp = dir.resolve(INSTANCE_FILE + ".tmp");
             Files.writeString(tmp, id, StandardCharsets.UTF_8);
             Files.move(tmp, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            LOG.info().$("new replication instance id [id=").$(id).$(", restoredFromCheckpoint=").$(isRestoredAtBoot).I$();
             return id;
         } catch (java.io.IOException e) {
             throw CairoException.critical(0).put("could not load the replication instance id [dir=").put(workDir)
@@ -1026,6 +1020,21 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             LOG.info().$("recorded a checkpoint in the replication history [instance=").$(instanceId)
                     .$(", checkpoints=").$(checkpointHistory.getCheckpoints().size()).I$();
         }
+    }
+
+    private void recordCheckpoint(long timestampMicros, io.questdb.std.CharSequenceLongHashMap tableDirNamesToSeqTxn) {
+        final io.questdb.replication.codec.CheckpointHistory.Checkpoint c = new io.questdb.replication.codec.CheckpointHistory.Checkpoint(timestampMicros);
+        final ObjList<CharSequence> keys = tableDirNamesToSeqTxn.keys();
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            final CharSequence dir = keys.getQuick(i);
+            final long seqTxn = tableDirNamesToSeqTxn.get(dir);
+            if (seqTxn != io.questdb.std.Numbers.LONG_NULL && seqTxn >= 0) {
+                c.addTable(dir.toString(), seqTxn);
+            }
+        }
+        pendingCheckpoints.add(c);
+        nextCheckpointUploadNanos = 0;
+        wake();
     }
 
     private void run() {

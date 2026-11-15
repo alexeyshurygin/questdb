@@ -126,11 +126,7 @@ public class ServerMain implements Closeable {
             if (engine instanceof io.questdb.replication.ReplicatedCairoEngine replicatedEngine) {
                 // before the engine envelope runs completeInit(): no sequencer may open without the WAL policy
                 final io.questdb.replication.ReplicationConfiguration replicationConfig = replicatedEngine.getReplicationConfiguration();
-                final io.questdb.replication.store.ObjectStore store = io.questdb.replication.store.ObjectStoreFactory.create(
-                        io.questdb.replication.store.ObjectStoreSettings.parse(replicationConfig.getObjectStore()),
-                        replicationConfig,
-                        bootstrap.getEnv()
-                );
+                final io.questdb.replication.store.ObjectStore store = newReplicationObjectStore(replicationConfig);
                 replicationService = freeOnExit(new io.questdb.replication.ReplicationService(replicatedEngine, store));
                 replicationService.installHooks();
             }
@@ -1076,6 +1072,20 @@ public class ServerMain implements Closeable {
         for (int i = 0, n = components.size(); i < n; i++) {
             orch.register(components.getQuick(i));
         }
+    }
+
+    /**
+     * Creates the replication object store from {@code replication.object.store}. Runs inside the
+     * constructor; tests override it to wrap the store with fault injection.
+     */
+    protected io.questdb.replication.store.ObjectStore newReplicationObjectStore(
+            io.questdb.replication.ReplicationConfiguration replicationConfig
+    ) {
+        return io.questdb.replication.store.ObjectStoreFactory.create(
+                io.questdb.replication.store.ObjectStoreSettings.parse(replicationConfig.getObjectStore()),
+                replicationConfig,
+                bootstrap.getEnv()
+        );
     }
 
     /**
