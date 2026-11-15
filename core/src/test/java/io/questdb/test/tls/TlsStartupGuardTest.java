@@ -26,10 +26,12 @@ package io.questdb.test.tls;
 
 import io.questdb.BuildInformationHolder;
 import io.questdb.PropServerConfiguration;
+import io.questdb.PropertyKey;
 import io.questdb.ServerConfigurationException;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.test.tools.TestUtils;
+import io.questdb.tls.TlsBootstrapConfiguration;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
@@ -37,6 +39,7 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Map;
 import java.util.Properties;
 
 import static org.junit.Assert.*;
@@ -61,6 +64,35 @@ public class TlsStartupGuardTest {
         final var keyFile = temp.newFile("guard-key.key");
         certPath = certFile.getAbsolutePath();
         keyPath = keyFile.getAbsolutePath();
+    }
+
+    @Test
+    public void testEachListenerAloneTriggersGuard() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            for (String prefix : new String[]{"http.min.", "line.tcp.", "pg.", "http."}) {
+                final var props = new Properties();
+                props.setProperty(prefix + "tls.enabled", "true");
+                props.setProperty(prefix + "tls.cert.path", certPath);
+                props.setProperty(prefix + "tls.private.key.path", keyPath);
+                try {
+                    new PropServerConfiguration(root, props, null, LOG, new BuildInformationHolder());
+                    fail("expected ServerConfigurationException for " + prefix);
+                } catch (ServerConfigurationException e) {
+                    TestUtils.assertContains(e.getMessage(), "Use io.questdb.tls.TlsServerMain as the entry point.");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testReadSettingPrefersEnvironmentAndTrims() {
+        final var props = new Properties();
+        props.setProperty("tls.cert.path", " /from/props.crt ");
+        assertEquals("/from/props.crt", TlsBootstrapConfiguration.readSetting(props, null, PropertyKey.TLS_CERT_PATH, "dflt"));
+        assertEquals("/from/props.crt", TlsBootstrapConfiguration.readSetting(props, Map.of(), PropertyKey.TLS_CERT_PATH, "dflt"));
+        assertEquals("/from/env.crt", TlsBootstrapConfiguration.readSetting(props, Map.of("QDB_TLS_CERT_PATH", "/from/env.crt "), PropertyKey.TLS_CERT_PATH, "dflt"));
+        assertEquals("dflt", TlsBootstrapConfiguration.readSetting(props, null, PropertyKey.TLS_PRIVATE_KEY_PATH, "dflt"));
+        assertNull(TlsBootstrapConfiguration.readSetting(props, null, PropertyKey.TLS_ENABLED, null));
     }
 
     @Test

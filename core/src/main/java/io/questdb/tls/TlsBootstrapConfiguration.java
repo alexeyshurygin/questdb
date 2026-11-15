@@ -25,27 +25,42 @@
 package io.questdb.tls;
 
 import io.questdb.Bootstrap;
+import io.questdb.ConfigPropertyKey;
 import io.questdb.DynamicPropServerConfiguration;
 import io.questdb.PropBootstrapConfiguration;
 import io.questdb.PropertyKey;
 import io.questdb.ServerConfiguration;
 import io.questdb.ServerMain;
 import io.questdb.std.FilesFacadeImpl;
-import io.questdb.std.datetime.microtime.MicrosecondClockImpl;
+import org.jetbrains.annotations.Nullable;
 
+import java.util.Map;
+import java.util.Properties;
+
+/**
+ * Bootstrap configuration of {@link TlsServerMain}: reads the per-listener TLS settings and installs the TLS
+ * socket factories through {@link TlsFactoryProviderFactory}.
+ */
 public class TlsBootstrapConfiguration extends PropBootstrapConfiguration {
+
+    /**
+     * Reads a TLS setting the way the server reads any setting: the {@code QDB_}-prefixed environment variable
+     * first, then the property, then the default. Values are trimmed.
+     */
+    public static String readSetting(Properties properties, @Nullable Map<String, String> env, ConfigPropertyKey key, String defaultValue) {
+        final var envVarName = ServerMain.propertyPathToEnvVarName(key.getPropertyPath());
+        var result = env != null ? env.get(envVarName) : null;
+        if (result == null) {
+            result = properties.getProperty(key.getPropertyPath());
+        }
+        return result != null ? result.trim() : defaultValue;
+    }
+
     @Override
     public ServerConfiguration getServerConfiguration(Bootstrap bootstrap) throws Exception {
         final var properties = bootstrap.loadProperties();
         final var rootDir = bootstrap.getRootDirectory();
-        ServerTlsConfiguration.GetStringFn simpleGetString = (props, env, key, defaultValue) -> {
-            final var envVarName = ServerMain.propertyPathToEnvVarName(key.getPropertyPath());
-            var result = (env != null) ? env.get(envVarName) : null;
-            if (result == null) {
-                result = props.getProperty(key.getPropertyPath());
-            }
-            return result != null ? result.trim() : defaultValue;
-        };
+        final ServerTlsConfiguration.GetStringFn simpleGetString = TlsBootstrapConfiguration::readSetting;
         final var globalTls = ServerTlsConfiguration.parse(
                 properties, getEnv(), rootDir,
                 PropertyKey.TLS_ENABLED, PropertyKey.TLS_CERT_PATH, PropertyKey.TLS_PRIVATE_KEY_PATH,
@@ -78,7 +93,7 @@ public class TlsBootstrapConfiguration extends PropBootstrapConfiguration {
                 bootstrap.getLog(),
                 bootstrap.getBuildInformation(),
                 FilesFacadeImpl.INSTANCE,
-                MicrosecondClockImpl.INSTANCE,
+                bootstrap.getMicrosecondClock(),
                 new TlsFactoryProviderFactory(httpTls, httpMinTls, lineTcpTls, pgTls)
         );
     }

@@ -25,9 +25,12 @@
 package io.questdb.tls;
 
 import io.questdb.FactoryProvider;
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.TickCalendarServiceFactory;
 import io.questdb.cairo.WalJobFactory;
 import io.questdb.cairo.security.SecurityContextFactory;
+import io.questdb.cairo.sql.StatefulAtom;
+import io.questdb.cairo.sql.async.WorkStealingStrategy;
 import io.questdb.cutlass.auth.LineAuthenticatorFactory;
 import io.questdb.cutlass.http.HttpAuthenticatorFactory;
 import io.questdb.cutlass.http.HttpCookieHandler;
@@ -37,8 +40,14 @@ import io.questdb.cutlass.http.RejectProcessorFactory;
 import io.questdb.cutlass.http.processors.TextImportRequestHeaderProcessor;
 import io.questdb.cutlass.pgwire.PGAuthenticatorFactory;
 import io.questdb.network.SocketFactory;
+import io.questdb.std.MemoryTrackerProvider;
 import org.jetbrains.annotations.NotNull;
 
+/**
+ * Delegates every {@link FactoryProvider} method to the wrapped provider, including the interface's default
+ * methods, and swaps in TLS socket factories. A default method left undelegated would silently use the
+ * interface default instead of the delegate's override.
+ */
 public class TlsFactoryProvider implements FactoryProvider {
     private final FactoryProvider delegate;
     private final SocketFactory httpMinSocketFactory;
@@ -106,6 +115,11 @@ public class TlsFactoryProvider implements FactoryProvider {
     }
 
     @Override
+    public @NotNull MemoryTrackerProvider getMemoryTrackerProvider(@NotNull CairoConfiguration cairoConfiguration) {
+        return delegate.getMemoryTrackerProvider(cairoConfiguration);
+    }
+
+    @Override
     public @NotNull SocketFactory getPGWireSocketFactory() {
         return pgWireSocketFactory;
     }
@@ -138,5 +152,14 @@ public class TlsFactoryProvider implements FactoryProvider {
     @Override
     public @NotNull WalJobFactory getWalJobFactory() {
         return delegate.getWalJobFactory();
+    }
+
+    @Override
+    public @NotNull WorkStealingStrategy getWorkStealingStrategy(
+            @NotNull CairoConfiguration configuration,
+            int workerCount,
+            @NotNull StatefulAtom atom
+    ) {
+        return delegate.getWorkStealingStrategy(configuration, workerCount, atom);
     }
 }

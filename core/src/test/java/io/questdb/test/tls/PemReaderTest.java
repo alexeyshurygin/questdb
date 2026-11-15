@@ -85,6 +85,102 @@ public class PemReaderTest {
         Files.copy(pkcs8Key.toPath(), keyFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     }
 
+    private static void runOpenssl(String... args) throws Exception {
+        final var command = new String[args.length + 1];
+        command[0] = "openssl";
+        System.arraycopy(args, 0, command, 1, args.length);
+        final var process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        final var output = new String(process.getInputStream().readAllBytes());
+        if (process.waitFor() != 0) {
+            fail("openssl failed: " + output);
+        }
+    }
+
+    @Test
+    public void testCertFileWithoutCertificatesFails() throws Exception {
+        Assume.assumeTrue("openssl not available", opensslAvailable());
+        TestUtils.assertMemoryLeak(() -> {
+            final var certFile = temp.newFile("empty.crt");
+            final var keyFile = temp.newFile("for-empty.key");
+            generateSelfSignedCert(temp.newFile("unused-empty.crt"), keyFile);
+            try {
+                PemReader.createServerSslContext(certFile.getAbsolutePath(), keyFile.getAbsolutePath());
+                fail("expected GeneralSecurityException");
+            } catch (GeneralSecurityException e) {
+                TestUtils.assertContains(e.getMessage(), "no certificates found in " + certFile.getAbsolutePath());
+            }
+        });
+    }
+
+    @Test
+    public void testEcKeyAccepted() throws Exception {
+        Assume.assumeTrue("openssl not available", opensslAvailable());
+        TestUtils.assertMemoryLeak(() -> {
+            final var certFile = temp.newFile("ec.crt");
+            final var keyFile = temp.newFile("ec.key");
+            runOpenssl(
+                    "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                    "-keyout", keyFile.getAbsolutePath(), "-out", certFile.getAbsolutePath(),
+                    "-days", "1", "-nodes", "-subj", "/CN=localhost"
+            );
+            // the RSA parser rejects the key first, then the EC parser accepts it
+            final var sslContext = PemReader.createServerSslContext(certFile.getAbsolutePath(), keyFile.getAbsolutePath());
+            assertNotNull(sslContext.createSSLEngine());
+        });
+    }
+
+    @Test
+    public void testEcPkcs1KeyFormatError() throws Exception {
+        Assume.assumeTrue("openssl not available", opensslAvailable());
+        TestUtils.assertMemoryLeak(() -> {
+            final var certFile = temp.newFile("pkcs1-ec.crt");
+            final var keyFile = temp.newFile("pkcs1-ec.key");
+            // certificates load before the key, so the certificate must be valid
+            generateSelfSignedCert(certFile, temp.newFile("unused-pkcs1-ec.key"));
+            Files.writeString(keyFile.toPath(), "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n");
+            try {
+                PemReader.createServerSslContext(certFile.getAbsolutePath(), keyFile.getAbsolutePath());
+                fail("expected GeneralSecurityException");
+            } catch (GeneralSecurityException e) {
+                TestUtils.assertContains(e.getMessage(), "PKCS1 key format not supported");
+            }
+        });
+    }
+
+    @Test
+    public void testKeyNeitherRsaNorEcFails() throws Exception {
+        Assume.assumeTrue("openssl not available", opensslAvailable());
+        TestUtils.assertMemoryLeak(() -> {
+            final var certFile = temp.newFile("ed.crt");
+            final var keyFile = temp.newFile("ed.key");
+            generateSelfSignedCert(certFile, temp.newFile("unused-ed.key"));
+            runOpenssl("genpkey", "-algorithm", "ed25519", "-out", keyFile.getAbsolutePath());
+            try {
+                PemReader.createServerSslContext(certFile.getAbsolutePath(), keyFile.getAbsolutePath());
+                fail("expected GeneralSecurityException");
+            } catch (GeneralSecurityException e) {
+                TestUtils.assertContains(e.getMessage(), "failed to parse private key as RSA or EC from " + keyFile.getAbsolutePath());
+            }
+        });
+    }
+
+    @Test
+    public void testKeyWithoutPkcs8HeaderFails() throws Exception {
+        Assume.assumeTrue("openssl not available", opensslAvailable());
+        TestUtils.assertMemoryLeak(() -> {
+            final var certFile = temp.newFile("enc.crt");
+            final var keyFile = temp.newFile("enc.key");
+            generateSelfSignedCert(certFile, temp.newFile("unused-enc.key"));
+            Files.writeString(keyFile.toPath(), "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n");
+            try {
+                PemReader.createServerSslContext(certFile.getAbsolutePath(), keyFile.getAbsolutePath());
+                fail("expected GeneralSecurityException");
+            } catch (GeneralSecurityException e) {
+                TestUtils.assertContains(e.getMessage(), "expected PEM private key (PKCS8 format) in " + keyFile.getAbsolutePath());
+            }
+        });
+    }
+
     @Test
     public void testInvalidPemContent() throws Exception {
         TestUtils.assertMemoryLeak(() -> {

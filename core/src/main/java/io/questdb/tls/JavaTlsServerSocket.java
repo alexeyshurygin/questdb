@@ -32,6 +32,8 @@ import io.questdb.network.TlsSessionInitFailedException;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
 import io.questdb.std.Vect;
+import io.questdb.std.str.StringSink;
+import org.jetbrains.annotations.Nullable;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -41,15 +43,34 @@ import java.lang.reflect.Field;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
 
+/**
+ * Server-side TLS socket on top of {@link SSLEngine}.
+ * <p>
+ * The handshake is non-blocking: {@link #startTlsSession(CharSequence)} starts it and makes as much progress as
+ * the bytes already available allow, and {@link #recv(long, int)} and {@link #send(long, int)} continue it
+ * whenever the dispatcher reports the socket ready. Until the handshake completes, both return 0 (no plaintext),
+ * so a client that stalls mid-handshake waits in the IO dispatcher like any idle connection instead of holding
+ * a worker thread. Handshake bytes that the socket cannot take at once stay in the output buffer;
+ * {@link #wantsTlsWrite()} reports them and {@link #tlsIO(int)} flushes them when the socket becomes writable.
+ */
 public final class JavaTlsServerSocket implements Socket {
 
     private static final long ADDRESS_FIELD_OFFSET;
     private static final long CAPACITY_FIELD_OFFSET;
-    static final int HANDSHAKE_SPIN_LIMIT = Integer.getInteger("questdb.experimental.tls.handshake.spin.limit", 10_000_000);
+    private static final ByteBuffer EMPTY_BUFFER = ByteBuffer.allocateDirect(0);
+    private static final int HS_DONE = 0;
+    private static final int HS_NEED_INPUT = 1;
+    private static final int HS_NEED_OUTPUT = 2;
     private static final int INITIAL_BUFFER_CAPACITY_BYTES = 256 * 1024;
     private static final long LIMIT_FIELD_OFFSET;
+    private static final int MAX_LOGGED_ERROR_CHARS = 256;
+    // The largest input buffer the socket grows to: far above the largest TLS record (16 KiB plus overhead), so
+    // only a buffer configured below one record ever grows.
+    private static final int MAX_UNWRAP_INPUT_CAPACITY_BYTES = 1024 * 1024;
+    private static final int SHUT_RD = 0;
     private static final int STATE_CLOSING = 3;
     private static final int STATE_EMPTY = 0;
+    private static final int STATE_HANDSHAKE = 4;
     private static final int STATE_PLAINTEXT = 1;
     private static final int STATE_TLS = 2;
 
@@ -70,13 +91,21 @@ public final class JavaTlsServerSocket implements Socket {
     }
 
     private final Socket delegate;
+    private final StringSink errorSink = new StringSink();
     private final Log log;
     private final SSLContext sslContext;
+    private final ByteBuffer plaintextStagingBuffer;
     private final ByteBuffer unwrapInputBuffer;
     private final ByteBuffer unwrapOutputBuffer;
     private final ByteBuffer wrapInputBuffer;
     private final ByteBuffer wrapOutputBuffer;
+    private boolean isHandshakeFailed;
+    private boolean isHandshakeInputShort;
     private boolean morePlaintextBuffered;
+    private int plaintextStagedHi;
+    private int plaintextStagedLo;
+    private int plaintextStagingCapacity;
+    private long plaintextStagingPtr;
     private SSLEngine sslEngine;
     private int state = STATE_EMPTY;
     private long unwrapInputBufferPtr;
@@ -90,6 +119,7 @@ public final class JavaTlsServerSocket implements Socket {
         this.unwrapOutputBuffer = ByteBuffer.allocateDirect(0);
         this.wrapOutputBuffer = ByteBuffer.allocateDirect(0);
         this.unwrapInputBuffer = ByteBuffer.allocateDirect(0);
+        this.plaintextStagingBuffer = ByteBuffer.allocateDirect(0);
     }
 
     @Override
@@ -99,15 +129,16 @@ public final class JavaTlsServerSocket implements Socket {
             case STATE_CLOSING: // intentional fall through
             case STATE_EMPTY:
                 return;
+            case STATE_HANDSHAKE: // intentional fall through
             case STATE_TLS: {
                 assert sslEngine != null;
                 state = STATE_CLOSING;
                 sslEngine.closeOutbound();
                 try {
-                    sslEngine.wrap(wrapInputBuffer, wrapOutputBuffer);
+                    sslEngine.wrap(EMPTY_BUFFER, wrapOutputBuffer);
                     while (wantsTlsWrite()) {
                         final var n = tlsIO(Socket.WRITE_FLAG);
-                        if (n <= 0) {
+                        if (n < 0 || wantsTlsWrite()) {
                             log.debug().$("could not send TLS close_notify").$();
                             break;
                         }
@@ -120,6 +151,9 @@ public final class JavaTlsServerSocket implements Socket {
             case STATE_PLAINTEXT:
                 state = STATE_CLOSING;
                 sslEngine = null;
+                isHandshakeFailed = false;
+                isHandshakeInputShort = false;
+                morePlaintextBuffered = false;
                 freeInternalBuffers();
                 delegate.close();
                 state = STATE_EMPTY;
@@ -135,6 +169,13 @@ public final class JavaTlsServerSocket implements Socket {
     @Override
     public boolean isClosed() {
         return delegate.isClosed();
+    }
+
+    /**
+     * @return true while the TLS handshake started by {@link #startTlsSession(CharSequence)} is still in progress.
+     */
+    public boolean isHandshakeInProgress() {
+        return state == STATE_HANDSHAKE;
     }
 
     @Override
@@ -159,63 +200,94 @@ public final class JavaTlsServerSocket implements Socket {
         if (sslEngine == null) {
             return delegate.recv(bufferPtr, bufferLen);
         }
+        if (state == STATE_HANDSHAKE) {
+            final var progress = continueHandshake();
+            if (progress <= 0) {
+                return progress;
+            }
+        }
         morePlaintextBuffered = false;
-        resetBufferToPointer(unwrapOutputBuffer, bufferPtr, bufferLen);
-        unwrapOutputBuffer.position(0);
+        var received = drainStagedPlaintext(bufferPtr, bufferLen);
         try {
-            var plainBytesReceived = 0;
-            for (; ; ) {
+            while (received < bufferLen) {
                 final var n = readFromSocket();
                 assert unwrapInputBuffer.position() == 0 : "unwrapInputBuffer is not compacted";
                 final var bytesAvailable = unwrapInputBuffer.limit();
-                if (n < 0 && bytesAvailable == 0) {
-                    if (plainBytesReceived == 0) {
-                        return n;
-                    }
-                    return plainBytesReceived;
-                }
                 if (bytesAvailable == 0) {
-                    return plainBytesReceived;
+                    return received > 0 || n >= 0 ? received : n;
                 }
-                final var result = sslEngine.unwrap(unwrapInputBuffer, unwrapOutputBuffer);
-                plainBytesReceived += result.bytesProduced();
-                final var bytesConsumed = result.bytesConsumed();
-                final var bytesRemaining = bytesAvailable - bytesConsumed;
-                Vect.memmove(unwrapInputBufferPtr, unwrapInputBufferPtr + bytesConsumed, bytesRemaining);
+                // SSLEngine needs room for a whole record in the destination; a smaller caller buffer gets the
+                // record through the staging buffer, which keeps what does not fit for the next call
+                final var room = bufferLen - received;
+                final var isDirect = room >= plaintextStagingCapacity;
+                final ByteBuffer destination;
+                if (isDirect) {
+                    resetBufferToPointer(unwrapOutputBuffer, bufferPtr + received, room);
+                    destination = unwrapOutputBuffer;
+                } else {
+                    resetBufferToPointer(plaintextStagingBuffer, plaintextStagingPtr, plaintextStagingCapacity);
+                    destination = plaintextStagingBuffer;
+                }
+                final var result = sslEngine.unwrap(unwrapInputBuffer, destination);
+                final var bytesRemaining = bytesAvailable - result.bytesConsumed();
+                Vect.memmove(unwrapInputBufferPtr, unwrapInputBufferPtr + result.bytesConsumed(), bytesRemaining);
                 unwrapInputBuffer.position(0);
                 unwrapInputBuffer.limit(bytesRemaining);
+                if (isDirect) {
+                    received += result.bytesProduced();
+                } else {
+                    plaintextStagedLo = 0;
+                    plaintextStagedHi = result.bytesProduced();
+                    received += drainStagedPlaintext(bufferPtr + received, room);
+                }
+                if (isEngineStuck(result)) {
+                    return -1;
+                }
                 switch (result.getStatus()) {
                     case BUFFER_UNDERFLOW:
-                        return plainBytesReceived;
+                        if (bytesRemaining == unwrapInputBuffer.capacity()) {
+                            // the buffer is smaller than the record; make room and read the rest
+                            growUnwrapInputBuffer();
+                            break;
+                        }
+                        // a partial record; recv() already read what the socket had
+                        if (n < 0 && received == 0) {
+                            return n;
+                        }
+                        return received;
                     case BUFFER_OVERFLOW:
-                        if (unwrapOutputBuffer.position() == 0) {
-                            throw new AssertionError("Output buffer too small to fit a single TLS record. This should not happen, please report as a bug.");
-                        }
-                        if (bytesRemaining > 0) {
-                            morePlaintextBuffered = true;
-                        }
-                        return plainBytesReceived;
-                    case OK:
-                        if (bytesRemaining > 0 && unwrapOutputBuffer.remaining() == 0) {
-                            morePlaintextBuffered = true;
-                            return plainBytesReceived;
-                        }
+                        // the session's record size grew past the staging buffer
+                        growPlaintextStagingBuffer();
                         break;
                     case CLOSED:
                         log.debug().$("SSL engine closed").$();
-                        return plainBytesReceived == 0 ? -1 : plainBytesReceived;
+                        return received == 0 ? -1 : received;
+                    default:
+                        break;
                 }
             }
-        } catch (SSLException e) {
-            log.error().$("could not unwrap SSL packet").$(e).$();
+        } catch (SSLException | RuntimeException e) {
+            log.error().$("could not unwrap SSL packet [fd=").$(delegate.getFd()).$(", error=").$(sanitize(e)).I$();
+            return -1;
+        } catch (TlsSessionInitFailedException e) {
+            log.error().$("could not unwrap SSL packet [fd=").$(delegate.getFd()).$(", error=").$safe(e.getFlyweightMessage()).I$();
             return -1;
         }
+        // The caller's buffer is full: tell the dispatcher to come back without waiting for the socket.
+        morePlaintextBuffered = plaintextStagedHi > plaintextStagedLo || unwrapInputBuffer.limit() > 0;
+        return received;
     }
 
     @Override
     public int send(long bufferPtr, int bufferLen) {
         if (sslEngine == null) {
             return delegate.send(bufferPtr, bufferLen);
+        }
+        if (state == STATE_HANDSHAKE) {
+            final var progress = continueHandshake();
+            if (progress <= 0) {
+                return progress;
+            }
         }
         try {
             resetBufferToPointer(wrapInputBuffer, bufferPtr, bufferLen);
@@ -236,6 +308,9 @@ public final class JavaTlsServerSocket implements Socket {
                 }
                 final var result = sslEngine.wrap(wrapInputBuffer, wrapOutputBuffer);
                 plainBytesConsumed += result.bytesConsumed();
+                if (isEngineStuck(result)) {
+                    return -1;
+                }
                 switch (result.getStatus()) {
                     case BUFFER_UNDERFLOW:
                         throw new AssertionError("Underflow while reading a plain text. This should not happen, please report as a bug");
@@ -251,118 +326,59 @@ public final class JavaTlsServerSocket implements Socket {
                         return -1;
                 }
             }
-        } catch (SSLException e) {
-            log.error().$("could not wrap SSL packet").$(e).$();
+        } catch (SSLException | RuntimeException e) {
+            log.error().$("could not wrap SSL packet [fd=").$(delegate.getFd()).$(", error=").$(sanitize(e)).I$();
             return -1;
         }
     }
 
+    /**
+     * Half-closes the connection. Shutting down the write side of a TLS session first queues close_notify and
+     * tries to send it together with any ciphertext still queued, so the FIN does not overtake them. The attempt
+     * does not wait for the socket: what the socket does not take at once is lost, as on close().
+     */
     @Override
     public int shutdown(int how) {
+        if (how != SHUT_RD && state == STATE_TLS) {
+            sslEngine.closeOutbound();
+            try {
+                sslEngine.wrap(EMPTY_BUFFER, wrapOutputBuffer);
+            } catch (SSLException | RuntimeException e) {
+                log.debug().$("could not queue TLS close_notify [fd=").$(delegate.getFd()).$(", error=").$(sanitize(e)).I$();
+            }
+            if (tlsIO(Socket.WRITE_FLAG) < 0 || wantsTlsWrite()) {
+                log.debug().$("could not send queued TLS bytes before shutdown [fd=").$(delegate.getFd()).I$();
+            }
+        }
         return delegate.shutdown(how);
     }
 
+    /**
+     * Starts the TLS handshake and advances it as far as the bytes already received allow. The call never waits
+     * for the client: the handshake continues in {@link #recv(long, int)}, {@link #send(long, int)} and
+     * {@link #tlsIO(int)}.
+     *
+     * @throws TlsSessionInitFailedException when the handshake fails on the bytes already available, or the
+     *                                       client has already disconnected
+     */
     @Override
     public void startTlsSession(CharSequence peerName) throws TlsSessionInitFailedException {
         assert state == STATE_PLAINTEXT;
         prepareInternalBuffers();
         try {
-            this.sslEngine = createSslEngine();
-            this.sslEngine.beginHandshake();
-            var zeroProgressCount = 0;
-            var handshakeStatus = sslEngine.getHandshakeStatus();
-            while (handshakeStatus != SSLEngineResult.HandshakeStatus.FINISHED) {
-                switch (handshakeStatus) {
-                    case NEED_TASK:
-                        Runnable task;
-                        while ((task = sslEngine.getDelegatedTask()) != null) {
-                            task.run();
-                        }
-                        handshakeStatus = sslEngine.getHandshakeStatus();
-                        break;
-                    case NEED_WRAP: {
-                        final var result = sslEngine.wrap(wrapInputBuffer, wrapOutputBuffer);
-                        handshakeStatus = result.getHandshakeStatus();
-                        switch (result.getStatus()) {
-                            case BUFFER_UNDERFLOW:
-                                throw new AssertionError("Buffer underflow during TLS handshake. This should not happen, please report as a bug");
-                            case BUFFER_OVERFLOW:
-                                throw new AssertionError("Buffer overflow during TLS handshake. This should not happen, please report as a bug");
-                            case OK:
-                                var written = 0;
-                                final var bufferLimit = wrapOutputBuffer.position();
-                                while (written < bufferLimit) {
-                                    final var n = delegate.send(wrapOutputBufferPtr + written, bufferLimit - written);
-                                    if (n < 0) {
-                                        throw TlsSessionInitFailedException.instance("socket write error");
-                                    }
-                                    if (n == 0) {
-                                        zeroProgressCount++;
-                                        if (zeroProgressCount > HANDSHAKE_SPIN_LIMIT) {
-                                            throw TlsSessionInitFailedException.instance("socket not making progress during TLS handshake write");
-                                        }
-                                        Thread.yield();
-                                    } else {
-                                        zeroProgressCount = 0;
-                                    }
-                                    written += n;
-                                }
-                                wrapOutputBuffer.clear();
-                                break;
-                            case CLOSED:
-                                throw TlsSessionInitFailedException.instance("client closed connection unexpectedly");
-                        }
-                        break;
-                    }
-                    case NEED_UNWRAP: {
-                        final var n = readFromSocket();
-                        if (n < 0) {
-                            throw TlsSessionInitFailedException.instance("socket read error");
-                        }
-                        if (n == 0) {
-                            zeroProgressCount++;
-                            if (zeroProgressCount > HANDSHAKE_SPIN_LIMIT) {
-                                throw TlsSessionInitFailedException.instance("socket not making progress during TLS handshake read");
-                            }
-                            Thread.yield();
-                            if (unwrapInputBuffer.limit() == 0) {
-                                break;
-                            }
-                        } else {
-                            zeroProgressCount = 0;
-                        }
-                        final var result = sslEngine.unwrap(unwrapInputBuffer, unwrapOutputBuffer);
-                        handshakeStatus = result.getHandshakeStatus();
-                        switch (result.getStatus()) {
-                            case BUFFER_UNDERFLOW:
-                                break;
-                            case BUFFER_OVERFLOW:
-                                throw new AssertionError("Buffer overflow during TLS handshake. This should not happen, please report as a bug");
-                            case OK:
-                                break;
-                            case CLOSED:
-                                throw TlsSessionInitFailedException.instance("client closed connection unexpectedly");
-                        }
-                    }
-                    break;
-                }
-            }
-            final var consumed = unwrapInputBuffer.position();
-            final var remaining = unwrapInputBuffer.limit() - consumed;
-            if (remaining > 0) {
-                Vect.memmove(unwrapInputBufferPtr, unwrapInputBufferPtr + consumed, remaining);
-            }
-            unwrapInputBuffer.position(0);
-            unwrapInputBuffer.limit(remaining);
-            morePlaintextBuffered = remaining > 0;
-            unwrapOutputBuffer.clear();
-            wrapOutputBuffer.clear();
-            state = STATE_TLS;
-        } catch (SSLException e) {
+            sslEngine = createSslEngine();
+            sslEngine.beginHandshake();
+            state = STATE_HANDSHAKE;
+            isHandshakeFailed = false;
+            isHandshakeInputShort = false;
+            advanceHandshake(true);
+        } catch (SSLException | RuntimeException e) {
             sslEngine = null;
-            throw TlsSessionInitFailedException.instance("TLS session creation failed [error=").put(e.getMessage()).put(']');
+            state = STATE_PLAINTEXT;
+            throw TlsSessionInitFailedException.instance("TLS session creation failed [error=").put(sanitize(e)).put(']');
         } catch (TlsSessionInitFailedException e) {
             sslEngine = null;
+            state = STATE_PLAINTEXT;
             throw e;
         }
     }
@@ -378,7 +394,20 @@ public final class JavaTlsServerSocket implements Socket {
             final var bytesToSend = wrapOutputBuffer.position();
             if (bytesToSend > 0) {
                 final var n = writeToSocket(bytesToSend);
-                return Math.min(n, 0);
+                if (n < 0) {
+                    return n;
+                }
+            }
+            if (state == STATE_HANDSHAKE && !isHandshakeFailed && wrapOutputBuffer.position() == 0) {
+                // The flushed bytes may have been only part of a handshake flight: produce the rest. Unwrapping
+                // stays with recv() on a worker thread, as it can run CPU-heavy delegated tasks.
+                try {
+                    advanceHandshake(false);
+                } catch (TlsSessionInitFailedException | SSLException | RuntimeException e) {
+                    logHandshakeFailure(e);
+                    isHandshakeFailed = true;
+                    return -1;
+                }
             }
         }
         return 0;
@@ -392,6 +421,34 @@ public final class JavaTlsServerSocket implements Socket {
     @Override
     public boolean wantsTlsWrite() {
         return wrapOutputBuffer.position() > 0;
+    }
+
+    /**
+     * Appends {@code message} to {@code sink} as printable ASCII: other characters, the backslash included, become
+     * {@code \\uXXXX} escapes, and the text is cut at {@value #MAX_LOGGED_ERROR_CHARS} characters. Engine error
+     * messages can carry client-controlled bytes, such as the server name from a ClientHello; written raw, a CR
+     * or LF in them would forge log lines.
+     */
+    public static void appendSanitized(StringSink sink, @Nullable CharSequence message) {
+        if (message == null) {
+            sink.put("null");
+            return;
+        }
+        final var n = Math.min(message.length(), MAX_LOGGED_ERROR_CHARS);
+        for (var i = 0; i < n; i++) {
+            final var c = message.charAt(i);
+            if (c >= 0x20 && c <= 0x7e && c != '\\') {
+                sink.put(c);
+            } else {
+                sink.put("\\u");
+                for (var shift = 12; shift >= 0; shift -= 4) {
+                    sink.put(Character.forDigit((c >> shift) & 0xf, 16));
+                }
+            }
+        }
+        if (message.length() > n) {
+            sink.put("...");
+        }
     }
 
     private static long allocateMemoryAndResetBuffer(ByteBuffer buffer, int capacity) {
@@ -416,39 +473,263 @@ public final class JavaTlsServerSocket implements Socket {
         buffer.position(0);
     }
 
+    /**
+     * Advances the handshake without waiting on the socket.
+     *
+     * @param isUnwrapAllowed false keeps the handshake from reading and unwrapping client bytes
+     * @return {@link #HS_DONE} once the handshake has completed, {@link #HS_NEED_INPUT} when it waits for client
+     * bytes, {@link #HS_NEED_OUTPUT} when the socket did not take all handshake bytes
+     */
+    private int advanceHandshake(boolean isUnwrapAllowed) throws SSLException, TlsSessionInitFailedException {
+        for (; ; ) {
+            switch (sslEngine.getHandshakeStatus()) {
+                case NEED_TASK: {
+                    Runnable task;
+                    while ((task = sslEngine.getDelegatedTask()) != null) {
+                        task.run();
+                    }
+                    break;
+                }
+                case NEED_WRAP: {
+                    if (!flushHandshakeBytes()) {
+                        return HS_NEED_OUTPUT;
+                    }
+                    final var result = sslEngine.wrap(EMPTY_BUFFER, wrapOutputBuffer);
+                    switch (result.getStatus()) {
+                        case OK:
+                            final var isFlushed = flushHandshakeBytes();
+                            if (result.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.FINISHED
+                                    || sslEngine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING) {
+                                // That was the last handshake output (the server Finished in TLS 1.2, the session
+                                // ticket in TLS 1.3): the handshake is complete even if the socket took only part
+                                // of it. send() and tlsIO() flush the rest. Completing here, on the thread that
+                                // called recv(), lets recv() go on to client data already buffered behind the
+                                // client's Finished; completing later inside tlsIO() would leave that data waiting
+                                // for a READ event that never comes, because the socket has nothing left to read.
+                                completeHandshake();
+                                return HS_DONE;
+                            }
+                            if (!isFlushed) {
+                                return HS_NEED_OUTPUT;
+                            }
+                            break;
+                        case BUFFER_OVERFLOW:
+                            // flushHandshakeBytes() emptied the buffer before the wrap, so the record is larger
+                            // than the whole buffer
+                            growWrapOutputBuffer();
+                            break;
+                        case CLOSED:
+                            // the engine produced a fatal alert; send it on a best-effort basis
+                            flushHandshakeBytes();
+                            throw TlsSessionInitFailedException.instance("TLS handshake failed: engine closed");
+                        default:
+                            throw new AssertionError("Buffer underflow during TLS handshake wrap. This should not happen, please report as a bug");
+                    }
+                    break;
+                }
+                case NEED_UNWRAP:
+                case NEED_UNWRAP_AGAIN: {
+                    if (!isUnwrapAllowed) {
+                        return HS_NEED_INPUT;
+                    }
+                    if (unwrapInputBuffer.limit() == 0 || isHandshakeInputShort) {
+                        final var n = readFromSocket();
+                        if (n < 0) {
+                            throw TlsSessionInitFailedException.instance("socket read error");
+                        }
+                        if (n == 0) {
+                            return HS_NEED_INPUT;
+                        }
+                        isHandshakeInputShort = false;
+                    }
+                    final var bytesAvailable = unwrapInputBuffer.limit();
+                    final var result = sslEngine.unwrap(unwrapInputBuffer, EMPTY_BUFFER);
+                    final var bytesRemaining = bytesAvailable - result.bytesConsumed();
+                    Vect.memmove(unwrapInputBufferPtr, unwrapInputBufferPtr + result.bytesConsumed(), bytesRemaining);
+                    unwrapInputBuffer.position(0);
+                    unwrapInputBuffer.limit(bytesRemaining);
+                    switch (result.getStatus()) {
+                        case BUFFER_UNDERFLOW:
+                            if (bytesRemaining == unwrapInputBuffer.capacity()) {
+                                growUnwrapInputBuffer();
+                            }
+                            isHandshakeInputShort = true;
+                            break;
+                        case BUFFER_OVERFLOW:
+                            // Only application data needs room in the destination, so the handshake has completed
+                            // and the next record is already application data: recv() unwraps it into the
+                            // caller's buffer.
+                            completeHandshake();
+                            return HS_DONE;
+                        case CLOSED:
+                            throw TlsSessionInitFailedException.instance("client closed connection unexpectedly");
+                        default:
+                            break;
+                    }
+                    break;
+                }
+                default: // FINISHED and NOT_HANDSHAKING
+                    completeHandshake();
+                    return HS_DONE;
+            }
+        }
+    }
+
+    private void completeHandshake() {
+        // a handshake completes at most once per connection, and close() frees the staging buffer
+        assert plaintextStagingPtr == 0;
+        final var capacity = sslEngine.getSession().getApplicationBufferSize();
+        // allocate before changing state, so a failed allocation leaves the socket in the handshake state
+        plaintextStagingPtr = Unsafe.malloc(capacity, MemoryTag.NATIVE_TLS_RSS);
+        plaintextStagingCapacity = capacity;
+        plaintextStagedLo = 0;
+        plaintextStagedHi = 0;
+        state = STATE_TLS;
+        isHandshakeInputShort = false;
+        morePlaintextBuffered = unwrapInputBuffer.limit() > 0;
+    }
+
+    /**
+     * @return 1 once the handshake has completed, 0 while it waits for the socket, -1 when it has failed
+     */
+    private int continueHandshake() {
+        if (isHandshakeFailed) {
+            return -1;
+        }
+        try {
+            return advanceHandshake(true) == HS_DONE ? 1 : 0;
+        } catch (TlsSessionInitFailedException | SSLException | RuntimeException e) {
+            logHandshakeFailure(e);
+            isHandshakeFailed = true;
+            return -1;
+        }
+    }
+
     private SSLEngine createSslEngine() {
         final var engine = sslContext.createSSLEngine();
         engine.setUseClientMode(false);
         return engine;
     }
 
-    private void freeInternalBuffers() {
-        var ptrToFree = wrapOutputBufferPtr;
-        if (ptrToFree != 0) {
-            var capacity = wrapOutputBuffer.capacity();
-            assert capacity != 0;
-            resetBufferToPointer(wrapOutputBuffer, 0, 0);
-            wrapOutputBufferPtr = 0;
-            Unsafe.free(ptrToFree, capacity, MemoryTag.NATIVE_TLS_RSS);
-            assert unwrapInputBufferPtr != 0;
-            capacity = unwrapInputBuffer.capacity();
-            assert capacity != 0;
-            resetBufferToPointer(unwrapInputBuffer, 0, 0);
-            ptrToFree = unwrapInputBufferPtr;
-            unwrapInputBufferPtr = 0;
-            Unsafe.free(ptrToFree, capacity, MemoryTag.NATIVE_TLS_RSS);
+    private int drainStagedPlaintext(long bufferPtr, int bufferLen) {
+        final var staged = plaintextStagedHi - plaintextStagedLo;
+        if (staged == 0) {
+            return 0;
         }
+        final var n = Math.min(staged, bufferLen);
+        Vect.memcpy(bufferPtr, plaintextStagingPtr + plaintextStagedLo, n);
+        plaintextStagedLo += n;
+        if (plaintextStagedLo == plaintextStagedHi) {
+            plaintextStagedLo = 0;
+            plaintextStagedHi = 0;
+        }
+        return n;
+    }
+
+    /**
+     * @return true when no handshake bytes remain to send
+     */
+    private boolean flushHandshakeBytes() throws TlsSessionInitFailedException {
+        final var bytesToSend = wrapOutputBuffer.position();
+        if (bytesToSend > 0 && writeToSocket(bytesToSend) < 0) {
+            throw TlsSessionInitFailedException.instance("socket write error");
+        }
+        return wrapOutputBuffer.position() == 0;
+    }
+
+    private void freeInternalBuffers() {
+        // each buffer on its own: a failed allocation can leave any subset of them allocated
+        if (plaintextStagingPtr != 0) {
+            resetBufferToPointer(plaintextStagingBuffer, 0, 0);
+            Unsafe.free(plaintextStagingPtr, plaintextStagingCapacity, MemoryTag.NATIVE_TLS_RSS);
+            plaintextStagingPtr = 0;
+            plaintextStagingCapacity = 0;
+            plaintextStagedLo = 0;
+            plaintextStagedHi = 0;
+        }
+        if (wrapOutputBufferPtr != 0) {
+            final var capacity = wrapOutputBuffer.capacity();
+            resetBufferToPointer(wrapOutputBuffer, 0, 0);
+            Unsafe.free(wrapOutputBufferPtr, capacity, MemoryTag.NATIVE_TLS_RSS);
+            wrapOutputBufferPtr = 0;
+        }
+        if (unwrapInputBufferPtr != 0) {
+            final var capacity = unwrapInputBuffer.capacity();
+            resetBufferToPointer(unwrapInputBuffer, 0, 0);
+            Unsafe.free(unwrapInputBufferPtr, capacity, MemoryTag.NATIVE_TLS_RSS);
+            unwrapInputBufferPtr = 0;
+        }
+    }
+
+    /**
+     * Detects an engine that can no longer make progress on application data. This server does not support
+     * renegotiation or any other handshake after the first one: a client that starts one (a ClientHello after the
+     * handshake) leaves the engine waiting for a delegated task that nobody runs, and every later wrap or unwrap
+     * returns OK without consuming or producing a byte, so the caller's loop would spin forever.
+     */
+    private boolean isEngineStuck(SSLEngineResult result) {
+        final var handshakeStatus = result.getHandshakeStatus();
+        final var isStuck = handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_TASK
+                || handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_UNWRAP
+                || handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_UNWRAP_AGAIN
+                || (result.getStatus() == SSLEngineResult.Status.OK && result.bytesConsumed() == 0 && result.bytesProduced() == 0);
+        if (isStuck) {
+            log.info().$("TLS peer started a handshake after the handshake; renegotiation is not supported, closing [fd=")
+                    .$(delegate.getFd()).$(", handshakeStatus=").$(handshakeStatus.name()).I$();
+        }
+        return isStuck;
+    }
+
+    private void growPlaintextStagingBuffer() {
+        final var newCapacity = plaintextStagingCapacity * 2;
+        plaintextStagingPtr = Unsafe.realloc(plaintextStagingPtr, plaintextStagingCapacity, newCapacity, MemoryTag.NATIVE_TLS_RSS);
+        plaintextStagingCapacity = newCapacity;
+    }
+
+    private void growUnwrapInputBuffer() throws TlsSessionInitFailedException {
+        if (unwrapInputBuffer.capacity() >= MAX_UNWRAP_INPUT_CAPACITY_BYTES) {
+            throw TlsSessionInitFailedException.instance("TLS record does not fit into the input buffer");
+        }
+        final var limit = unwrapInputBuffer.limit();
+        unwrapInputBufferPtr = expandBuffer(unwrapInputBuffer, unwrapInputBufferPtr);
+        unwrapInputBuffer.position(0);
+        unwrapInputBuffer.limit(limit);
     }
 
     private void growWrapOutputBuffer() {
         wrapOutputBufferPtr = expandBuffer(wrapOutputBuffer, wrapOutputBufferPtr);
     }
 
+    private void logHandshakeFailure(Exception e) {
+        final var line = log.info().$("TLS handshake failed [fd=").$(delegate.getFd()).$(", error=");
+        if (e instanceof TlsSessionInitFailedException tlsException) {
+            // messages this class writes itself: constants, or text that sanitize() has already escaped
+            line.$safe(tlsException.getFlyweightMessage());
+        } else {
+            line.$(sanitize(e));
+        }
+        line.I$();
+    }
+
+    private CharSequence sanitize(Exception e) {
+        errorSink.clear();
+        errorSink.put(e.getClass().getSimpleName()).put(": ");
+        appendSanitized(errorSink, e.getMessage());
+        return errorSink;
+    }
+
     private void prepareInternalBuffers() {
+        // a previous startTlsSession() on this connection may have failed and left its buffers behind
         final var initialCapacity = Integer.getInteger("questdb.experimental.tls.buffersize", INITIAL_BUFFER_CAPACITY_BYTES);
-        this.wrapOutputBufferPtr = allocateMemoryAndResetBuffer(wrapOutputBuffer, initialCapacity);
-        this.unwrapInputBufferPtr = allocateMemoryAndResetBuffer(unwrapInputBuffer, initialCapacity);
-        unwrapInputBuffer.flip();
+        if (wrapOutputBufferPtr == 0) {
+            wrapOutputBufferPtr = allocateMemoryAndResetBuffer(wrapOutputBuffer, initialCapacity);
+        }
+        wrapOutputBuffer.position(0);
+        if (unwrapInputBufferPtr == 0) {
+            unwrapInputBufferPtr = allocateMemoryAndResetBuffer(unwrapInputBuffer, initialCapacity);
+        }
+        unwrapInputBuffer.position(0);
+        unwrapInputBuffer.limit(0);
     }
 
     private int readFromSocket() {

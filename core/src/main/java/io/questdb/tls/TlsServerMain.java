@@ -28,22 +28,38 @@ import io.questdb.Bootstrap;
 import io.questdb.ServerMain;
 import io.questdb.log.LogFactory;
 
+/**
+ * Entry point that starts QuestDB with TLS support. It mirrors {@link ServerMain#main(String[])}, including its
+ * failure handling, and differs only in the bootstrap configuration.
+ */
 public class TlsServerMain {
     public static void main(String[] args) {
         try {
             new ServerMain(new Bootstrap(new TlsBootstrapConfiguration(), args)).start(true);
-        } catch (Bootstrap.BootstrapException e) {
-            if (e.isSilentStacktrace()) {
-                System.err.println(e.getMessage());
-            } else {
-                e.printStackTrace();
+        } catch (Throwable th) {
+            try {
+                if (th instanceof Bootstrap.BootstrapException e && e.isSilentStacktrace()) {
+                    System.err.println(th.getMessage());
+                } else {
+                    printStackTraceSafely(th);
+                }
+            } catch (Throwable ignore) {
             }
-            LogFactory.closeInstance();
-            System.exit(55);
-        } catch (Throwable thr) {
-            thr.printStackTrace();
-            LogFactory.closeInstance();
-            System.exit(55);
+            try {
+                LogFactory.closeInstance();
+            } catch (Throwable closeFailure) {
+                printStackTraceSafely(closeFailure);
+            } finally {
+                System.exit(55);
+            }
+        }
+    }
+
+    private static void printStackTraceSafely(Throwable th) {
+        try {
+            //noinspection CallToPrintStackTrace
+            th.printStackTrace();
+        } catch (Throwable ignore) {
         }
     }
 }

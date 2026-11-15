@@ -25,11 +25,14 @@
 package io.questdb.test.tls;
 
 import io.questdb.BuildInformationHolder;
+import io.questdb.FactoryProvider;
 import io.questdb.PropServerConfiguration;
 import io.questdb.network.PlainSocketFactory;
+import io.questdb.network.SocketFactory;
 import io.questdb.test.tools.TestUtils;
 import io.questdb.tls.JavaTlsServerSocketFactory;
 import io.questdb.tls.ServerTlsConfiguration;
+import io.questdb.tls.TlsFactoryProvider;
 import io.questdb.tls.TlsFactoryProviderFactory;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -38,6 +41,9 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.File;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
+import java.util.ArrayList;
 import java.util.Properties;
 
 import io.questdb.log.Log;
@@ -101,6 +107,82 @@ public class TlsFactoryProviderTest {
                 "-out", keyFile.getAbsolutePath()
         ).redirectErrorStream(true).start();
         assertEquals(0, convertProcess.waitFor());
+    }
+
+    @Test
+    public void testDelegatesEveryNonSocketMethod() throws Exception {
+        final var invoked = new ArrayList<String>();
+        final var returned = new Object[1];
+        final var delegate = (FactoryProvider) Proxy.newProxyInstance(
+                FactoryProvider.class.getClassLoader(),
+                new Class<?>[]{FactoryProvider.class},
+                (proxy, method, args) -> {
+                    invoked.add(method.getName());
+                    final var returnType = method.getReturnType();
+                    // a distinct instance of the declared return type, so the caller's result can be traced back
+                    returned[0] = returnType.isInterface()
+                            ? Proxy.newProxyInstance(returnType.getClassLoader(), new Class<?>[]{returnType}, (p, m, a) -> null)
+                            : null;
+                    return returned[0];
+                }
+        );
+        final SocketFactory http = PlainSocketFactory.INSTANCE;
+        final SocketFactory httpMin = (nf, log) -> null;
+        final SocketFactory line = (nf, log) -> null;
+        final SocketFactory pg = (nf, log) -> null;
+        final var provider = new TlsFactoryProvider(delegate, http, httpMin, line, pg);
+        for (Method method : FactoryProvider.class.getMethods()) {
+            invoked.clear();
+            returned[0] = null;
+            final var paramTypes = method.getParameterTypes();
+            final var args = new Object[paramTypes.length];
+            for (var i = 0; i < args.length; i++) {
+                args[i] = paramTypes[i] == int.class ? 3 : null;
+            }
+            final var result = method.invoke(provider, args);
+            switch (method.getName()) {
+                case "getHttpSocketFactory" -> assertSame(http, result);
+                case "getHttpMinSocketFactory" -> assertSame(httpMin, result);
+                case "getLineSocketFactory" -> assertSame(line, result);
+                case "getPGWireSocketFactory" -> assertSame(pg, result);
+                default -> {
+                    assertEquals("method must reach the delegate: " + method, 1, invoked.size());
+                    assertEquals(method.getName(), invoked.getFirst());
+                    assertSame("method must return the delegate's result: " + method, returned[0], result);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testOverridesEveryFactoryProviderMethod() throws Exception {
+        // A default method of the interface that TlsFactoryProvider does not override would bypass the delegate.
+        for (Method method : FactoryProvider.class.getMethods()) {
+            final var impl = TlsFactoryProvider.class.getMethod(method.getName(), method.getParameterTypes());
+            assertEquals("TlsFactoryProvider must override " + method, TlsFactoryProvider.class, impl.getDeclaringClass());
+        }
+    }
+
+    @Test
+    public void testInvalidCertificateFailsProvider() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final var badCert = temp.newFile("bad.crt");
+            final var badKey = temp.newFile("bad.key");
+            java.nio.file.Files.writeString(badCert.toPath(), "not a certificate");
+            java.nio.file.Files.writeString(badKey.toPath(), "not a key");
+            final var tlsConfig = new ServerTlsConfiguration(true, badCert.getAbsolutePath(), badKey.getAbsolutePath());
+            final var fpf = new TlsFactoryProviderFactory(tlsConfig, ServerTlsConfiguration.DISABLED, ServerTlsConfiguration.DISABLED, ServerTlsConfiguration.DISABLED);
+            final var config = new PropServerConfiguration(
+                    root, new Properties(), null, LOG, new BuildInformationHolder(),
+                    FilesFacadeImpl.INSTANCE, MicrosecondClockImpl.INSTANCE, fpf
+            );
+            try {
+                fpf.getInstance(config, null, null);
+                fail("expected CairoException");
+            } catch (io.questdb.cairo.CairoException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "failed to initialize TLS: ");
+            }
+        });
     }
 
     @Test

@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - '[0-9]*.[0-9]*.[0-9]*'
+      # TLS image tags (e.g. 10.2.0-tls) belong to publish-tls-image.yml
+      - '!*-tls'
   # A manual dispatch packages and verifies only: the publish jobs below run
   # solely on a tag push.
   workflow_dispatch:

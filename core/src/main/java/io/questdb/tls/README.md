@@ -23,7 +23,16 @@ TLS support follows the **overlay pattern**:
    default `FactoryProviderImpl` and overrides socket factories per protocol.
 
 4. **`JavaTlsServerSocketFactory` / `JavaTlsServerSocket`** -- wrap plain
-   sockets with `SSLEngine` for TLS handshake and encryption.
+   sockets with `SSLEngine` for TLS handshake and encryption. The handshake is
+   non-blocking: `startTlsSession()` starts it, and `recv()`/`send()` continue it
+   whenever the IO dispatcher reports the socket ready, returning 0 until it
+   completes. A client that stalls mid-handshake therefore waits in the
+   dispatcher like any idle connection (and is closed by the usual idle
+   timeouts) instead of holding a worker thread. Handshake bytes the socket
+   cannot take at once are flushed through `wantsTlsWrite()`/`tlsIO()`. When the
+   caller's receive buffer is smaller than one decrypted TLS record (about
+   16 KiB), the socket stages the record and hands it out over several `recv()`
+   calls.
 
 5. **`PemReader`** -- loads PEM-encoded X.509 certificates and PKCS8 private
    keys to create an `SSLContext`.
@@ -137,16 +146,15 @@ The `-nodes` flag produces a PKCS8-format key directly — no conversion needed.
 
 ### Build the Docker image
 
+The test image builds on the stock QuestDB image, so the jar and its native
+libraries (including the Rust `libquestdbr`) are built for Linux inside Docker.
+A jar built on macOS carries only the macOS native libraries and does not start
+in a Linux container. Build from a full clone (not a git worktree: the build
+runs `git` inside the container):
+
 ```bash
-# Build QuestDB JAR first
-mvn clean package -DskipTests -P build-web-console
-
-# Copy JAR to Docker build context
-cp core/target/questdb-*.jar core/docker-tls/questdb.jar
-
-# Build image
-cd core/docker-tls
-docker build -t questdb-tls .
+docker build -f core/Dockerfile --target questdb -t questdb-base:local .
+docker build --build-arg BASE_IMAGE=questdb-base:local -t questdb-tls core/docker-tls
 ```
 
 ### Run the container
@@ -183,12 +191,13 @@ bash test-tls.sh
 
 ### Use custom certificates
 
-Mount your own certs at `/app/tls/`:
+Mount your own certs at `/etc/questdb/tls/` (readable by uid 10001, which
+QuestDB runs as):
 
 ```bash
 docker run -d --name questdb-tls \
   -p 9000:9000 -p 8812:8812 -p 9009:9009 \
-  -v /path/to/your/certs:/app/tls \
+  -v /path/to/your/certs:/etc/questdb/tls:ro \
   questdb-tls
 ```
 

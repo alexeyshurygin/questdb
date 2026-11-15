@@ -28,11 +28,13 @@ import io.questdb.PropertyKey;
 import io.questdb.ServerConfigurationException;
 import io.questdb.tls.ServerTlsConfiguration;
 import io.questdb.test.tools.TestUtils;
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.ClassRule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.Properties;
 
@@ -214,6 +216,88 @@ public class ServerTlsConfigurationTest {
             assertFalse(global.isEnabled());
             assertTrue(http.isEnabled());
             assertFalse(pg.isEnabled());
+        });
+    }
+
+    @Test
+    public void testRelativePathsResolveAgainstRootDir() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final var rootDir = temp.newFolder("relative-root");
+            assertTrue(new File(rootDir, "rel.crt").createNewFile());
+            assertTrue(new File(rootDir, "rel.key").createNewFile());
+            final var props = new Properties();
+            props.setProperty("tls.enabled", "true");
+            props.setProperty("tls.cert.path", "rel.crt");
+            props.setProperty("tls.private.key.path", "rel.key");
+            final var config = ServerTlsConfiguration.parse(
+                    props, null, rootDir.getAbsolutePath(),
+                    PropertyKey.TLS_ENABLED, PropertyKey.TLS_CERT_PATH, PropertyKey.TLS_PRIVATE_KEY_PATH,
+                    ServerTlsConfiguration.DISABLED, getString
+            );
+            assertTrue(config.isEnabled());
+            assertEquals(new File(rootDir, "rel.crt").getPath(), config.getCertPath());
+            assertEquals(new File(rootDir, "rel.key").getPath(), config.getPrivateKeyPath());
+        });
+    }
+
+    @Test
+    public void testUnreadableKeyFileThrows() throws Exception {
+        final var unreadable = temp.newFile("unreadable.key");
+        Assume.assumeTrue("cannot drop read permission (running as root?)", unreadable.setReadable(false, false) && !unreadable.canRead());
+        try {
+            TestUtils.assertMemoryLeak(() -> {
+                final var props = new Properties();
+                props.setProperty("tls.enabled", "true");
+                props.setProperty("tls.cert.path", certPath);
+                props.setProperty("tls.private.key.path", unreadable.getAbsolutePath());
+                try {
+                    ServerTlsConfiguration.parse(
+                            props, null, temp.getRoot().getAbsolutePath(),
+                            PropertyKey.TLS_ENABLED, PropertyKey.TLS_CERT_PATH, PropertyKey.TLS_PRIVATE_KEY_PATH,
+                            ServerTlsConfiguration.DISABLED, getString
+                    );
+                    fail("expected ServerConfigurationException");
+                } catch (ServerConfigurationException e) {
+                    TestUtils.assertContains(
+                            e.getMessage(),
+                            "TLS file is not readable [key=tls.private.key.path, path=" + unreadable.getAbsolutePath() + ']'
+                    );
+                }
+            });
+        } finally {
+            assertTrue(unreadable.setReadable(true, false));
+        }
+    }
+
+    @Test
+    public void testEmptyPathsThrow() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final var props = new Properties();
+            props.setProperty("tls.enabled", "true");
+            props.setProperty("tls.cert.path", "");
+            props.setProperty("tls.private.key.path", keyPath);
+            try {
+                ServerTlsConfiguration.parse(
+                        props, null, temp.getRoot().getAbsolutePath(),
+                        PropertyKey.TLS_ENABLED, PropertyKey.TLS_CERT_PATH, PropertyKey.TLS_PRIVATE_KEY_PATH,
+                        ServerTlsConfiguration.DISABLED, getString
+                );
+                fail("expected ServerConfigurationException");
+            } catch (ServerConfigurationException e) {
+                TestUtils.assertContains(e.getMessage(), "TLS is enabled but certificate path is not set [key=tls.cert.path]");
+            }
+            props.setProperty("tls.cert.path", certPath);
+            props.setProperty("tls.private.key.path", "");
+            try {
+                ServerTlsConfiguration.parse(
+                        props, null, temp.getRoot().getAbsolutePath(),
+                        PropertyKey.TLS_ENABLED, PropertyKey.TLS_CERT_PATH, PropertyKey.TLS_PRIVATE_KEY_PATH,
+                        ServerTlsConfiguration.DISABLED, getString
+                );
+                fail("expected ServerConfigurationException");
+            } catch (ServerConfigurationException e) {
+                TestUtils.assertContains(e.getMessage(), "TLS is enabled but private key path is not set [key=tls.private.key.path]");
+            }
         });
     }
 
