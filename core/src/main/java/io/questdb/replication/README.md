@@ -70,15 +70,15 @@ regular WAL apply job then applies them.
 
 ## Roles and write fencing
 
-`ReplicatedCairoEngine` refuses client writes unless the node is a writable
-primary: `isReadOnlyMode()` is false in the `PRIMARY` role only.
+`ReplicatedCairoEngine` refuses client writes unless the node is a primary
+whose lease is current: `isReadOnlyMode()` is false in the `PRIMARY` role only.
 
 | Engine role | Meaning |
 |---|---|
-| `PRIMARY_CATCHUP` | configured as primary, still applying what the store holds, waiting for the lease, or waiting for the store to answer |
-| `PRIMARY` | holds the lease; accepts writes and uploads them |
+| `PRIMARY_CATCHUP` | configured as primary and not writable now: still applying what the store holds, waiting for the lease or for the store to answer, or a primary whose lease lapsed and is not renewed yet |
+| `PRIMARY` | holds a current lease; accepts writes and uploads them |
 | `REPLICA` | follows the store; refuses writes |
-| `FENCED` | a primary that lost the lease, found diverging history or another database in the store, or lost its coordinator; read-only until restarted |
+| `FENCED` | a primary that lost the lease, may not take the store over without `_migrate_primary`, found diverging history or another database in the store, or lost its coordinator; read-only until restarted |
 
 Refused writes fail with `replica access is read-only`, the message QuestDB
 uses for every read-only refusal. QWP clients see the primary-catch-up role on
@@ -120,39 +120,60 @@ them.
    the lease was released by a graceful stop, or the index has not changed for
    three keepalive intervals. The taking node counts those on its own monotonic
    clock with its own setting, so give every node the same keepalive interval.
-   The object store enforces none of this: it only compares versions. A node
-   that restarts with the instance id of the current owner takes over without
+   The object store enforces none of this: it only compares versions. A
+   released index still names the primary that released it. A node that
+   restarts with the instance id of the current owner takes over without
    waiting, which is why `.replication/` must never be copied to another node.
-2. **Conditional index writes.** Two primaries can never both commit: the store
+2. **Lease-bound writes.** A primary accepts writes only while its lease is
+   current: for 2.5 keepalive intervals from the moment it sent its last index
+   write that the store accepted, on its own monotonic clock. After that it is
+   read-only (`PRIMARY_CATCHUP`) and uploads and deletes nothing. It becomes
+   writable again by itself, and only through an index write the store accepts:
+   the store accepts it only if no other node wrote the index in between. If one
+   did, the node fences itself and leaves the store as that node wrote it. A
+   takeover waits three keepalive intervals, so with equal settings the old
+   primary stops acknowledging writes before another node can take over. The
+   bound relies on the node's clock running: a primary whose machine was frozen
+   for longer than the takeover wait (a paused virtual machine) still trusts
+   its lease when it wakes up, and acknowledges writes until its next index
+   write, at most one keepalive interval later, fences it. Those writes stay on
+   that node only.
+3. **Conditional index writes.** Two primaries can never both commit: the store
    accepts an index only from the writer that saw the previous one, and the
-   primary whose write loses fences itself. Until that write, at most one
-   keepalive interval later, a deposed primary still acknowledges writes.
-3. **Epochs.** Each new primary term writes its objects under a new epoch, so a
+   primary whose write loses fences itself.
+4. **Epochs.** Each new primary term writes its objects under a new epoch, so a
    deposed primary cannot overwrite what its successor wrote.
-4. **Catch-up before writes.** A starting primary applies everything the store
+5. **Catch-up before writes.** A starting primary applies everything the store
    holds, takes the lease, and catches up again before it opens writes. While
    the store is unreachable it stays read-only and keeps trying.
-5. **Divergence check.** A node compares its history with the store's before
+6. **Promotion guard.** A node started as primary takes a store over by itself
+   only when it is that store's own primary coming back: the index names it as
+   the owner and holds nothing the node lacks. Any other node (a replica being
+   promoted, a restored copy, a primary that lost transactions the store holds)
+   fences itself and changes nothing in the store, unless an empty
+   `_migrate_primary` file is in its install root. The node removes the file
+   once it is the primary, so the file allows one promotion. A role set to
+   `primary` by mistake therefore does no harm.
+7. **Divergence check.** A node compares its history with the store's before
    it extends either. A node starting as primary that holds a different
    transaction at the same number (a crashed primary with transactions it never
    uploaded, after a failover) fences itself and uploads none of it. On a
    replica, the table that differs stops replicating and the log says so; the
    node stays a replica and keeps serving its local rows of that table, so it
    must be re-seeded.
-6. **DataID.** A node only joins a store of the same database. A replica adopts
+8. **DataID.** A node only joins a store of the same database. A replica adopts
    the store's DataID; an empty node starting as primary does too.
-7. **Gap check.** A replica that needs transactions the store no longer holds
+9. **Gap check.** A replica that needs transactions the store no longer holds
    stops replicating that table and says so.
-8. **Strict configuration.** An unknown role, a malformed store string, or
+10. **Strict configuration.** An unknown role, a malformed store string, or
    `readonly=true` combined with a role stops the server at startup.
-9. **Asynchronous.** A transaction is acknowledged before it is uploaded. If the
-   primary dies, what it had not uploaded yet is lost: up to one throttle
-   window of transactions, more while uploads are failing. A primary that
-   cannot reach the object store keeps accepting writes and uploads them when
-   the store is back. It does not stop when its lease runs out, so stop the old
-   primary, or make sure it cannot be reached, before promoting another node:
-   what it accepts after the promotion is never replicated, and it fences
-   itself only at its next index write that reaches the store.
+11. **Asynchronous.** A transaction is acknowledged before it is uploaded. If
+    the primary dies, what it had not uploaded yet is lost: up to one throttle
+    window of transactions, more while uploads are failing. A primary that
+    cannot reach the object store accepts writes until its lease lapses (item
+    2), so an outage adds at most 2.5 keepalive intervals of transactions that
+    exist on the primary only. It uploads them when the store is back, unless
+    another node was promoted in the meantime: then they are never replicated.
 
 ## Promotion
 
@@ -160,9 +181,11 @@ them.
    committed and then releases the lease. If it cannot upload all of it (the
    store is unreachable, the stop times out), it leaves the lease to expire, so
    a released lease always means a complete store.
-2. Restart the replica with `replication.role=primary`. It catches up, takes the
+2. Create an empty `_migrate_primary` file in the replica's install root and
+   restart the replica with `replication.role=primary`. It catches up, takes the
    lease (at once after a graceful stop, after three keepalive intervals
-   otherwise) and opens writes.
+   otherwise), opens writes and removes the file. Without the file it fences
+   itself, and its log names the file and the directory it expects it in.
 3. Restart the former primary with `replication.role=replica` to make it follow
    the new primary. If it had transactions it never uploaded, the tables they
    belong to stop replicating once the new primary writes those transaction
@@ -182,7 +205,8 @@ them.
   identifies a node. A node started with `_restore` replaces a copied id; a
   plain copy does not.
 - **Disaster recovery without a replica:** restore a checkpoint-consistent volume
-  snapshot on a new node and start it with `replication.role=primary`. It rolls
+  snapshot on a new node, put an empty `_migrate_primary` file in its install
+  root and start it with `replication.role=primary`. It rolls
   every table forward from the store to the last uploaded transaction, provided
   the WAL cleaner has not removed the transactions after the snapshot. A table
   that existed before replication was enabled needs a snapshot taken after that.
@@ -212,10 +236,9 @@ says so.
 
 - **Role switch.** Enterprise promotes and demotes in place (`SWITCH ROLE`).
   Here both need a restart.
-- **Promotion guard.** Enterprise refuses a promotion while the node is behind
-  the store, and its restart path needs a `_migrate_primary` file. Here a node
-  started with `replication.role=primary` catches up and takes the lease by
-  itself.
+- **Promotion guard.** As in Enterprise, a restart-based promotion needs a
+  `_migrate_primary` file. Enterprise refuses an in-place promotion while the
+  node is behind the store; here the node catches up first.
 - **Former primary.** Enterprise lets it rejoin as a replica and discards the
   transactions it never uploaded. Here those tables stop replicating and the
   node needs a fresh copy.
@@ -225,7 +248,9 @@ says so.
   to `adaptive`. Enterprise leaves the default at `nosync` and tells operators
   to set `adaptive` on every node that can become primary.
 - **Store outage.** The Enterprise documentation does not say what a primary
-  does while the store is unreachable. Here it keeps accepting writes.
+  does while the store is unreachable. Here it turns read-only when its lease
+  lapses, 2.5 keepalive intervals after its last accepted index write, and
+  turns writable again when the store accepts a renewal.
 - **Settings without effect.** These are accepted and range-checked, and do
   nothing: `replication.summary.interval`, `replication.metrics.per.table`,
   `replication.metrics.dropped.table.poll.count`,

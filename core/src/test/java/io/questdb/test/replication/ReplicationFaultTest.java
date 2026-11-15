@@ -340,6 +340,7 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
             // a released the lease. b takes it: its first index write fails outright, twice; on the third
             // attempt another node commits first, so b's write loses the comparison
             writeConfiguration(b, "primary");
+            allowPromotion(b);
             final AtomicInteger failures = new AtomicInteger(2);
             final AtomicBoolean isRaceArmed = new AtomicBoolean(true);
             try (TestServerMain nodeB = startFaulty(b, new FaultyObjectStore.Hook() {
@@ -429,6 +430,135 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
                 TestUtils.assertEventually(() -> Assert.assertTrue(failedBefore.get() < 0), 30);
                 awaitSame(primary, replica, "t");
                 Assert.assertEquals(EngineRole.PRIMARY, role(primary));
+            }
+        });
+    }
+
+    @Test
+    public void testPrimaryIsReadOnlyWhileItsLeaseIsLapsedAndResumes() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            final String r = nodeRoot("r");
+            // uploads wait for a ten-minute window, so the insert below is still local when the store goes
+            writeConfiguration(p, "primary", PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000");
+            writeConfiguration(r, "replica");
+            final AtomicBoolean isStoreDown = new AtomicBoolean();
+            try (TestServerMain primary = startFaulty(p, new FaultyObjectStore.Hook() {
+                @Override
+                public void before(String op, String key) {
+                    if (isStoreDown.get()) {
+                        throw ObjectStoreException.retryable("injected store outage", null);
+                    }
+                }
+            }); TestServerMain replica = start(r)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(primary, "t");
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitApplied(primary, "t");
+
+                // the store goes away. Writes are accepted while the lease is current, and refused once it
+                // is two and a half keepalive intervals old: another node may take over half an interval later
+                isStoreDown.set(true);
+                final long outageStart = System.nanoTime();
+                primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                TestUtils.assertEventually(() -> Assert.assertEquals(EngineRole.PRIMARY_CATCHUP, role(primary)), 30);
+                final long lapsedAfterMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - outageStart);
+                // the lease is 2.5 s here and the last renewal was at most a little over one keepalive interval
+                // (1 s) before the outage: not at once, and not as late as the 3 s after which another node may take over
+                Assert.assertTrue("lapsed after " + lapsedAfterMillis + " ms", lapsedAfterMillis >= 1_000 && lapsedAfterMillis < 6_000);
+                final io.questdb.replication.ReplicatedCairoEngine engine = (io.questdb.replication.ReplicatedCairoEngine) primary.getEngine();
+                Assert.assertTrue(engine.isPrimaryRole());
+                Assert.assertTrue(engine.isLeaseLapsed());
+                Assert.assertNull(engine.getFenceReason());
+                try {
+                    primary.execute("INSERT INTO t VALUES ('2024-01-03', 3)");
+                    Assert.fail("a primary with a lapsed lease must refuse writes");
+                } catch (Throwable e) {
+                    TestUtils.assertContains(String.valueOf(e.getMessage()) + e.getCause(), io.questdb.cairo.CairoException.READ_ONLY_ACCESS_MESSAGE);
+                }
+                TestUtils.assertEventually(() -> TestUtils.assertContains(primary.getReplicationService().getStatus(), "lease lapsed"), 30);
+                primary.assertSql("SELECT count() n FROM t", "n\n2\n");
+
+                // the store is back and nobody took it: the node renews its lease and carries on by itself
+                isStoreDown.set(false);
+                awaitRole(primary, EngineRole.PRIMARY);
+                Assert.assertNull(engine.getFenceReason());
+                TestUtils.assertEventually(() -> TestUtils.assertContains(primary.getReplicationService().getStatus(), "primary, epoch"), 30);
+                primary.execute("INSERT INTO t VALUES ('2024-01-03', 3)");
+            }
+            // the stop uploaded what the outage and the window had kept local
+            Assert.assertEquals(3, readIndex().getTables().getQuick(0).getLastTxn());
+            Assert.assertTrue(readIndex().isReleased());
+        });
+    }
+
+    @Test
+    public void testPrimaryWithLapsedLeaseTouchesNothingAfterATakeover() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            writeConfiguration(
+                    p, "primary",
+                    PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000",
+                    PropertyKey.REPLICATION_PRIMARY_CLEANER_INTERVAL.getPropertyPath() + "=1s",
+                    PropertyKey.REPLICATION_PRIMARY_CLEANER_DROPPED_TABLE_COOLOFF.getPropertyPath() + "=0"
+            );
+            final AtomicBoolean isStoreDown = new AtomicBoolean();
+            final AtomicBoolean isRecording = new AtomicBoolean();
+            final java.util.List<String> requests = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+            try (TestServerMain primary = startFaulty(p, new FaultyObjectStore.Hook() {
+                @Override
+                public void before(String op, String key) {
+                    if (isStoreDown.get()) {
+                        throw ObjectStoreException.retryable("injected store outage", null);
+                    }
+                    if (isRecording.get()) {
+                        requests.add(op + ' ' + key);
+                    }
+                }
+            })) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("CREATE TABLE gone (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(primary, "t");
+                awaitUploaded(primary, "gone");
+                // work is waiting when the store goes away: rows to upload, and a dropped table to clean
+                isStoreDown.set(true);
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                primary.execute("DROP TABLE gone");
+                TestUtils.assertEventually(() -> Assert.assertEquals(EngineRole.PRIMARY_CATCHUP, role(primary)), 30);
+
+                // during the outage another node takes the store over; then the store answers this node again
+                writeForeignIndex();
+                final long foreignSequence = readIndex().getSequence();
+                isRecording.set(true);
+                isStoreDown.set(false);
+                awaitRole(primary, EngineRole.FENCED);
+                TestUtils.assertContains(((io.questdb.replication.ReplicatedCairoEngine) primary.getEngine()).getFenceReason(), "lost its lease");
+
+                // all it did was try to renew its lease, which the store refused: no upload, no deletion
+                synchronized (requests) {
+                    for (String request : requests) {
+                        Assert.assertTrue(request, request.equals("put " + IndexClient.INDEX_KEY) || request.startsWith("get "));
+                    }
+                    Assert.assertTrue(requests.toString(), requests.contains("put " + IndexClient.INDEX_KEY));
+                }
+                final io.questdb.replication.codec.ReplicationIndex index = readIndex();
+                Assert.assertEquals("another-primary", index.getOwnerInstanceId());
+                Assert.assertEquals(foreignSequence, index.getSequence());
+                try {
+                    primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                    Assert.fail("a fenced primary must refuse writes");
+                } catch (Throwable e) {
+                    TestUtils.assertContains(String.valueOf(e.getMessage()) + e.getCause(), io.questdb.cairo.CairoException.READ_ONLY_ACCESS_MESSAGE);
+                }
+            }
+            // nor did the stop: the store is as the other node left it
+            Assert.assertEquals("another-primary", readIndex().getOwnerInstanceId());
+            synchronized (requests) {
+                for (String request : requests) {
+                    Assert.assertTrue(request, request.equals("put " + IndexClient.INDEX_KEY) || request.startsWith("get "));
+                }
             }
         });
     }

@@ -109,6 +109,36 @@ public abstract class AbstractReplicationTest extends AbstractBootstrapTest {
     }
 
     /**
+     * Copies a directory tree, replacing the target.
+     */
+    protected static void copyTree(String from, String to) throws Exception {
+        TestUtils.removeTestPath(to);
+        final java.nio.file.Path src = java.nio.file.Paths.get(from);
+        final java.nio.file.Path dst = java.nio.file.Paths.get(to);
+        try (java.util.stream.Stream<java.nio.file.Path> files = java.nio.file.Files.walk(src)) {
+            for (java.nio.file.Path f : (Iterable<java.nio.file.Path>) files::iterator) {
+                final java.nio.file.Path target = dst.resolve(src.relativize(f).toString());
+                if (java.nio.file.Files.isDirectory(f)) {
+                    java.nio.file.Files.createDirectories(target);
+                } else {
+                    java.nio.file.Files.copy(f, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
+    }
+
+    /**
+     * Lets the node take over an object store it does not own, on its next start as primary.
+     */
+    protected static void allowPromotion(String serverRoot) throws Exception {
+        TestUtils.createTestPath(serverRoot);
+        final java.nio.file.Path marker = java.nio.file.Paths.get(serverRoot, io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE);
+        if (!java.nio.file.Files.exists(marker)) {
+            java.nio.file.Files.createFile(marker);
+        }
+    }
+
+    /**
      * The index the object store holds now.
      */
     protected io.questdb.replication.codec.ReplicationIndex readIndex() {
@@ -171,7 +201,7 @@ public abstract class AbstractReplicationTest extends AbstractBootstrapTest {
                 PropertyKey.REPLICATION_ROLE.getPropertyPath() + '=' + role,
                 PropertyKey.REPLICATION_OBJECT_STORE.getPropertyPath() + "=fs::root=" + storeRoot + ';',
                 PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=100",
-                PropertyKey.REPLICATION_PRIMARY_KEEPALIVE_INTERVAL.getPropertyPath() + "=500",
+                PropertyKey.REPLICATION_PRIMARY_KEEPALIVE_INTERVAL.getPropertyPath() + "=1000",
                 PropertyKey.REPLICATION_REPLICA_POLL_INTERVAL.getPropertyPath() + "=50"
         );
         Collections.addAll(settings, extra);

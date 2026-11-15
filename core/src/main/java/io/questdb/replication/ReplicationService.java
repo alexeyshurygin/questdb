@@ -83,6 +83,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private static final long CATCHUP_BATCH = 10_000;
     private static final String INSTANCE_FILE = "instance";
     private static final Log LOG = LogFactory.getLog(ReplicationService.class);
+    /**
+     * An empty file of this name in the install root lets a node that does not own the object store, or
+     * is behind it, become its primary. The node removes it once it is the primary.
+     */
+    public static final String MIGRATE_PRIMARY_FILE = "_migrate_primary";
     private static final long UPLOAD_BATCH = 10_000;
     private static final int WHOLE_WAL = -1;
     private final ConcurrentLinkedQueue<ReplicationWorker> allWorkers = new ConcurrentLinkedQueue<>();
@@ -118,6 +123,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // the WAL cleaner changed index entries it could not commit yet; coordinator thread only
     private boolean isCleanerCommitPending;
     private volatile boolean isClosed;
+    // an operator allowed this node to take over a store it does not own or is behind; read once at start
+    private volatile boolean isMigrationAllowed;
     // when close() began waiting for the coordinator; 0 until then
     private volatile long closeStartedNanos;
     private volatile boolean isCrashed;
@@ -373,6 +380,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         isStarted = true;
         isRunning = true;
         instanceId = loadInstanceId();
+        isMigrationAllowed = isPrimary && Files.exists(Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE));
         mainThread = new Thread(this::run, "qdb-replication");
         mainThread.setDaemon(true);
         mainThread.start();
@@ -473,7 +481,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final ReplicationIndex idx = new ReplicationIndex();
         final DataID dataID = engine.getDataID();
         idx.setDataId(dataID.getHi(), dataID.getLo());
-        idx.setOwner(isReleased ? null : instanceId, epoch, engine.getConfiguration().getMicrosecondClock().getTicks(), sequence + 1, isReleased);
+        // a released index still names who released it: that node may come back as primary unasked
+        idx.setOwner(instanceId, epoch, engine.getConfiguration().getMicrosecondClock().getTicks(), sequence + 1, isReleased);
         for (TableUploader u : uploaders.values()) {
             // a replica asks for the create manifest of every table the index lists and gives the table
             // up when it stays missing, so a table created under replication waits for its manifest
@@ -535,6 +544,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      */
     private boolean commitIndex(boolean isReleased) {
         final ReplicationIndex idx = buildIndex(isReleased);
+        // the lease counts from before the request: the store accepted the write no earlier than this
+        final long writeStartNanos = System.nanoTime();
         try {
             indexClient.write(idx, config.getCompressionLevel());
         } catch (ObjectStoreException e) {
@@ -587,6 +598,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
         sequence = idx.getSequence();
         lastIndexWriteNanos = System.nanoTime();
+        if (!isReleased) {
+            engine.renewLease(writeStartNanos + TimeUnit.MILLISECONDS.toNanos(leaseMillis()));
+        }
         for (TableUploader u : uploaders.values()) {
             synchronized (u) {
                 u.onCommitted();
@@ -604,7 +618,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
 
     // another node committed an index after the one this node last saw
     private void onLeaseLost(String reason) {
-        if (engine.getRole() == ReplicatedCairoEngine.EngineRole.PRIMARY) {
+        if (engine.isPrimaryRole()) {
             fence(reason);
         } else {
             // not writable yet, so nothing of this node's is at stake: catch up and wait for the lease again
@@ -885,6 +899,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             try {
                 idx = indexClient.read();
                 if (idx != null) {
+                    checkMayBecomePrimary(idx);
                     if (!engine.getDataID().isInitialized()) {
                         throw ReplicationException.divergence("this primary has no database id");
                     }
@@ -931,9 +946,32 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         status = "primary, epoch " + epoch;
         LOG.advisory().$("replication primary is writable [epoch=").$(epoch).$(", instance=").$(instanceId)
                 .$(", store=").$(store.getDescription()).I$();
+        consumeMigrationMarker();
         long firstDirtyNanos = 0;
+        boolean wasLeaseLapsed = false;
         while (isRunning) {
             final long window = config.getThrottleWindowDuration();
+            if (engine.isLeaseLapsed()) {
+                // The node refuses writes by now. Another node may have taken the store over, so nothing
+                // goes up and nothing is deleted until the store accepts this node's next index, which it
+                // does only if nobody replaced the one this node wrote last. If somebody did, the node fences.
+                if (!wasLeaseLapsed) {
+                    wasLeaseLapsed = true;
+                    status = "primary, lease lapsed: read-only until the object store accepts a renewal";
+                    LOG.critical().$("replication lease lapsed, the primary is read-only until it renews it [epoch=").$(epoch).I$();
+                }
+                if (!renewLapsedLease()) {
+                    if (isRunning) {
+                        sleepQuietly(config.getRetryInterval());
+                    }
+                    continue;
+                }
+            }
+            if (wasLeaseLapsed) {
+                wasLeaseLapsed = false;
+                status = "primary, epoch " + epoch;
+                LOG.advisory().$("replication lease renewed, the primary accepts writes again [epoch=").$(epoch).I$();
+            }
             if (!dirtyTables.isEmpty() && firstDirtyNanos == 0) {
                 firstDirtyNanos = System.nanoTime();
             }
@@ -963,7 +1001,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             awaitWake(Math.max(1, Math.min(window, config.getKeepaliveInterval()) / 4));
         }
         // drain what is committed, then hand the lease over
-        if (engine.getRole() == ReplicatedCairoEngine.EngineRole.PRIMARY && !isCrashed) {
+        if (engine.isPrimaryRole() && !isCrashed) {
             try {
                 drainAndRelease();
             } catch (Throwable th) {
@@ -979,6 +1017,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      * own, as after a crash.
      */
     private void drainAndRelease() {
+        if (engine.isLeaseLapsed() && !renewLapsedLease()) {
+            LOG.error().$("replication stops with a lapsed lease it could not renew; nothing more is uploaded").$();
+            return;
+        }
         for (TableUploader u : uploaders.values()) {
             dirtyTables.put(u.getToken().getDirName(), Boolean.TRUE);
         }
@@ -989,11 +1031,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final long deadline = (closeStarted != 0 ? closeStarted : System.nanoTime()) + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() / 2);
         while (System.nanoTime() < deadline) {
             final long uploaded = primaryRound(true);
-            if (uploaded == 0 || dirtyTables.isEmpty() || engine.getRole() != ReplicatedCairoEngine.EngineRole.PRIMARY) {
+            if (uploaded == 0 || dirtyTables.isEmpty() || !engine.isPrimaryRole()) {
                 break;
             }
         }
-        if (engine.getRole() != ReplicatedCairoEngine.EngineRole.PRIMARY) {
+        if (!engine.isPrimaryRole()) {
             return;
         }
         if (dirtyTables.isEmpty() && createdTables.isEmpty()) {
@@ -1008,8 +1050,86 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 .$(dirtyTables.size() + createdTables.size()).I$();
     }
 
+    /**
+     * How long a primary may act on one accepted index write. Another node takes the store over once
+     * the index has not changed for three keepalive intervals, counted from when that node first saw
+     * it, which is never before the write. This primary stops half an interval earlier: the margin
+     * covers a write that passed the lease check just before the bound.
+     */
+    private long leaseMillis() {
+        return config.getKeepaliveInterval() * 5 / 2;
+    }
+
     private long shutdownTimeoutMillis() {
         return Math.max(5_000, 3 * config.getRequestBaseTimeout());
+    }
+
+    /**
+     * A node configured as primary takes a store over by itself only when it is the store's own
+     * primary coming back: the index names it as the owner and holds nothing this node lacks. Any other
+     * node needs an empty {@value #MIGRATE_PRIMARY_FILE} file in its install root, as QuestDB Enterprise
+     * requires for a restart-based promotion. A replica whose role was set to primary by mistake, or a
+     * restored copy started with the wrong role, therefore changes nothing in the store.
+     */
+    private void checkMayBecomePrimary(ReplicationIndex idx) {
+        if (isMigrationAllowed) {
+            return;
+        }
+        final String why;
+        if (!instanceId.equals(idx.getOwnerInstanceId())) {
+            why = "the object store belongs to another primary [owner=" + idx.getOwnerInstanceId() + ']';
+        } else {
+            final String behind = firstTableBehind(idx);
+            if (behind == null) {
+                return;
+            }
+            why = "this node is behind the object store [table=" + behind + ']';
+        }
+        throw ReplicationException.divergence(why + "; to make this node the primary, create an empty " + MIGRATE_PRIMARY_FILE
+                + " file in " + engine.getConfiguration().getInstallRoot() + " and restart it");
+    }
+
+    // the marker allows one promotion
+    private void consumeMigrationMarker() {
+        if (isMigrationAllowed) {
+            isMigrationAllowed = false;
+            try {
+                Files.deleteIfExists(Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE));
+                LOG.advisory().$("replication promoted this node and removed ").$(MIGRATE_PRIMARY_FILE).$();
+            } catch (java.io.IOException e) {
+                LOG.error().$("could not remove ").$(MIGRATE_PRIMARY_FILE).$(" [error=").$safe(e.getMessage()).I$();
+            }
+        }
+    }
+
+    // the name of a table the store holds more of than this node, or null
+    private String firstTableBehind(ReplicationIndex idx) {
+        final ObjList<IndexTable> tables = idx.getTables();
+        for (int i = 0, n = tables.size(); i < n; i++) {
+            final IndexTable t = tables.getQuick(i);
+            final TableToken token = engine.getTableTokenByDirName(t.getDirName());
+            if (token == null) {
+                if (!t.isDropped()) {
+                    return t.getTableName();
+                }
+            } else if (t.isDropped() || engine.getTableSequencerAPI().lastTxn(token) < t.getLastTxn()) {
+                return t.getTableName();
+            }
+        }
+        return null;
+    }
+
+    // one index write with nothing new in it; true when the store accepted it
+    private boolean renewLapsedLease() {
+        try {
+            return commitIndex(false) && !engine.isLeaseLapsed();
+        } catch (ObjectStoreException e) {
+            LOG.error().$("could not renew the replication lease, will retry [error=").$safe(e.getMessage()).I$();
+            return false;
+        } catch (Throwable th) {
+            LOG.critical().$("could not renew the replication lease, will retry [error=").$(th).I$();
+            return false;
+        }
     }
 
     private long readCreateTimestamp(TableToken token) {

@@ -361,6 +361,32 @@ public class ReplicaApplyTest extends AbstractTest {
     }
 
     @Test
+    public void testReplayLeavesNoDurabilityPinBehind() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = newDir("pins-a");
+            final String b = newDir("pins-b");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            // adaptive commit mode: the sequencer pins every transaction until its writer flushed the log
+            try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
+                 ReplicatedCairoEngine replica = newEngine(b, ReplicationRole.REPLICA, null, io.questdb.cairo.CommitMode.ADAPTIVE);
+                 ReplicationWorker pw = worker(store, primary, a);
+                 ReplicationWorker rw = worker(store, replica, b)) {
+                final IndexTable entry = uploadSample(primary, pw);
+                final TableReplayer replayer = new TableReplayer(entry.getKey());
+                Assert.assertEquals(3, replayer.replay(replica, entry, rw, null, 100));
+                Assert.assertNull(replayer.getStaleReason());
+                final TableToken token = replica.verifyTableName("t");
+                final io.questdb.cairo.wal.seq.SeqTxnTracker tracker = replica.getTableSequencerAPI().getTxnTrackerIfExists(token);
+                Assert.assertNotNull(tracker);
+                // nobody on this node writes the primary's WALs: the replayer flushed the log and dropped
+                // their pins, and the table's durable frontier is at the last replayed transaction
+                Assert.assertEquals(0, tracker.getPendingWriterPinCount());
+                Assert.assertEquals(3, tracker.getLocalDurableSeqTxn());
+            }
+        });
+    }
+
+    @Test
     public void testReplayFailures() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = newDir("replay-a");
@@ -824,7 +850,16 @@ public class ReplicaApplyTest extends AbstractTest {
     }
 
     private static ReplicatedCairoEngine newEngine(String dir, ReplicationRole role, FilesFacade ff) {
+        return newEngine(dir, role, ff, io.questdb.cairo.CommitMode.NOSYNC);
+    }
+
+    private static ReplicatedCairoEngine newEngine(String dir, ReplicationRole role, FilesFacade ff, int commitMode) {
         final DefaultTestCairoConfiguration configuration = new DefaultTestCairoConfiguration(dir + File.separator + "db", dir) {
+            @Override
+            public int getCommitMode() {
+                return commitMode;
+            }
+
             @Override
             public @NotNull FilesFacade getFilesFacade() {
                 return ff != null ? ff : super.getFilesFacade();
@@ -843,6 +878,8 @@ public class ReplicaApplyTest extends AbstractTest {
             engine.buildViewGraphs();
             if (role == ReplicationRole.PRIMARY) {
                 engine.setRole(ReplicatedCairoEngine.EngineRole.PRIMARY, null);
+                // no replication service runs here to renew the lease
+                engine.renewLease(System.nanoTime() + java.util.concurrent.TimeUnit.HOURS.toNanos(1));
             }
             return engine;
         } catch (Throwable th) {

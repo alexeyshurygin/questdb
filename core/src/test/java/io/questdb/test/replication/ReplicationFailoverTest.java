@@ -61,16 +61,28 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             }
             // b takes over once a's lease expires and writes a different transaction 2
             writeConfiguration(b, "primary");
+            allowPromotion(b);
             try (TestServerMain nodeB = start(b)) {
                 awaitRole(nodeB, EngineRole.PRIMARY);
                 nodeB.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
                 awaitApplied(nodeB, "t");
             }
-            // a comes back as primary: its transaction 2 differs from the store's
+            // a comes back as primary. The store is b's now: a is refused before it looks any further
             writeConfiguration(a, "primary");
             try (TestServerMain nodeA = start(a)) {
                 awaitRole(nodeA, EngineRole.FENCED);
+                final String reason = ((io.questdb.replication.ReplicatedCairoEngine) nodeA.getEngine()).getFenceReason();
+                TestUtils.assertContains(reason, "the object store belongs to another primary");
+                TestUtils.assertContains(reason, io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE);
+            }
+            // told to take over anyway, it finds that its transaction 2 differs from the store's
+            writeConfiguration(a, "primary");
+            allowPromotion(a);
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.FENCED);
                 TestUtils.assertContains(((io.questdb.replication.ReplicatedCairoEngine) nodeA.getEngine()).getFenceReason(), "could not catch up");
+                // a refused promotion keeps its marker: nothing was promoted
+                Assert.assertTrue(java.nio.file.Files.exists(java.nio.file.Paths.get(a, io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE)));
                 assertWriteRefused(nodeA, "INSERT INTO t VALUES ('2024-01-03', 3)");
             }
         });
@@ -139,6 +151,7 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             storeRoot = root + File.separator + "store2";
             TestUtils.createTestPath(storeRoot);
             writeConfiguration(c, "primary");
+            allowPromotion(c);
             storeRoot = mainStore;
             try (TestServerMain nodeC = start(c)) {
                 awaitRole(nodeC, EngineRole.PRIMARY);
@@ -147,6 +160,7 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             }
             // pointed at a's store, c refuses it as a primary and as a replica
             writeConfiguration(c, "primary");
+            allowPromotion(c);
             try (TestServerMain nodeC = start(c)) {
                 awaitRole(nodeC, EngineRole.FENCED);
                 Assert.assertEquals("the object store belongs to another database (DataID differs)",
@@ -193,6 +207,7 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             final java.nio.file.Path dataId = java.nio.file.Paths.get(c, "db", io.questdb.cairo.DataID.FILENAME);
             java.nio.file.Files.deleteIfExists(dataId);
             writeConfiguration(c, "primary");
+            allowPromotion(c);
             try (TestServerMain nodeC = start(c)) {
                 awaitRole(nodeC, EngineRole.FENCED);
                 Assert.assertEquals("the object store belongs to another database (DataID differs)",
@@ -225,6 +240,7 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             }
             // b takes over and writes one transaction of its own: a different transaction 2
             writeConfiguration(b, "primary");
+            allowPromotion(b);
             try (TestServerMain nodeB = start(b)) {
                 awaitRole(nodeB, EngineRole.PRIMARY);
                 nodeB.execute("INSERT INTO t VALUES ('2024-02-01', 100)");
@@ -232,6 +248,7 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             }
             // a holds more transactions than the store, but they are not the store's: it must not upload them
             writeConfiguration(a, "primary");
+            allowPromotion(a);
             try (TestServerMain nodeA = start(a)) {
                 awaitRole(nodeA, EngineRole.FENCED);
                 TestUtils.assertContains(((io.questdb.replication.ReplicatedCairoEngine) nodeA.getEngine()).getFenceReason(), "could not catch up");
@@ -239,6 +256,7 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             }
             // the store still holds b's history only
             writeConfiguration(b, "primary");
+            allowPromotion(b);
             try (TestServerMain nodeB = start(b)) {
                 awaitRole(nodeB, EngineRole.PRIMARY);
                 nodeB.assertSql("SELECT v FROM t", "v\n100\n");
@@ -280,10 +298,121 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
 
             // another node takes over without a wait and without missing a row
             writeConfiguration(b, "primary");
+            allowPromotion(b);
             try (TestServerMain nodeB = start(b)) {
                 awaitRole(nodeB, EngineRole.PRIMARY);
                 awaitApplied(nodeB, "t");
                 nodeB.assertSql("SELECT count() n, max(v) m FROM t", "n\tm\n" + txnCount + "\t" + (txnCount - 1) + "\n");
+            }
+        });
+    }
+
+    @Test
+    public void testNodeBehindItsOwnStoreNeedsTheMigrationMarker() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String old = nodeRoot("a-old");
+            writeConfiguration(a, "primary");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitUploaded(nodeA, "t");
+                awaitApplied(nodeA, "t");
+            }
+            // the node as it was: same instance id, one transaction
+            copyTree(a, old);
+            writeConfiguration(a, "primary");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-02', 2), ('2024-01-03', 3)");
+                awaitUploaded(nodeA, "t");
+            }
+            final long sequence = readIndex().getSequence();
+            // its disk is rolled back, as a power loss rolls back commits that were never flushed: the
+            // store now holds more than the node. It owns the store, but it does not take it over unasked
+            copyTree(old, a);
+            writeConfiguration(a, "primary");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.FENCED);
+                final String reason = ((io.questdb.replication.ReplicatedCairoEngine) nodeA.getEngine()).getFenceReason();
+                TestUtils.assertContains(reason, "this node is behind the object store [table=t]");
+                TestUtils.assertContains(reason, io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE);
+                assertWriteRefused(nodeA, "INSERT INTO t VALUES ('2024-01-04', 4)");
+                nodeA.assertSql("SELECT count() n FROM t", "n\n1\n");
+            }
+            Assert.assertEquals(sequence, readIndex().getSequence());
+            // told to, it brings itself up to the store and carries on
+            writeConfiguration(a, "primary");
+            allowPromotion(a);
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                awaitApplied(nodeA, "t");
+                nodeA.assertSql("SELECT count() n FROM t", "n\n3\n");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-04', 4)");
+                awaitUploaded(nodeA, "t");
+            }
+        });
+    }
+
+    @Test
+    public void testPromotionNeedsTheMigrationMarker() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            writeConfiguration(a, "primary");
+            writeConfiguration(b, "replica");
+            try (TestServerMain nodeA = start(a); TestServerMain nodeB = start(b)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitSame(nodeA, nodeB, "t");
+            }
+            final io.questdb.replication.codec.ReplicationIndex released = readIndex();
+            Assert.assertTrue(released.isReleased());
+            final java.nio.file.Path marker = java.nio.file.Paths.get(b, io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE);
+
+            // the replica's role is changed to primary and nothing else: a slip of the hand. It is caught
+            // up and the lease is free, yet it leaves the store alone
+            writeConfiguration(b, "primary");
+            try (TestServerMain nodeB = start(b)) {
+                awaitRole(nodeB, EngineRole.FENCED);
+                final String reason = ((io.questdb.replication.ReplicatedCairoEngine) nodeB.getEngine()).getFenceReason();
+                TestUtils.assertContains(reason, "the object store belongs to another primary [owner=" + released.getOwnerInstanceId() + ']');
+                TestUtils.assertContains(reason, "create an empty " + io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE + " file in");
+                assertWriteRefused(nodeB, "INSERT INTO t VALUES ('2024-01-02', 2)");
+                nodeB.assertSql("SELECT count() n FROM t", "n\n1\n");
+            }
+            final io.questdb.replication.codec.ReplicationIndex untouched = readIndex();
+            Assert.assertEquals(released.getSequence(), untouched.getSequence());
+            Assert.assertEquals(released.getOwnerInstanceId(), untouched.getOwnerInstanceId());
+            Assert.assertEquals(released.getEpoch(), untouched.getEpoch());
+
+            // the operator means it: the marker promotes the node once, and is gone afterwards
+            writeConfiguration(b, "primary");
+            allowPromotion(b);
+            Assert.assertTrue(java.nio.file.Files.exists(marker));
+            final String ownerB;
+            try (TestServerMain nodeB = start(b)) {
+                awaitRole(nodeB, EngineRole.PRIMARY);
+                ownerB = nodeB.getReplicationService().getInstanceId();
+                TestUtils.assertEventually(() -> Assert.assertFalse(java.nio.file.Files.exists(marker)), 30);
+                nodeB.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                awaitUploaded(nodeB, "t");
+            }
+            Assert.assertEquals(ownerB, readIndex().getOwnerInstanceId());
+            // the store is its own now: it restarts as primary without being told again
+            writeConfiguration(b, "primary");
+            try (TestServerMain nodeB = start(b)) {
+                awaitRole(nodeB, EngineRole.PRIMARY);
+                nodeB.assertSql("SELECT count() n FROM t", "n\n2\n");
+            }
+            // and the former primary needs the marker to come back as primary
+            writeConfiguration(a, "primary");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.FENCED);
+                TestUtils.assertContains(((io.questdb.replication.ReplicatedCairoEngine) nodeA.getEngine()).getFenceReason(),
+                        "the object store belongs to another primary [owner=" + ownerB + ']');
             }
         });
     }
@@ -317,6 +446,7 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             final String b = nodeRoot("b");
             writeConfiguration(a, "primary");
             writeConfiguration(b, "primary");
+            allowPromotion(b);
             try (TestServerMain nodeA = start(a)) {
                 awaitRole(nodeA, EngineRole.PRIMARY);
                 nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
@@ -388,6 +518,7 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             }
             // promote b: restart it as primary
             writeConfiguration(b, "primary");
+            allowPromotion(b);
             writeConfiguration(a, "replica");
             try (TestServerMain nodeB = start(b)) {
                 awaitRole(nodeB, EngineRole.PRIMARY);

@@ -93,6 +93,20 @@ public class ReplicatedCairoEngineTest extends AbstractTest {
 
                 final long epoch0 = engine.getQwpServerInfoProvider().getEpoch();
                 engine.setRole(EngineRole.PRIMARY, null);
+                // the primary role alone opens no writes: the node also needs a current lease
+                Assert.assertTrue(engine.isPrimaryRole());
+                Assert.assertTrue(engine.isLeaseLapsed());
+                Assert.assertTrue(engine.isReadOnlyMode());
+                Assert.assertEquals(EngineRole.PRIMARY_CATCHUP, engine.getRole());
+                Assert.assertEquals(QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP, engine.getQwpServerInfoProvider().role());
+                assertRefused(engine, "CREATE TABLE early (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                // a lease that ran out a moment ago is as good as none, and renewals never move it back
+                engine.renewLease(System.nanoTime() - 1);
+                Assert.assertTrue(engine.isReadOnlyMode());
+                engine.renewLease(System.nanoTime() + java.util.concurrent.TimeUnit.HOURS.toNanos(1));
+                engine.renewLease(System.nanoTime() - 1);
+                Assert.assertFalse(engine.isLeaseLapsed());
+                Assert.assertEquals(EngineRole.PRIMARY, engine.getRole());
                 Assert.assertFalse(engine.isReadOnlyMode());
                 Assert.assertEquals(QwpEgressMsgKind.ROLE_PRIMARY, engine.getQwpServerInfoProvider().role());
                 Assert.assertEquals(epoch0 + 1, engine.getQwpServerInfoProvider().getEpoch());

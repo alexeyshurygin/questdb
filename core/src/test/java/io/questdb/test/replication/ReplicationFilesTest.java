@@ -268,6 +268,8 @@ public class ReplicationFilesTest extends AbstractTest {
             engine.load();
             engine.buildViewGraphs();
             engine.setRole(ReplicatedCairoEngine.EngineRole.PRIMARY, null);
+            // no replication service runs here to renew the lease
+            engine.renewLease(System.nanoTime() + java.util.concurrent.TimeUnit.HOURS.toNanos(1));
             return engine;
         } catch (Throwable th) {
             engine.close();

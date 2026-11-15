@@ -95,6 +95,8 @@ elif command == "ls":  # <key prefix>: prints the keys of the objects under the 
     for page in client("s3").get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=sys.argv[3]):
         for entry in page.get("Contents", []):
             print(entry["Key"])
+elif command == "etag":  # <key>: prints the object's ETag, which changes with every write of the object
+    print(client("s3").head_object(Bucket=bucket, Key=sys.argv[3])["ETag"])
 elif command == "ls-with-wrong-secret":  # prints how moto answers the right key id with a wrong secret
     wrong = client("s3", aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"], aws_secret_access_key="wrong")
     try:
@@ -230,20 +232,44 @@ echo -n "Test 8: the store holds the index and table objects... "
 OBJECTS=$(s3 ls e2e/ 2>&1 || true)
 if echo "$OBJECTS" | grep -q "_index" && echo "$OBJECTS" | grep -q "/seq/" && echo "$OBJECTS" | grep -q "/wal/"; then pass; else fail "$OBJECTS"; fi
 
-echo -n "Test 9: promotion: stop the primary, restart the replica as primary... "
+echo -n "Test 9: a replica restarted as primary without _migrate_primary stays read-only... "
 docker stop -t 60 "$NODE_A" >/dev/null
 docker rm "$NODE_A" >/dev/null
 docker rm -f "$NODE_B" >/dev/null
+INDEX_BEFORE=$(s3 etag e2e/_index 2>&1 || true)
 start_node "$NODE_B" "$PORT_B" primary
 verify_endpoint "$PORT_B"
-if await_writable "$PORT_B" && q "$PORT_B" "INSERT INTO trades VALUES ('2024-03-03', 'NEW', 2.0, 'after promotion')" | grep -q '"dml":"OK"' \
-    && await_count "$PORT_B" trades 1102 30; then
+REFUSED=""
+for _ in $(seq 1 60); do
+    if docker logs "$NODE_B" 2>&1 | grep -q "create an empty _migrate_primary file in /var/lib/questdb"; then
+        REFUSED=yes
+        break
+    fi
+    sleep 1
+done
+if [ -n "$REFUSED" ] \
+    && q "$PORT_B" "INSERT INTO trades VALUES ('2024-03-03', 'NO', 1.0, 'refused')" | grep -q "read-only" \
+    && [ -n "$INDEX_BEFORE" ] && [ "$(s3 etag e2e/_index 2>&1 || true)" = "$INDEX_BEFORE" ]; then
     pass
 else
     fail "$(docker logs --tail 30 "$NODE_B" 2>&1)"
 fi
 
-echo -n "Test 10: the former primary rejoins as a replica... "
+echo -n "Test 10: promotion: with _migrate_primary the replica becomes the primary... "
+docker rm -f "$NODE_B" >/dev/null
+docker run --rm -v "$NODE_B-vol:/var/lib/questdb" --entrypoint /bin/sh "$IMAGE" \
+    -c 'touch /var/lib/questdb/_migrate_primary && chmod 666 /var/lib/questdb/_migrate_primary' >/dev/null
+start_node "$NODE_B" "$PORT_B" primary
+verify_endpoint "$PORT_B"
+if await_writable "$PORT_B" && q "$PORT_B" "INSERT INTO trades VALUES ('2024-03-03', 'NEW', 2.0, 'after promotion')" | grep -q '"dml":"OK"' \
+    && await_count "$PORT_B" trades 1102 30 \
+    && ! docker exec "$NODE_B" test -e /var/lib/questdb/_migrate_primary; then
+    pass
+else
+    fail "$(docker logs --tail 30 "$NODE_B" 2>&1)"
+fi
+
+echo -n "Test 11: the former primary rejoins as a replica... "
 start_node "$NODE_A" "$PORT_A" replica
 verify_endpoint "$PORT_A"
 if await_count "$PORT_A" trades 1102 60; then pass; else fail "count=$(count "$PORT_A" trades)"; fi

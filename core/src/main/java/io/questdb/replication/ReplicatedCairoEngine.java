@@ -81,6 +81,9 @@ public class ReplicatedCairoEngine extends CairoEngine {
     private volatile @Nullable CheckpointListener checkpointListener;
     private volatile @Nullable String fenceReason;
     private volatile boolean isDataIdMintedAtBoot;
+    // a primary acknowledges writes until this moment; the replication service moves it with every
+    // index write that the object store accepted
+    private volatile long leaseValidUntilNanos = System.nanoTime();
     private volatile EngineRole role;
 
     public ReplicatedCairoEngine(
@@ -217,8 +220,13 @@ public class ReplicatedCairoEngine extends CairoEngine {
         return replicationConfiguration;
     }
 
+    /**
+     * The role in effect. A primary whose lease lapsed reports {@link EngineRole#PRIMARY_CATCHUP}: it
+     * refuses writes until it has renewed the lease, and clients treat that role as transient.
+     */
     public @NotNull EngineRole getRole() {
-        return role;
+        final EngineRole r = role;
+        return r == EngineRole.PRIMARY && isLeaseLapsed() ? EngineRole.PRIMARY_CATCHUP : r;
     }
 
     @Override
@@ -272,9 +280,37 @@ public class ReplicatedCairoEngine extends CairoEngine {
         return role == EngineRole.REPLICA && !getConfiguration().isReadOnlyInstance();
     }
 
+    /**
+     * True for a primary that has not renewed its ownership lease in time. Another node may take the
+     * object store over once the lease is three keepalive intervals old, so a primary stops
+     * acknowledging writes before that: what it accepted after a takeover could never be replicated.
+     * The check reads the clock on every call, so it holds while the replication coordinator is stuck
+     * in a request to an unreachable store.
+     */
+    public boolean isLeaseLapsed() {
+        return role == EngineRole.PRIMARY && System.nanoTime() - leaseValidUntilNanos >= 0;
+    }
+
+    /**
+     * True when the node holds the primary role, whether or not its lease is current.
+     */
+    public boolean isPrimaryRole() {
+        return role == EngineRole.PRIMARY;
+    }
+
     @Override
     public boolean isReadOnlyMode() {
-        return role != EngineRole.PRIMARY || super.isReadOnlyMode();
+        return role != EngineRole.PRIMARY || isLeaseLapsed() || super.isReadOnlyMode();
+    }
+
+    /**
+     * Records a lease renewal: the node may act as primary until {@code validUntilNanos}
+     * ({@link System#nanoTime()} scale). Only moves the bound forward.
+     */
+    public void renewLease(long validUntilNanos) {
+        if (validUntilNanos - leaseValidUntilNanos > 0) {
+            leaseValidUntilNanos = validUntilNanos;
+        }
     }
 
     @Override
@@ -411,7 +447,7 @@ public class ReplicatedCairoEngine extends CairoEngine {
 
         @Override
         public byte role() {
-            return switch (role) {
+            return switch (getRole()) {
                 case PRIMARY -> QwpEgressMsgKind.ROLE_PRIMARY;
                 case PRIMARY_CATCHUP -> QwpEgressMsgKind.ROLE_PRIMARY_CATCHUP;
                 // a fenced primary refuses writes like a replica

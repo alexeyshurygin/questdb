@@ -28,6 +28,7 @@ package io.questdb.replication;
 import io.questdb.cairo.CommitMode;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.wal.WalLocker;
+import io.questdb.cairo.wal.seq.SeqTxnTracker;
 import io.questdb.cairo.wal.seq.TableSequencerAPI;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
@@ -37,6 +38,7 @@ import io.questdb.replication.codec.SegmentDelta;
 import io.questdb.replication.codec.TableCreateManifest;
 import io.questdb.replication.codec.TxnPart;
 import io.questdb.replication.codec.TxnRecord;
+import io.questdb.std.IntList;
 import io.questdb.std.LongLongHashMap;
 import io.questdb.std.datetime.MicrosecondClock;
 import org.jetbrains.annotations.NotNull;
@@ -53,6 +55,8 @@ public class TableReplayer {
     private static final Log LOG = LogFactory.getLog(TableReplayer.class);
     // (walId << 32 | segmentId) -> last segment txn written locally
     private final LongLongHashMap segmentHighWater = new LongLongHashMap(16, 0.5, -1, -1);
+    // WALs whose transactions the current batch sequenced under a durable commit mode
+    private final IntList replayedWalIds = new IntList();
     private final String tableKey;
     private TxnPart cachedPart;
     private long cachedPartEpoch = -1;
@@ -282,35 +286,76 @@ public class TableReplayer {
         final WalLocker walLocker = engine.getWalLocker();
         long applied = 0;
         long rows = 0;
-        while (local < entry.getLastTxn() && applied < maxTxnCount) {
-            final long txn = local + 1;
-            final long part = IndexTable.partOf(txn, entry.getPartTxnCount());
-            final TxnPart p = loadPart(entry, worker, part, entry.getAuthoritativeEpoch(part), txn);
-            final TxnRecord record = p.getRecord(txn);
-            if (record.isData()) {
-                // a WAL writer lock keeps the purge job off the segment until its transaction is sequenced
-                walLocker.lockWriter(token, record.getWalId(), record.getSegmentId());
-                try {
-                    applyDelta(engine, record, worker, isDurable, pins);
+        try {
+            while (local < entry.getLastTxn() && applied < maxTxnCount) {
+                final long txn = local + 1;
+                final long part = IndexTable.partOf(txn, entry.getPartTxnCount());
+                final TxnPart p = loadPart(entry, worker, part, entry.getAuthoritativeEpoch(part), txn);
+                final TxnRecord record = p.getRecord(txn);
+                if (record.isData()) {
+                    // a WAL writer lock keeps the purge job off the segment until its transaction is sequenced
+                    walLocker.lockWriter(token, record.getWalId(), record.getSegmentId());
+                    try {
+                        applyDelta(engine, record, worker, isDurable, pins);
+                        token = worker.getTableApplier().apply(token, record);
+                        if (isDurable && !replayedWalIds.contains(record.getWalId())) {
+                            replayedWalIds.add(record.getWalId());
+                        }
+                    } finally {
+                        walLocker.unlockWriter(token, record.getWalId());
+                    }
+                    rows += record.getRowCount();
+                } else {
                     token = worker.getTableApplier().apply(token, record);
-                } finally {
-                    walLocker.unlockWriter(token, record.getWalId());
                 }
-                rows += record.getRowCount();
-            } else {
-                token = worker.getTableApplier().apply(token, record);
+                local = txn;
+                applied++;
+                if (record.isDrop()) {
+                    isDone = true;
+                    break;
+                }
             }
-            local = txn;
-            applied++;
-            if (record.isDrop()) {
-                isDone = true;
-                break;
+        } catch (Throwable th) {
+            try {
+                releaseDurabilityPins(api);
+            } catch (Throwable e) {
+                th.addSuppressed(e);
             }
+            throw th;
         }
+        releaseDurabilityPins(api);
         if (applied > 0 && !isDone) {
             engine.getRecentWriteTracker().recordReplicaDownload(token, local, clock.getTicks(), rows, local < entry.getLastTxn());
         }
         return applied;
+    }
+
+    /**
+     * Under a durable commit mode the sequencer pins every transaction it appends for the WAL writer
+     * that wrote it, and holds the table's durable frontier below the pin until that writer flushes
+     * the sequencer log. The writer of a replicated transaction is on the primary, so this node flushes
+     * the log and drops the pins itself, once per batch. Left alone, the pins would keep the frontier
+     * where it was: a node that catches up and then becomes the primary would upload nothing more, and
+     * a replica would collect one pin for every WAL the primary ever opened.
+     */
+    private void releaseDurabilityPins(TableSequencerAPI api) {
+        if (replayedWalIds.size() == 0) {
+            return;
+        }
+        try {
+            if (!isDone) {
+                final SeqTxnTracker tracker = api.getTxnTrackerIfExists(token);
+                if (tracker != null) {
+                    final long orphanSweepMark = tracker.snapshotOrphanSweepMark();
+                    final long covered = api.fdatasyncTxnLog(token);
+                    for (int i = 0, n = replayedWalIds.size(); i < n; i++) {
+                        tracker.markWriterDurable(replayedWalIds.getQuick(i), orphanSweepMark, covered);
+                    }
+                }
+            }
+        } finally {
+            replayedWalIds.clear();
+        }
     }
 
     /**

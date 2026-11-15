@@ -104,6 +104,7 @@ public class ReplicationBootstrapTest extends AbstractReplicationTest {
             final String d = nodeRoot("d");
             writeConfiguration(p, "primary");
             writeConfiguration(d, "primary");
+            allowPromotion(d);
             try (TestServerMain primary = start(p)) {
                 awaitRole(primary, EngineRole.PRIMARY);
                 primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
