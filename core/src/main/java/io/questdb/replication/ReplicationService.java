@@ -84,6 +84,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private static final String INSTANCE_FILE = "instance";
     private static final Log LOG = LogFactory.getLog(ReplicationService.class);
     private static final long UPLOAD_BATCH = 10_000;
+    private static final int WHOLE_WAL = -1;
     private final ConcurrentLinkedQueue<ReplicationWorker> allWorkers = new ConcurrentLinkedQueue<>();
     private final WalCleaner cleaner;
     private final io.questdb.cairo.CheckpointListener configuredCheckpointListener;
@@ -106,6 +107,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private final ObjectStore store;
     private final ConcurrentHashMap<String, TableUploader> uploaders = new ConcurrentHashMap<>();
     private final Condition wakeUp = lock.newCondition();
+    // closes of segments and WALs (segment WHOLE_WAL) of tables without an uploader yet: {walId, segmentId, lastTxn}
+    private final Map<String, List<long[]>> earlyCloses = new HashMap<>();
     // objects the WAL cleaner could not delete, or did not get to; coordinator thread only
     private final List<String> pendingDeletes = new ArrayList<>();
     private final ThreadLocal<ReplicationWorker> workerSlot = new ThreadLocal<>();
@@ -115,6 +118,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // the WAL cleaner changed index entries it could not commit yet; coordinator thread only
     private boolean isCleanerCommitPending;
     private volatile boolean isClosed;
+    // when close() began waiting for the coordinator; 0 until then
+    private volatile long closeStartedNanos;
     private volatile boolean isCrashed;
     private volatile boolean isNonDataPending;
     private volatile boolean isRestoredAtBoot;
@@ -179,6 +184,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             return;
         }
         isClosed = true;
+        closeStartedNanos = System.nanoTime();
         isRunning = false;
         wake();
         final Thread t = mainThread;
@@ -327,7 +333,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
 
     @Override
     public void onSegmentClosed(TableToken token, int walId, int segmentId, long lastTxn) {
-        final TableUploader u = uploaders.get(token.getDirName());
+        final TableUploader u = uploaderOrKeepClose(token, walId, segmentId, lastTxn);
         if (u != null) {
             synchronized (u) {
                 u.onSegmentClosed(walId, segmentId, lastTxn);
@@ -349,7 +355,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
 
     @Override
     public void onWalClosed(TableToken token, int walId, long lastTxn) {
-        final TableUploader u = uploaders.get(token.getDirName());
+        final TableUploader u = uploaderOrKeepClose(token, walId, WHOLE_WAL, lastTxn);
         if (u != null) {
             synchronized (u) {
                 u.onWalClosed(walId, lastTxn);
@@ -602,6 +608,40 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
     }
 
+    // makes the uploader visible and hands it the closes that arrived before it existed
+    private void registerUploader(String tableDir, TableUploader u) {
+        final List<long[]> closes;
+        synchronized (earlyCloses) {
+            uploaders.put(tableDir, u);
+            closes = earlyCloses.remove(tableDir);
+        }
+        if (closes != null) {
+            synchronized (u) {
+                for (long[] c : closes) {
+                    if (c[1] == WHOLE_WAL) {
+                        u.onWalClosed((int) c[0], c[2]);
+                    } else {
+                        u.onSegmentClosed((int) c[0], (int) c[1], c[2]);
+                    }
+                }
+            }
+        }
+    }
+
+    // A table created a moment ago has no uploader until the next round picks it up. A segment its
+    // writer closes meanwhile must not be forgotten: the uploader releases a segment's marker on that
+    // close only, and without it the segment would stay on disk until a restart.
+    private TableUploader uploaderOrKeepClose(TableToken token, int walId, int segmentId, long lastTxn) {
+        synchronized (earlyCloses) {
+            final TableUploader u = uploaders.get(token.getDirName());
+            // views and materialized views never get an uploader
+            if (u == null && isPrimary && !token.isView() && !token.isMatView()) {
+                earlyCloses.computeIfAbsent(token.getDirName(), k -> new ArrayList<>()).add(new long[]{walId, segmentId, lastTxn});
+            }
+            return u;
+        }
+    }
+
     // gives up the calling thread's context, if it has one
     private void releaseWorkerOfThisThread() {
         final ReplicationWorker w = workerSlot.get();
@@ -716,7 +756,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 u = newUploader(token, local);
             }
             u.setStartupLastTxn(local, path, engine.getConfiguration().getDbRoot(), engine.getConfiguration().getFilesFacade());
-            uploaders.put(token.getDirName(), u);
+            registerUploader(token.getDirName(), u);
             dirtyTables.put(token.getDirName(), Boolean.TRUE);
         }
         // tables dropped or gone meanwhile stay listed until the cleaner removes them
@@ -769,7 +809,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         for (TableToken token : createdTables.values()) {
             createdTables.remove(token.getDirName());
             if (!uploaders.containsKey(token.getDirName()) && !token.isView() && !token.isMatView()) {
-                uploaders.put(token.getDirName(), newUploader(token, 0));
+                registerUploader(token.getDirName(), newUploader(token, 0));
                 dirtyTables.put(token.getDirName(), Boolean.TRUE);
             }
         }
@@ -838,38 +878,46 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 return;
             }
             status = "primary catching up";
-            idx = indexClient.read();
-            if (idx != null) {
-                if (!engine.getDataID().isInitialized()) {
-                    throw ReplicationException.divergence("this primary has no database id");
+            try {
+                idx = indexClient.read();
+                if (idx != null) {
+                    if (!engine.getDataID().isInitialized()) {
+                        throw ReplicationException.divergence("this primary has no database id");
+                    }
+                    adoptDataId(idx);
                 }
-                adoptDataId(idx);
-            }
-            if (!catchUp(idx)) {
-                fence("tables could not catch up with the object store; see the log");
-                return;
-            }
-            if (!acquireLease()) {
-                return;
-            }
-            // the previous owner may have committed more while this node waited: catch up again; a
-            // commit that still slips in makes the index write below fail and the loop start over
-            idx = indexClient.read();
-            if (!catchUp(idx)) {
-                fence("tables could not catch up with the object store; see the log");
-                return;
-            }
-            epoch = (idx != null ? idx.getEpoch() : 0) + 1;
-            sequence = idx != null ? idx.getSequence() : 0;
-            uploaders.clear();
-            prepareUploaders(idx);
-            for (TableUploader u : uploaders.values()) {
-                if (!u.isDropCommitted()) {
-                    u.loadPart(worker());
+                if (!catchUp(idx)) {
+                    fence("tables could not catch up with the object store; see the log");
+                    return;
                 }
-            }
-            if (commitIndex(false)) {
-                break;
+                if (!acquireLease()) {
+                    return;
+                }
+                // the previous owner may have committed more while this node waited: catch up again; a
+                // commit that still slips in makes the index write below fail and the loop start over
+                idx = indexClient.read();
+                if (!catchUp(idx)) {
+                    fence("tables could not catch up with the object store; see the log");
+                    return;
+                }
+                epoch = (idx != null ? idx.getEpoch() : 0) + 1;
+                sequence = idx != null ? idx.getSequence() : 0;
+                uploaders.clear();
+                prepareUploaders(idx);
+                for (TableUploader u : uploaders.values()) {
+                    if (!u.isDropCommitted()) {
+                        u.loadPart(worker());
+                    }
+                }
+                if (commitIndex(false)) {
+                    break;
+                }
+            } catch (ObjectStoreException e) {
+                // the store is unreachable or refuses the node: nothing is decided, so the node stays
+                // read-only and keeps trying instead of fencing itself until a restart
+                status = "primary catching up, object store error: " + e.getMessage();
+                LOG.error().$("replication cannot reach the object store while starting, will retry [error=").$safe(e.getMessage()).I$();
+                sleepQuietly(config.getRetryInterval());
             }
             if (!isRunning) {
                 return;
@@ -925,21 +973,25 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         for (TableUploader u : uploaders.values()) {
             dirtyTables.put(u.getToken().getDirName(), Boolean.TRUE);
         }
-        // close() waits this long for the coordinator before it frees what the drain uses
-        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() * 3 / 4);
-        long uploaded;
-        do {
-            uploaded = primaryRound(true);
-        } while (uploaded > 0
-                && !dirtyTables.isEmpty()
-                && engine.getRole() == ReplicatedCairoEngine.EngineRole.PRIMARY
-                && System.nanoTime() < deadline);
+        // close() frees what the drain uses once it has waited shutdownTimeoutMillis() for the
+        // coordinator: no round starts in the second half of that wait, which is left to the round in
+        // progress and to the release
+        final long closeStarted = closeStartedNanos;
+        final long deadline = (closeStarted != 0 ? closeStarted : System.nanoTime()) + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() / 2);
+        while (System.nanoTime() < deadline) {
+            final long uploaded = primaryRound(true);
+            if (uploaded == 0 || dirtyTables.isEmpty() || engine.getRole() != ReplicatedCairoEngine.EngineRole.PRIMARY) {
+                break;
+            }
+        }
         if (engine.getRole() != ReplicatedCairoEngine.EngineRole.PRIMARY) {
             return;
         }
         if (dirtyTables.isEmpty() && createdTables.isEmpty()) {
             if (commitIndex(true)) {
                 LOG.info().$("replication drained and released the lease [epoch=").$(epoch).I$();
+            } else {
+                LOG.error().$("replication uploaded everything but could not release the lease; it stays held until it expires").$();
             }
             return;
         }
@@ -1074,50 +1126,58 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final List<String> keys = new ArrayList<>(pendingDeletes);
         pendingDeletes.clear();
         boolean isIndexChanged = false;
-        if (cutoffs != null) {
-            for (TableUploader u : uploaders.values()) {
-                synchronized (u) {
-                    if (u.isDropCommitted() || u.hasPending()) {
-                        continue;
-                    }
-                    final Long cutoff = cutoffs.get(u.getEntry().getDirName());
-                    if (cutoff == null || cutoff <= 0) {
-                        continue;
-                    }
-                    final WalCleaner.TablePlan plan = cleaner.planTable(u.getEntry(), cutoff, w);
-                    if (plan != null) {
-                        u.getEntry().setFirstTxn(plan.getNewFirstTxn());
-                        keys.addAll(plan.getKeys());
-                        isIndexChanged = true;
-                        LOG.info().$("WAL cleaner frees table history [table=").$(u.getToken()).$(", newFirstTxn=")
-                                .$(plan.getNewFirstTxn()).$(", objects=").$(plan.getKeys().size()).I$();
+        try {
+            if (cutoffs != null) {
+                for (TableUploader u : uploaders.values()) {
+                    synchronized (u) {
+                        if (u.isDropCommitted() || u.hasPending()) {
+                            continue;
+                        }
+                        final Long cutoff = cutoffs.get(u.getEntry().getDirName());
+                        if (cutoff == null || cutoff <= 0) {
+                            continue;
+                        }
+                        final WalCleaner.TablePlan plan = cleaner.planTable(u.getEntry(), cutoff, w);
+                        if (plan != null) {
+                            u.getEntry().setFirstTxn(plan.getNewFirstTxn());
+                            keys.addAll(plan.getKeys());
+                            isIndexChanged = true;
+                            LOG.info().$("WAL cleaner frees table history [table=").$(u.getToken()).$(", newFirstTxn=")
+                                    .$(plan.getNewFirstTxn()).$(", objects=").$(plan.getKeys().size()).I$();
+                        }
                     }
                 }
             }
-        }
-        final long nowMicros = engine.getConfiguration().getMicrosecondClock().getTicks();
-        final long cooloffMicros = config.getCleanerDroppedTableCooloff() * 1000;
-        for (Map.Entry<String, IndexTable> e : retainedEntries.entrySet()) {
-            final IndexTable t = e.getValue();
-            if (t.isDropped() && nowMicros - t.getDroppedAt() >= cooloffMicros) {
-                keys.addAll(cleaner.planDroppedTable(t));
-                retainedEntries.remove(e.getKey());
-                isIndexChanged = true;
+            final long nowMicros = engine.getConfiguration().getMicrosecondClock().getTicks();
+            final long cooloffMicros = config.getCleanerDroppedTableCooloff() * 1000;
+            for (Map.Entry<String, IndexTable> e : retainedEntries.entrySet()) {
+                final IndexTable t = e.getValue();
+                if (t.isDropped() && nowMicros - t.getDroppedAt() >= cooloffMicros) {
+                    keys.addAll(cleaner.planDroppedTable(t));
+                    retainedEntries.remove(e.getKey());
+                    isIndexChanged = true;
+                }
             }
-        }
-        for (Map.Entry<String, TableUploader> e : uploaders.entrySet()) {
-            final TableUploader u = e.getValue();
-            if (u.isDropCommitted() && nowMicros - u.getEntry().getDroppedAt() >= cooloffMicros) {
-                keys.addAll(cleaner.planDroppedTable(u.getEntry()));
-                uploaders.remove(e.getKey());
-                isIndexChanged = true;
+            for (Map.Entry<String, TableUploader> e : uploaders.entrySet()) {
+                final TableUploader u = e.getValue();
+                if (u.isDropCommitted() && nowMicros - u.getEntry().getDroppedAt() >= cooloffMicros) {
+                    keys.addAll(cleaner.planDroppedTable(u.getEntry()));
+                    uploaders.remove(e.getKey());
+                    isIndexChanged = true;
+                }
             }
-        }
-        // the index stops naming the objects before they go
-        if (isIndexChanged && !commitIndex(false)) {
+            // the index stops naming the objects before they go
+            if (isIndexChanged && !commitIndex(false)) {
+                pendingDeletes.addAll(keys);
+                isCleanerCommitPending = true;
+                return;
+            }
+        } catch (Throwable th) {
+            // a failed listing or commit must not lose what was planned: the entries changed in memory
+            // reach the index with the next commit, after which no plan finds these objects again
             pendingDeletes.addAll(keys);
-            isCleanerCommitPending = true;
-            return;
+            isCleanerCommitPending |= isIndexChanged;
+            throw th;
         }
         deleteObjects(keys);
     }

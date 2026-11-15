@@ -101,7 +101,8 @@ them.
 3. **Epochs.** Each new primary term writes its objects under a new epoch, so a
    deposed primary cannot overwrite what its successor wrote.
 4. **Catch-up before writes.** A starting primary applies everything the store
-   holds, takes the lease, and catches up again before it opens writes.
+   holds, takes the lease, and catches up again before it opens writes. While
+   the store is unreachable it stays read-only and keeps trying.
 5. **Divergence check.** A node whose transaction at a given number differs from
    the store's (for example a crashed primary with transactions it never
    uploaded, after a failover) is fenced and never serves the different history.

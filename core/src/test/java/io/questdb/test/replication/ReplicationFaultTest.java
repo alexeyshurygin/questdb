@@ -447,6 +447,89 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testPrimaryStartsOnceTheStoreAnswers() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            final String r = nodeRoot("r");
+            writeConfiguration(p, "primary", PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000");
+            writeConfiguration(r, "replica");
+            try (TestServerMain primary = start(p)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(primary, "t");
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitApplied(primary, "t");
+                primary.getReplicationService().crashForTesting();
+            }
+            // the restart finds the store down: reads fail outright, then writes are refused
+            final AtomicBoolean isStoreDown = new AtomicBoolean(true);
+            final AtomicInteger refused = new AtomicInteger();
+            writeConfiguration(p, "primary");
+            try (TestServerMain primary = startFaulty(p, new FaultyObjectStore.Hook() {
+                @Override
+                public void before(String op, String key) {
+                    if (isStoreDown.get()) {
+                        if (refused.incrementAndGet() % 2 == 0) {
+                            throw ObjectStoreException.fatal("injected access denied");
+                        }
+                        throw ObjectStoreException.retryable("injected store outage", null);
+                    }
+                }
+            }); TestServerMain replica = start(r)) {
+                // it neither opens writes nor gives up: it stays read-only and says why
+                TestUtils.assertEventually(() -> Assert.assertTrue(refused.get() >= 6), 30);
+                Assert.assertEquals(EngineRole.PRIMARY_CATCHUP, role(primary));
+                TestUtils.assertContains(primary.getReplicationService().getStatus(), "object store error");
+                try {
+                    primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                    Assert.fail("a primary that has not taken the lease must refuse writes");
+                } catch (Throwable e) {
+                    TestUtils.assertContains(String.valueOf(e.getMessage()) + e.getCause(), io.questdb.cairo.CairoException.READ_ONLY_ACCESS_MESSAGE);
+                }
+                // the store comes back: the node takes its lease and uploads what the crash left local
+                isStoreDown.set(false);
+                awaitRole(primary, EngineRole.PRIMARY);
+                Assert.assertNull(((io.questdb.replication.ReplicatedCairoEngine) primary.getEngine()).getFenceReason());
+                awaitUploaded(primary, "t");
+                awaitSame(primary, replica, "t");
+                replica.assertSql("SELECT v FROM t", "v\n1\n");
+            }
+        });
+    }
+
+    @Test
+    public void testSegmentClosedBeforeItsTableIsPickedUpLosesItsMarker() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            // nothing uploads before the stop: a new table has no uploader until then
+            writeConfiguration(
+                    p, "primary",
+                    PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000",
+                    PropertyKey.REPLICATION_PRIMARY_THROTTLE_NON_DATA.getPropertyPath() + "=true"
+            );
+            final java.nio.file.Path tableDir;
+            try (TestServerMain primary = start(p)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitApplied(primary, "t");
+                final io.questdb.cairo.TableToken token = primary.getEngine().verifyTableName("t");
+                tableDir = java.nio.file.Paths.get(primary.getEngine().getConfiguration().getDbRoot(), token.getDirName());
+                Assert.assertEquals(1, markers(tableDir));
+                // the writer closes its segment and its WAL while the table is still unknown to the uploads
+                primary.getEngine().releaseAllWalWriters();
+                Assert.assertEquals(-1, primary.getReplicationService().getUploadedTxn(token));
+                Assert.assertEquals(1, markers(tableDir));
+            }
+            // the stop uploaded the table. The close was not forgotten: the marker is gone, and the purge
+            // job is free to remove the segment once it is applied
+            Assert.assertEquals(1, readIndex().getTables().size());
+            Assert.assertEquals(1, readIndex().getTables().getQuick(0).getLastTxn());
+            Assert.assertEquals(0, markers(tableDir));
+        });
+    }
+
+    @Test
     public void testReplicaReadFaultsAreRetried() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String p = nodeRoot("p");
@@ -564,6 +647,14 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
             final byte[] text = new byte[(int) raw.size()];
             io.questdb.std.Unsafe.copyMemory(null, raw.ptr(), text, io.questdb.std.Unsafe.BYTE_OFFSET, text.length);
             return io.questdb.replication.codec.CheckpointHistory.decode(text, 0, text.length);
+        }
+    }
+
+    // the number of upload.pending markers in the WAL segments of a table
+    private static long markers(java.nio.file.Path tableDir) throws Exception {
+        try (java.util.stream.Stream<java.nio.file.Path> files = java.nio.file.Files.walk(tableDir)) {
+            return files.filter(f -> f.getFileName().toString().equals(io.questdb.replication.ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER)
+                    && f.getParent().getParent().getFileName().toString().startsWith("wal")).count();
         }
     }
 

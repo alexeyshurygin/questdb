@@ -120,6 +120,25 @@ public abstract class AbstractReplicationTest extends AbstractBootstrapTest {
         }
     }
 
+    /**
+     * Starts a node whose object store runs every request past the hook.
+     */
+    protected static TestServerMain start(String serverRoot, FaultyObjectStore.Hook hook) {
+        final TestServerMain server = new TestServerMain(Bootstrap.getServerMainArgs(serverRoot)) {
+            @Override
+            protected io.questdb.replication.store.ObjectStore newReplicationObjectStore(io.questdb.replication.ReplicationConfiguration replicationConfig) {
+                return new FaultyObjectStore(super.newReplicationObjectStore(replicationConfig), hook);
+            }
+        };
+        try {
+            server.start();
+            return server;
+        } catch (Throwable th) {
+            server.close();
+            throw th;
+        }
+    }
+
     protected String nodeRoot(String name) {
         return root + File.separator + name;
     }
