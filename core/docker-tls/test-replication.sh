@@ -114,6 +114,7 @@ start_node() { # <name> <port> <role>
         -p "127.0.0.1:$2:9000" \
         -v "$1-vol:/var/lib/questdb" \
         -e QDB_REPLICATION_ROLE="$3" \
+        -e QDB_CAIRO_COMMIT_MODE=adaptive \
         -e QDB_REPLICATION_OBJECT_STORE="$STORE" \
         -e QDB_REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION=1000 \
         -e QDB_REPLICATION_PRIMARY_KEEPALIVE_INTERVAL=2000 \

@@ -20,11 +20,22 @@ replication.role=primary
 replication.object.store=s3::bucket=my-bucket;root=prod-db;region=ap-northeast-1;
 # group transactions for 1 s instead of the default 10 s
 replication.primary.throttle.window.duration=1000
+# on every node that can become primary
+cairo.commit.mode=adaptive
 
 # replica: the same object store string
 replication.role=replica
 replication.object.store=s3::bucket=my-bucket;root=prod-db;region=ap-northeast-1;
+cairo.commit.mode=adaptive
 ```
+
+Replication does not change the default of `cairo.commit.mode`, which is
+`nosync`. Set `adaptive` on every node that can become primary, as QuestDB
+Enterprise asks: a primary then uploads only transactions that are durable on
+its own disk. Under `nosync` a power loss can cut transactions the store already
+holds; the node is then behind its own store at its next start and refuses to
+run as primary without `_migrate_primary` (guardrail 6). The server logs an
+advisory at start when a replicated node runs without a durable commit mode.
 
 The `access_key_id`/`secret_access_key`/`session_token` keys of the store string
 are optional. Without them the S3 client reads `AWS_ACCESS_KEY_ID`,
@@ -261,9 +272,6 @@ says so.
   node needs a fresh copy.
 - **Views.** Enterprise keeps materialized views in sync on replicas and
   replicates live view definitions. Here views of every kind are node-local.
-- **Commit mode.** A node with a replication role defaults `cairo.commit.mode`
-  to `adaptive`. Enterprise leaves the default at `nosync` and tells operators
-  to set `adaptive` on every node that can become primary.
 - **Store outage.** The Enterprise documentation does not say what a primary
   does while the store is unreachable. Here it turns read-only when its lease
   lapses, 2.5 keepalive intervals after its last accepted index write, and

@@ -198,6 +198,8 @@ public abstract class AbstractReplicationTest extends AbstractBootstrapTest {
                 PropertyKey.LINE_TCP_NET_BIND_TO.getPropertyPath() + "=127.0.0.1:" + ilpPort,
                 PropertyKey.LINE_UDP_BIND_TO.getPropertyPath() + "=127.0.0.1:" + ilpPort,
                 PropertyKey.CAIRO_WAL_ENABLED_DEFAULT.getPropertyPath() + "=true",
+                // what every node that can become primary is to run with; a later setting in extra wins
+                PropertyKey.CAIRO_COMMIT_MODE.getPropertyPath() + "=adaptive",
                 PropertyKey.REPLICATION_ROLE.getPropertyPath() + '=' + role,
                 PropertyKey.REPLICATION_OBJECT_STORE.getPropertyPath() + "=fs::root=" + storeRoot + ';',
                 PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=100",

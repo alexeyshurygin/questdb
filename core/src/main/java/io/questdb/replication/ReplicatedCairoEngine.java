@@ -211,6 +211,14 @@ public class ReplicatedCairoEngine extends CairoEngine {
         return fenceReason;
     }
 
+    /**
+     * Test seam: the {@link System#nanoTime()} until which the primary's lease is current.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public long getLeaseValidUntilNanos() {
+        return leaseValidUntilNanos;
+    }
+
     @Override
     public @NotNull QwpServerInfoProvider getQwpServerInfoProvider() {
         return qwpServerInfoProvider;

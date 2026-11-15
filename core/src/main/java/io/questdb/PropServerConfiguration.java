@@ -1813,15 +1813,10 @@ public class PropServerConfiguration implements ServerConfiguration {
             this.exportWorkerSleepTimeout = getMillis(properties, env, PropertyKey.EXPORT_WORKER_SLEEP_TIMEOUT, 10);
             this.exportWorkerYieldThreshold = getLong(properties, env, PropertyKey.EXPORT_WORKER_YIELD_THRESHOLD, 1000);
 
-            // A replicated node defaults to adaptive, the mode QuestDB Enterprise tells operators to set on every node
-            // that can become primary: a primary then uploads only what is durable locally, so a power loss cannot leave
-            // its log behind the object store. An explicit cairo.commit.mode wins.
-            this.commitMode = getCommitMode(
-                    properties,
-                    env,
-                    PropertyKey.CAIRO_COMMIT_MODE,
-                    CommitMode.toString(replicationConfiguration.getRole().isEnabled() ? CommitMode.ADAPTIVE : CommitMode.DEFAULT)
-            );
+            // Replication leaves the default alone, as QuestDB Enterprise does. Set cairo.commit.mode=adaptive on every
+            // node that can become primary: a primary then uploads only what is durable locally, so a power loss cannot
+            // leave its log behind the object store.
+            this.commitMode = getCommitMode(properties, env, PropertyKey.CAIRO_COMMIT_MODE, CommitMode.toString(CommitMode.DEFAULT));
             this.adaptiveEpochIntervalMs = getMillis(properties, env, PropertyKey.CAIRO_ADAPTIVE_EPOCH_INTERVAL, 60000);
             this.adaptiveEpochMaxRows = getLong(properties, env, PropertyKey.CAIRO_ADAPTIVE_EPOCH_MAX_ROWS, 5_000_000);
             // 0 fdatasyncs every commit before it returns. A negative value clamps to 0, so a

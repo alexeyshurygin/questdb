@@ -470,17 +470,32 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
                 // is two and a half keepalive intervals old: another node may take over half an interval later
                 isStoreDown.set(true);
                 primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
-                final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-                while (role(primary) != EngineRole.PRIMARY_CATCHUP) {
-                    Assert.assertTrue("the lease did not lapse", System.nanoTime() < deadline);
-                    Os.sleep(1);
-                }
-                // The lease counts from the moment the node sent its last accepted index write, a moment
-                // before the store saw it. It lasts 2.5 s here: less than the 3 s after which another node
-                // may take over, which is what keeps two primaries from accepting writes at once.
-                final long leaseMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastIndexWriteNanos.get());
-                Assert.assertTrue("the lease lasted " + leaseMillis + " ms", leaseMillis >= 2_400 && leaseMillis < 3_000);
                 final io.questdb.replication.ReplicatedCairoEngine engine = (io.questdb.replication.ReplicatedCairoEngine) primary.getEngine();
+                // The lease counts from the moment the node sent its last accepted index write, a moment
+                // before the store saw it, and lasts 2.5 keepalive intervals: 2.5 s here. That is less
+                // than the 3 s after which another node may take over, which is what keeps two primaries
+                // from accepting writes at once. The store saw that write at lastIndexWriteNanos, so the
+                // lease ends no later than 2.5 s after it, and only the moment between sending and seeing
+                // earlier.
+                // An index write the store let through just before the outage may still be on its way
+                // back: until the node has counted it, the two values belong to different writes.
+                final AtomicLong lapse = new AtomicLong();
+                TestUtils.assertEventually(() -> {
+                    final long until = engine.getLeaseValidUntilNanos();
+                    final long leaseMillis = TimeUnit.NANOSECONDS.toMillis(until - lastIndexWriteNanos.get());
+                    Assert.assertTrue("the lease lasts " + leaseMillis + " ms", leaseMillis > 2_000 && leaseMillis <= 2_500);
+                    lapse.set(until);
+                }, 30);
+                final long lapseNanos = lapse.get();
+                // the node acts on it: writable until that moment, read-only from it
+                final EngineRole roleNow = role(primary);
+                if (System.nanoTime() - lapseNanos < 0) {
+                    Assert.assertEquals(EngineRole.PRIMARY, roleNow);
+                }
+                TestUtils.assertEventually(() -> Assert.assertEquals(EngineRole.PRIMARY_CATCHUP, role(primary)), 30);
+                Assert.assertTrue(System.nanoTime() - lapseNanos >= 0);
+                // nothing renewed it during the outage
+                Assert.assertEquals(lapseNanos, engine.getLeaseValidUntilNanos());
                 Assert.assertTrue(engine.isPrimaryRole());
                 Assert.assertTrue(engine.isLeaseLapsed());
                 Assert.assertNull(engine.getFenceReason());
@@ -603,6 +618,47 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
             final ReplicationIndex released = readIndex();
             Assert.assertTrue(released.isReleased());
             Assert.assertEquals(2, lastTxn(released, "t"));
+        });
+    }
+
+    @Test
+    public void testSlowIndexWritesLeaveRoomForHousekeeping() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            writeConfiguration(p, "primary", PropertyKey.REPLICATION_PRIMARY_CLEANER_INTERVAL.getPropertyPath() + "=1s");
+            final AtomicBoolean isSlow = new AtomicBoolean();
+            final AtomicInteger cleanerRuns = new AtomicInteger();
+            final AtomicInteger indexWrites = new AtomicInteger();
+            try (TestServerMain primary = startFaulty(p, new FaultyObjectStore.Hook() {
+                @Override
+                public void before(String op, String key) {
+                    if (!isSlow.get()) {
+                        return;
+                    }
+                    if (op.equals("put") && key.equals(IndexClient.INDEX_KEY)) {
+                        // the store takes longer than a keepalive interval to accept an index
+                        indexWrites.incrementAndGet();
+                        Os.sleep(1_100);
+                    } else if (op.equals("list") && key.startsWith("_checkpoints/")) {
+                        cleanerRuns.incrementAndGet();
+                    }
+                }
+            })) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 0)");
+                awaitUploaded(primary, "t");
+                isSlow.set(true);
+                // Every index write is due again by the time it returns, if the next is counted from when
+                // it was sent. The coordinator counts from when it returned, so it still gets to its
+                // housekeeping; the lease keeper covers the lease.
+                TestUtils.assertEventually(() -> Assert.assertTrue("cleaner runs: " + cleanerRuns.get(), cleanerRuns.get() >= 3), 60);
+                Assert.assertTrue("index writes: " + indexWrites.get(), indexWrites.get() >= 3);
+                Assert.assertEquals(EngineRole.PRIMARY, role(primary));
+                isSlow.set(false);
+                primary.execute("INSERT INTO t VALUES ('2024-01-02', 1)");
+                awaitUploaded(primary, "t");
+            }
         });
     }
 

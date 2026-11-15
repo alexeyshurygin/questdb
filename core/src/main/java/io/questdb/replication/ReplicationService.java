@@ -149,6 +149,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // the index the store accepted last from this node; guarded by indexLock
     private ReplicationIndex lastCommittedIndex;
     private ReplicationIndex lastIndex;
+    // when the last accepted index write came back: paces the coordinator's own keepalive
+    private volatile long lastIndexWriteEndNanos;
+    // when the last accepted index write was sent: the lease and the keeper's renewals count from here
     private volatile long lastIndexWriteNanos;
     private volatile Thread leaseKeeperThread;
     private Thread mainThread;
@@ -174,10 +177,14 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // the index bypasses the activity record: the lease keeper's own writes must not count as progress
         this.indexClient = new IndexClient(store, isChecksum);
         this.cleaner = new WalCleaner(config, this.store);
-        // longer than any request that is not an upload may take with all its attempts
+        // longer than any request that is not an upload may take with all its attempts and the pauses between them
         this.stallLimitMillis = Math.max(
                 60_000,
-                Math.max(20 * config.getKeepaliveInterval(), (config.getRetryAttempts() + 2) * config.getRequestBaseTimeout())
+                Math.max(
+                        20 * config.getKeepaliveInterval(),
+                        (config.getRetryAttempts() + 2) * config.getRequestBaseTimeout()
+                                + io.questdb.replication.store.ObjectStoreUtils.totalRetryPause(config.getRetryAttempts(), config.getRetryInterval())
+                )
         );
         this.configuredCheckpointListener = cairoConfig.getCheckpointListener();
         this.pins = isPrimary ? null : new ReplicaSegmentPins(10 * 60_000L);
@@ -459,6 +466,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         isRunning = true;
         instanceId = loadInstanceId();
         isMigrationAllowed = isPrimary && Files.exists(Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE));
+        if (!CommitMode.isPowerLossDurable(engine.getConfiguration().getCommitMode())) {
+            LOG.advisory().$("replication runs with cairo.commit.mode=").$(CommitMode.toString(engine.getConfiguration().getCommitMode()))
+                    .$(": a power loss can leave a primary behind the object store; set cairo.commit.mode=adaptive on every node that can become primary").$();
+        }
         mainThread = new Thread(this::run, "qdb-replication");
         mainThread.setDaemon(true);
         mainThread.start();
@@ -704,6 +715,16 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         return !isIndexClientClosed && engine.getRole() != ReplicatedCairoEngine.EngineRole.FENCED;
     }
 
+    /**
+     * The coordinator's keepalive, counted from when the last index write came back. Counted from
+     * when it was sent, as the lease is, a store that takes a keepalive interval to accept an index
+     * would have the coordinator write one index after another and never reach its housekeeping; the
+     * lease keeper covers the difference.
+     */
+    private boolean isKeepaliveDue() {
+        return System.nanoTime() - lastIndexWriteEndNanos >= TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval());
+    }
+
     // the caller holds indexLock; isCommit is false for a renewal that carries no upload
     private boolean writeIndex(ReplicationIndex idx, boolean isReleased, boolean isCommit) {
         // the lease counts from before the request: the store accepted the write no earlier than this
@@ -764,6 +785,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // the lease counts from when the write was sent, so the next renewal is due from then too: a
         // write that took long must not push the next one past the end of the lease
         lastIndexWriteNanos = writeStartNanos;
+        lastIndexWriteEndNanos = System.nanoTime();
         if (!isReleased) {
             engine.renewLease(writeStartNanos + TimeUnit.MILLISECONDS.toNanos(leaseMillis()));
         }
@@ -1128,7 +1150,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         for (TableUploader u : uploaders.values()) {
             hasPending |= u.hasPending();
         }
-        final boolean isKeepaliveDue = System.nanoTime() - lastIndexWriteNanos >= TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval());
+        final boolean isKeepaliveDue = isKeepaliveDue();
         if (hasPending || isKeepaliveDue) {
             if (commitIndex(false) && uploaded > 0) {
                 status = "primary, epoch " + epoch;
@@ -1191,7 +1213,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 }
                 // the marker allows one promotion: it goes before the store changes hands, and a marker
                 // that cannot be removed stops the promotion instead of allowing every later one
-                if (!removeMigrationMarker()) {
+                if (!removeMigrationMarker(idx)) {
                     return;
                 }
                 if (commitIndex(false)) {
@@ -1245,7 +1267,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 firstDirtyNanos = System.nanoTime();
             }
             final boolean isWindowDue = firstDirtyNanos != 0 && System.nanoTime() - firstDirtyNanos >= TimeUnit.MILLISECONDS.toNanos(window);
-            final boolean isKeepaliveDue = System.nanoTime() - lastIndexWriteNanos >= TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval());
+            final boolean isKeepaliveDue = isKeepaliveDue();
             final boolean isUploadDue = isNonDataPending || isWindowDue || !createdTables.isEmpty() && !config.isThrottleNonData();
             if (isUploadDue || isKeepaliveDue) {
                 if (isUploadDue) {
@@ -1373,9 +1395,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 + " file in " + engine.getConfiguration().getInstallRoot() + " and restart it");
     }
 
-    // true when no marker is left in the install root; fences the node when it cannot remove one
-    private boolean removeMigrationMarker() {
-        if (!isMigrationAllowed) {
+    /**
+     * Uses up the marker right before the takeover.
+     *
+     * @return false when the node fenced itself because it cannot remove the marker
+     * @throws ReplicationException when the operator deleted the marker meanwhile and the node may
+     *                              not take over the store that holds {@code idx} without it
+     */
+    private boolean removeMigrationMarker(@Nullable ReplicationIndex idx) {
+        if (!isMigrationAllowed || isMarkerRemoved) {
             return true;
         }
         final java.nio.file.Path marker = Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE);
@@ -1383,6 +1411,13 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             if (Files.deleteIfExists(marker)) {
                 isMarkerRemoved = true;
                 LOG.advisory().$("replication removed ").$(MIGRATE_PRIMARY_FILE).$(", this node becomes the primary").$();
+            } else {
+                // the operator took the permission back after the last check: the node goes on only if
+                // it needs none
+                isMigrationAllowed = false;
+                if (idx != null) {
+                    checkMayBecomePrimary(idx);
+                }
             }
             return true;
         } catch (java.io.IOException e) {

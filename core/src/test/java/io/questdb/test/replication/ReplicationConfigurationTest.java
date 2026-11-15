@@ -160,9 +160,9 @@ public class ReplicationConfigurationTest {
     }
 
     @Test
-    public void testCommitModeAndRolloverDefaultsFollowRole() throws Exception {
-        // QuestDB Enterprise: a primary rolls WAL segments at 2 MiB unless set; replication changes the commit
-        // mode default. Without replication the OSS defaults stay: 50 MiB segments and nosync.
+    public void testRolloverDefaultFollowsRoleAndCommitModeDoesNot() throws Exception {
+        // As QuestDB Enterprise: a primary rolls WAL segments at 2 MiB unless set, and the commit mode default
+        // stays nosync with or without replication; operators set adaptive on nodes that can become primary.
         final Properties none = new Properties();
         ServerConfiguration c = load(none);
         Assert.assertEquals(50 * Numbers.SIZE_1MB, c.getCairoConfiguration().getWalSegmentRolloverSize());
@@ -170,22 +170,22 @@ public class ReplicationConfigurationTest {
 
         c = load(primary());
         Assert.assertEquals(2 * Numbers.SIZE_1MB, c.getCairoConfiguration().getWalSegmentRolloverSize());
-        Assert.assertEquals(CommitMode.ADAPTIVE, c.getCairoConfiguration().getCommitMode());
+        Assert.assertEquals(CommitMode.NOSYNC, c.getCairoConfiguration().getCommitMode());
 
         final Properties replica = new Properties();
         replica.setProperty("replication.role", "replica");
         replica.setProperty("replication.object.store", S3_STORE);
         c = load(replica);
         Assert.assertEquals(50 * Numbers.SIZE_1MB, c.getCairoConfiguration().getWalSegmentRolloverSize());
-        Assert.assertEquals(CommitMode.ADAPTIVE, c.getCairoConfiguration().getCommitMode());
+        Assert.assertEquals(CommitMode.NOSYNC, c.getCairoConfiguration().getCommitMode());
 
-        // an explicit setting wins over the role default
+        // explicit settings win
         final Properties explicit = primary();
         explicit.setProperty("cairo.wal.segment.rollover.size", "8M");
-        explicit.setProperty("cairo.commit.mode", "nosync");
+        explicit.setProperty("cairo.commit.mode", "adaptive");
         c = load(explicit);
         Assert.assertEquals(8 * Numbers.SIZE_1MB, c.getCairoConfiguration().getWalSegmentRolloverSize());
-        Assert.assertEquals(CommitMode.NOSYNC, c.getCairoConfiguration().getCommitMode());
+        Assert.assertEquals(CommitMode.ADAPTIVE, c.getCairoConfiguration().getCommitMode());
     }
 
     @Test

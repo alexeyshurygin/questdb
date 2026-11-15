@@ -26,6 +26,9 @@ package io.questdb.replication.store;
 
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
+
+import java.util.function.LongSupplier;
 
 /**
  * Passes every request to another store and remembers the last sign of life: a request that returned,
@@ -37,27 +40,49 @@ public class ActivityObjectStore implements ObjectStore {
     private final Object busyLock = new Object();
     private final ObjectStore delegate;
     private final long minThroughput;
+    private final LongSupplier nanoClock;
     private final long requestBaseTimeoutMillis;
     private final int retryAttempts;
-    private final long retryIntervalMillis;
+    private final long retryPauseMillis;
     // until when the uploads in flight may legitimately take; guarded by busyLock
-    private long busyUntilNanos = System.nanoTime();
+    private long busyUntilNanos;
     // guarded by busyLock
     private int inFlightUploads;
-    private volatile long lastActivityNanos = System.nanoTime();
+    private volatile long lastActivityNanos;
 
     /**
      * @param requestBaseTimeoutMillis {@code replication.requests.base.timeout}
      * @param minThroughput            {@code replication.requests.min.throughput}, bytes per second
      * @param retryAttempts            {@code replication.requests.retry.attempts}
-     * @param retryIntervalMillis      {@code replication.requests.retry.interval}
+     * @param retryIntervalMillis      {@code replication.requests.retry.interval}; the pause doubles
+     *                                 with every attempt, see {@link ObjectStoreUtils#totalRetryPause}
      */
     public ActivityObjectStore(@NotNull ObjectStore delegate, long requestBaseTimeoutMillis, long minThroughput, int retryAttempts, long retryIntervalMillis) {
+        this(delegate, requestBaseTimeoutMillis, minThroughput, retryAttempts, retryIntervalMillis, System::nanoTime);
+    }
+
+    /**
+     * For tests: reads the time from {@code nanoClock}, a clock like {@link System#nanoTime()}.
+     */
+    @TestOnly
+    public ActivityObjectStore(
+            @NotNull ObjectStore delegate,
+            long requestBaseTimeoutMillis,
+            long minThroughput,
+            int retryAttempts,
+            long retryIntervalMillis,
+            @NotNull LongSupplier nanoClock
+    ) {
         this.delegate = delegate;
-        this.requestBaseTimeoutMillis = requestBaseTimeoutMillis;
+        this.nanoClock = nanoClock;
+        this.requestBaseTimeoutMillis = Math.max(0, requestBaseTimeoutMillis);
         this.minThroughput = Math.max(1, minThroughput);
         this.retryAttempts = Math.max(0, retryAttempts);
-        this.retryIntervalMillis = Math.max(0, retryIntervalMillis);
+        // the pauses of a request that fails every attempt, as the stores make them
+        this.retryPauseMillis = ObjectStoreUtils.totalRetryPause(this.retryAttempts, Math.max(0, retryIntervalMillis));
+        final long now = nanoClock.getAsLong();
+        this.busyUntilNanos = now;
+        this.lastActivityNanos = now;
     }
 
     @Override
@@ -101,7 +126,7 @@ public class ActivityObjectStore implements ObjectStore {
         synchronized (busyLock) {
             busyUntil = busyUntilNanos;
         }
-        final long now = System.nanoTime();
+        final long now = nanoClock.getAsLong();
         return Math.max(0, Math.min(now - lastActivityNanos, now - busyUntil));
     }
 
@@ -126,9 +151,8 @@ public class ActivityObjectStore implements ObjectStore {
     @Override
     public @NotNull String put(@NotNull String key, byte @NotNull [] data, int offset, int length, @Nullable String ifMatch, boolean isIfNoneMatch) {
         // one upload may take every attempt the store makes, each as long as its size allows
-        final long allowedMillis = (retryAttempts + 1) * (requestBaseTimeoutMillis + length * 1000L / minThroughput)
-                + retryAttempts * retryIntervalMillis;
-        final long until = System.nanoTime() + allowedMillis * 1_000_000L;
+        final long allowedMillis = (retryAttempts + 1) * (requestBaseTimeoutMillis + length * 1000L / minThroughput) + retryPauseMillis;
+        final long until = nanoClock.getAsLong() + allowedMillis * 1_000_000L;
         synchronized (busyLock) {
             inFlightUploads++;
             if (until - busyUntilNanos > 0) {
@@ -141,7 +165,7 @@ public class ActivityObjectStore implements ObjectStore {
             synchronized (busyLock) {
                 if (--inFlightUploads == 0) {
                     // nothing is in flight any more: from here on only returns and keys count
-                    busyUntilNanos = System.nanoTime();
+                    busyUntilNanos = nanoClock.getAsLong();
                 }
             }
             touch();
@@ -152,6 +176,6 @@ public class ActivityObjectStore implements ObjectStore {
      * Records a sign of life that is not a request.
      */
     public void touch() {
-        lastActivityNanos = System.nanoTime();
+        lastActivityNanos = nanoClock.getAsLong();
     }
 }

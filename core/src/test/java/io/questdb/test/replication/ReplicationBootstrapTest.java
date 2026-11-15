@@ -25,6 +25,7 @@
 
 package io.questdb.test.replication;
 
+import io.questdb.PropertyKey;
 import io.questdb.cairo.TableUtils;
 import io.questdb.replication.ReplicatedCairoEngine;
 import io.questdb.replication.ReplicatedCairoEngine.EngineRole;
@@ -44,6 +45,38 @@ import java.util.stream.Stream;
  * Seeding nodes from a checkpoint copy: a new replica, and disaster recovery of a lost primary.
  */
 public class ReplicationBootstrapTest extends AbstractReplicationTest {
+
+    @Test
+    public void testReplicationUnderTheDefaultCommitMode() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            final String r = nodeRoot("r");
+            // nosync, what a node runs with when its configuration does not name a commit mode
+            final String nosync = PropertyKey.CAIRO_COMMIT_MODE.getPropertyPath() + "=nosync";
+            writeConfiguration(p, "primary", nosync);
+            writeConfiguration(r, "replica", nosync);
+            try (TestServerMain replica = start(r)) {
+                try (TestServerMain primary = start(p)) {
+                    awaitRole(primary, io.questdb.replication.ReplicatedCairoEngine.EngineRole.PRIMARY);
+                    Assert.assertEquals(io.questdb.cairo.CommitMode.NOSYNC, primary.getEngine().getConfiguration().getCommitMode());
+                    Assert.assertEquals(io.questdb.cairo.CommitMode.NOSYNC, replica.getEngine().getConfiguration().getCommitMode());
+                    primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                    primary.execute("INSERT INTO t VALUES ('2024-01-01', 1), ('2024-01-02', 2)");
+                    awaitSame(primary, replica, "t");
+                }
+                // the primary stops and comes back: it owns the store, holds all of it, and carries on
+                writeConfiguration(p, "primary", nosync);
+                try (TestServerMain primary = start(p)) {
+                    awaitRole(primary, io.questdb.replication.ReplicatedCairoEngine.EngineRole.PRIMARY);
+                    primary.execute("INSERT INTO t VALUES ('2024-01-03', 3)");
+                    primary.execute("ALTER TABLE t ADD COLUMN s SYMBOL");
+                    primary.execute("INSERT INTO t VALUES ('2024-01-04', 4, 'a')");
+                    awaitSame(primary, replica, "t");
+                    replica.assertSql("SELECT count() n FROM t", "n\n4\n");
+                }
+            }
+        });
+    }
 
     @Test
     public void testCheckpointCopyBootstrapsReplica() throws Exception {

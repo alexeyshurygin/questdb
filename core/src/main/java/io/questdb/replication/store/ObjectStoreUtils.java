@@ -63,6 +63,31 @@ public final class ObjectStoreUtils {
     }
 
     /**
+     * The pause before a retry doubles with every attempt, up to this multiple of the retry interval.
+     */
+    public static final int MAX_BACKOFF_MULTIPLIER = 10;
+
+    /**
+     * The pause after an attempt that followed a pause of {@code pause} milliseconds.
+     */
+    public static long nextRetryPause(long pause, long retryInterval) {
+        return Math.min(pause * 2, retryInterval * MAX_BACKOFF_MULTIPLIER);
+    }
+
+    /**
+     * How long the pauses between the attempts of one request add up to, when every attempt fails.
+     */
+    public static long totalRetryPause(int retryAttempts, long retryInterval) {
+        long total = 0;
+        long pause = retryInterval;
+        for (int i = 0; i < retryAttempts; i++) {
+            total += pause;
+            pause = nextRetryPause(pause, retryInterval);
+        }
+        return total;
+    }
+
+    /**
      * Sleeps before the next attempt of a failed request.
      *
      * @throws ObjectStoreException {@link ObjectStoreException.Kind#RETRYABLE} when the thread is

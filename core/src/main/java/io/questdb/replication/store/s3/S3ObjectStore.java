@@ -101,7 +101,6 @@ public class S3ObjectStore implements ObjectStore {
     // stands in for the body of a response that went into the caller's sink; never written
     private static final ByteSink EMPTY_BODY = new ByteSink(16);
     private static final Log LOG = LogFactory.getLog(S3ObjectStore.class);
-    private static final int MAX_BACKOFF_MULTIPLIER = 10;
     private static final long MAX_OBJECT_SIZE = Integer.MAX_VALUE - 8;
     private static final long TIMEOUT_GRACE_MILLIS = 100;
     private final String baseUrl;
@@ -517,7 +516,7 @@ public class S3ObjectStore implements ObjectStore {
                     .$(", reason=").$(failure.getMessage())
                     .I$();
             ObjectStoreUtils.pause(pause);
-            pause = Math.min(pause * 2, retryInterval * MAX_BACKOFF_MULTIPLIER);
+            pause = ObjectStoreUtils.nextRetryPause(pause, retryInterval);
         }
     }
 

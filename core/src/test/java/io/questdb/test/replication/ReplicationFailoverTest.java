@@ -147,6 +147,54 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testMarkerWithdrawnRightBeforeTheTakeoverCancelsThePromotion() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            writeConfiguration(a, "primary");
+            writeConfiguration(b, "replica");
+            final String ownerA;
+            try (TestServerMain nodeA = start(a); TestServerMain nodeB = start(b)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitSame(nodeA, nodeB, "t");
+                ownerA = nodeA.getReplicationService().getInstanceId();
+                nodeA.getReplicationService().crashForTesting();
+            }
+            final long sequenceA = readIndex().getSequence();
+
+            writeConfiguration(b, "primary");
+            allowPromotion(b);
+            final java.nio.file.Path marker = java.nio.file.Paths.get(b, io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE);
+            final java.util.concurrent.atomic.AtomicBoolean isDecided = new java.util.concurrent.atomic.AtomicBoolean();
+            final AtomicInteger withdrawals = new AtomicInteger();
+            // The node has waited for the lease, passed every check with the marker in place and is
+            // loading what it needs for the takeover. Only then does the operator delete the marker.
+            try (TestServerMain nodeB = start(b, new FaultyObjectStore.Hook() {
+                @Override
+                public void before(String op, String key) {
+                    if (isDecided.get() && op.equals("get") && key.contains("/seq/") && withdrawals.getAndIncrement() == 0) {
+                        try {
+                            java.nio.file.Files.delete(marker);
+                        } catch (java.io.IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                }
+            })) {
+                nodeB.getReplicationService().setTakeoverHookForTesting(() -> isDecided.set(true));
+                awaitRole(nodeB, EngineRole.FENCED);
+                final String reason = ((io.questdb.replication.ReplicatedCairoEngine) nodeB.getEngine()).getFenceReason();
+                TestUtils.assertContains(reason, "the object store belongs to another primary [owner=" + ownerA + ']');
+                Assert.assertTrue("the marker was not withdrawn", withdrawals.get() > 0);
+            }
+            Assert.assertEquals(ownerA, readIndex().getOwnerInstanceId());
+            Assert.assertEquals(sequenceA, readIndex().getSequence());
+        });
+    }
+
+    @Test
     public void testMarkerWithdrawnWhileWaitingForTheLeaseCancelsThePromotion() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = nodeRoot("a");

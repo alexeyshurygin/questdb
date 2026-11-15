@@ -29,7 +29,6 @@ import io.questdb.replication.store.ActivityObjectStore;
 import io.questdb.replication.store.ByteSink;
 import io.questdb.replication.store.ObjectStore;
 import io.questdb.replication.store.ObjectStoreException;
-import io.questdb.std.Os;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.junit.Assert;
@@ -38,54 +37,65 @@ import org.junit.Test;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class ActivityObjectStoreTest {
-    private static final long PAUSE_MILLIS = 40;
+    private static final long PAUSE_NANOS = TimeUnit.MILLISECONDS.toNanos(40);
 
     @Test
     public void testAnUploadIsAliveForAsLongAsItsSizeAllows() {
         final Recorder recorder = new Recorder();
         // base timeout 0 and no retries: an upload may take its size over 1000 bytes per second
-        final ActivityObjectStore store = new ActivityObjectStore(recorder, 0, 1_000, 0, 0);
-        recorder.store = store;
+        final ActivityObjectStore store = recorder.wrap(0, 1_000, 0, 0);
 
-        // 10 bytes are allowed 10 ms: the 40 ms the request takes are past that
+        // 10 bytes are allowed 10 ms: the request takes 40 ms, so its last 30 ms count as idle
         Assert.assertEquals("etag-a", store.put("a", new byte[10], 0, 10, null, false));
-        Assert.assertTrue("idle " + recorder.idleInsideNanos, recorder.idleInsideNanos >= TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
-        Assert.assertTrue(store.getIdleNanos() < TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS));
+        Assert.assertEquals(TimeUnit.MILLISECONDS.toNanos(30), recorder.idleInsideNanos);
+        Assert.assertEquals(0, store.getIdleNanos());
 
         // 10000 bytes are allowed ten seconds: the request is alive all along
         Assert.assertEquals("etag-b", store.put("b", new byte[10_000], 0, 10_000, "x", true));
         Assert.assertEquals(0, recorder.idleInsideNanos);
         // once the request is back its allowance is over: idle time counts again
-        Os.sleep(PAUSE_MILLIS);
-        Assert.assertTrue(store.getIdleNanos() >= TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
+        Assert.assertEquals(0, store.getIdleNanos());
+        recorder.clock.addAndGet(PAUSE_NANOS);
+        Assert.assertEquals(PAUSE_NANOS, store.getIdleNanos());
         Assert.assertEquals(List.of("put a 10 null false", "put b 10000 x true"), recorder.calls);
     }
 
     @Test
     public void testEachAttemptAndRetryPauseCountForAnUpload() {
-        final Recorder recorder = new Recorder();
-        // two retries of 20 ms each, 5 ms apart: 3 * 20 + 2 * 5 = 70 ms for an empty upload
-        final ActivityObjectStore store = new ActivityObjectStore(recorder, 20, 1_000_000, 2, 5);
-        recorder.store = store;
+        // Two retries, attempts of 20 ms, pauses of 5 and 10 ms (the pause doubles): 3 * 20 + 15 = 75 ms
+        // for an empty upload. The request takes 40 ms: within that.
+        Recorder recorder = new Recorder();
+        ActivityObjectStore store = recorder.wrap(20, 1_000_000, 2, 5);
         store.put("a", new byte[0], 0, 0, null, false);
-        // 40 ms into the request, within its 70 ms
         Assert.assertEquals(0, recorder.idleInsideNanos);
 
+        // one attempt of 20 ms and no retry: the last 20 ms of the request count as idle
+        recorder = new Recorder();
+        store = recorder.wrap(20, 1_000_000, 0, 5);
+        store.put("a", new byte[0], 0, 0, null, false);
+        Assert.assertEquals(TimeUnit.MILLISECONDS.toNanos(20), recorder.idleInsideNanos);
+
+        // the pause stops doubling at ten times the interval: 1 + 2 + 4 + 8 + 10 + 10 = 35 ms of pauses,
+        // so six retries of an attempt that is allowed no time cover 35 of the 40 ms
+        recorder = new Recorder();
+        store = recorder.wrap(0, 1_000_000, 6, 1);
+        store.put("a", new byte[0], 0, 0, null, false);
+        Assert.assertEquals(TimeUnit.MILLISECONDS.toNanos(5), recorder.idleInsideNanos);
+
         // negative settings count as none: an empty upload gets no time at all
-        final Recorder strict = new Recorder();
-        final ActivityObjectStore strictStore = new ActivityObjectStore(strict, 0, -5, -1, -1);
-        strict.store = strictStore;
-        strictStore.put("a", new byte[0], 0, 0, null, false);
-        Assert.assertTrue(strict.idleInsideNanos >= TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
+        recorder = new Recorder();
+        store = recorder.wrap(-7, -5, -1, -1);
+        store.put("a", new byte[0], 0, 0, null, false);
+        Assert.assertEquals(PAUSE_NANOS, recorder.idleInsideNanos);
     }
 
     @Test
     public void testEveryListedKeyIsASignOfLife() {
         final Recorder recorder = new Recorder();
-        final ActivityObjectStore store = new ActivityObjectStore(recorder, 0, 1, 0, 0);
-        recorder.store = store;
+        final ActivityObjectStore store = recorder.wrap(0, 1, 0, 0);
         final List<String> keys = new ArrayList<>();
         final List<Long> idleAtKey = new ArrayList<>();
         // the delegate pauses before every key, as a store does between pages
@@ -97,38 +107,38 @@ public class ActivityObjectStoreTest {
         Assert.assertEquals(List.of("p/1 1", "p/2 2"), keys);
         // the consumer stopped the listing after the second key
         Assert.assertEquals(List.of("list p/ p/0", "key p/1", "key p/2"), recorder.calls);
-        for (long idle : idleAtKey) {
-            Assert.assertTrue("idle " + idle, idle < TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
-        }
-        Assert.assertTrue(store.getIdleNanos() < TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
+        // idle time reached a pause before each key, and each key reset it
+        Assert.assertEquals(PAUSE_NANOS, recorder.idleInsideNanos);
+        Assert.assertEquals(List.of(0L, 0L), idleAtKey);
+        Assert.assertEquals(0, store.getIdleNanos());
     }
 
     @Test
     public void testIdleTimeGrowsUntilARequestReturns() {
         final Recorder recorder = new Recorder();
-        final ActivityObjectStore store = new ActivityObjectStore(recorder, 0, 1, 0, 0);
-        recorder.store = store;
-        Os.sleep(PAUSE_MILLIS);
-        Assert.assertTrue(store.getIdleNanos() >= TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
+        final ActivityObjectStore store = recorder.wrap(0, 1, 0, 0);
+        Assert.assertEquals(0, store.getIdleNanos());
+        recorder.clock.addAndGet(PAUSE_NANOS);
+        Assert.assertEquals(PAUSE_NANOS, store.getIdleNanos());
         store.touch();
-        Assert.assertTrue(store.getIdleNanos() < TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
+        Assert.assertEquals(0, store.getIdleNanos());
 
         // a request is idle time while it runs, and a sign of life when it returns
         final ByteSink sink = new ByteSink();
         Assert.assertEquals("etag-k", store.get("k", "old", sink));
-        Assert.assertTrue(recorder.idleInsideNanos >= TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
-        Assert.assertTrue(store.getIdleNanos() < TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
+        Assert.assertEquals(PAUSE_NANOS, recorder.idleInsideNanos);
+        Assert.assertEquals(0, store.getIdleNanos());
+        recorder.clock.addAndGet(PAUSE_NANOS);
         store.delete("k");
-        Assert.assertTrue(recorder.idleInsideNanos >= TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
-        Assert.assertTrue(store.getIdleNanos() < TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
+        Assert.assertEquals(2 * PAUSE_NANOS, recorder.idleInsideNanos);
+        Assert.assertEquals(0, store.getIdleNanos());
         Assert.assertEquals(List.of("get k old", "delete k"), recorder.calls);
     }
 
     @Test
     public void testRequestThatFailsIsASignOfLifeToo() {
         final Recorder recorder = new Recorder();
-        final ActivityObjectStore store = new ActivityObjectStore(recorder, 0, 1, 0, 0);
-        recorder.store = store;
+        final ActivityObjectStore store = recorder.wrap(0, 1, 0, 0);
         recorder.isFailing = true;
         final ByteSink sink = new ByteSink();
         final ObjectStore.ListConsumer consumer = (key, size) -> true;
@@ -139,14 +149,15 @@ public class ActivityObjectStoreTest {
                 () -> store.put("k", new byte[1], 0, 1, null, false),
         };
         for (Runnable request : requests) {
-            Os.sleep(PAUSE_MILLIS);
+            recorder.clock.addAndGet(PAUSE_NANOS);
+            Assert.assertEquals(PAUSE_NANOS, store.getIdleNanos());
             try {
                 request.run();
                 Assert.fail("the store's error must reach the caller");
             } catch (ObjectStoreException e) {
                 Assert.assertEquals("injected", e.getMessage());
             }
-            Assert.assertTrue(store.getIdleNanos() < TimeUnit.MILLISECONDS.toNanos(PAUSE_MILLIS - 10));
+            Assert.assertEquals(0, store.getIdleNanos());
         }
         Assert.assertEquals(List.of("delete k", "get k null", "list p/ null", "put k 1 null false"), recorder.calls);
     }
@@ -158,14 +169,18 @@ public class ActivityObjectStoreTest {
         Assert.assertEquals(7, store.getDefaultCleanerMaxRequestsPerSecond());
         Assert.assertEquals("recorder", store.getDescription());
         Assert.assertTrue(store.isIntegrityChecked());
+        // the real clock: no time to speak of has passed
+        Assert.assertTrue(store.getIdleNanos() < TimeUnit.MINUTES.toNanos(1));
         Assert.assertFalse(recorder.isClosed);
         store.close();
         Assert.assertTrue(recorder.isClosed);
     }
 
-    // answers every request after a pause, and notes how idle the wrapping store was at the end of it
+    // Answers every request after 40 ms of its own clock, which the wrapping store reads too, and notes
+    // how idle that store was at the end of the pause.
     private static class Recorder implements ObjectStore {
         final List<String> calls = new ArrayList<>();
+        final AtomicLong clock = new AtomicLong(1_000_000_000L);
         long idleInsideNanos = -1;
         boolean isClosed;
         boolean isFailing;
@@ -223,8 +238,13 @@ public class ActivityObjectStoreTest {
             return "etag-" + key;
         }
 
+        ActivityObjectStore wrap(long requestBaseTimeoutMillis, long minThroughput, int retryAttempts, long retryIntervalMillis) {
+            store = new ActivityObjectStore(this, requestBaseTimeoutMillis, minThroughput, retryAttempts, retryIntervalMillis, clock::get);
+            return store;
+        }
+
         private void pause() {
-            Os.sleep(PAUSE_MILLIS);
+            clock.addAndGet(PAUSE_NANOS);
             if (store != null) {
                 idleInsideNanos = store.getIdleNanos();
             }
