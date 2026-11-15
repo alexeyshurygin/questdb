@@ -173,7 +173,8 @@ public class TableReplayer {
         final TxnPart p = loadPart(entry, worker, partNo, entry.getAuthoritativeEpoch(partNo), txn);
         final TxnRecord stored = p.getRecord(txn);
         final TxnRecord localRecord = new TxnRecord();
-        final TxnLogReader reader = worker.getTxnLogReader().of(engine.getConfiguration().getDbRoot(), token.getDirName());
+        // by the entry's directory: the service calls this before the first replay resolved the token
+        final TxnLogReader reader = worker.getTxnLogReader().of(engine.getConfiguration().getDbRoot(), entry.getDirName());
         try {
             reader.readRecord(txn, localRecord);
         } finally {

@@ -77,6 +77,52 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testCrashedPrimaryRestartsAndUploadsItsTail() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            // a long throttle window keeps the last inserts and the new table local when a crashes
+            writeConfiguration(a, "primary", PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000");
+            writeConfiguration(b, "replica");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                try (TestServerMain nodeB = start(b)) {
+                    awaitRole(nodeB, EngineRole.REPLICA);
+                    TestUtils.assertEventually(() -> Assert.assertNotNull(nodeB.getEngine().getTableTokenIfExists("t")), 60);
+                }
+                // structure changes upload at once; the inserts after them wait for the window
+                nodeA.execute("ALTER TABLE t ADD COLUMN s STRING");
+                nodeA.execute("CREATE TABLE late (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(nodeA, "t");
+                awaitUploaded(nodeA, "late");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1, NULL)");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-02', 2, 'two')");
+                nodeA.execute("INSERT INTO late VALUES ('2024-01-01', 7)");
+                awaitApplied(nodeA, "t");
+                awaitApplied(nodeA, "late");
+                final io.questdb.cairo.TableToken t = nodeA.getEngine().verifyTableName("t");
+                Assert.assertTrue(nodeA.getReplicationService().getUploadedTxn(t) < nodeA.getEngine().getTableSequencerAPI().lastTxn(t));
+                nodeA.getReplicationService().crashForTesting();
+            }
+            // nobody else wrote to the store: a's own history extends it, so a comes back as primary
+            writeConfiguration(a, "primary");
+            try (TestServerMain nodeA = start(a); TestServerMain nodeB = start(b)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                Assert.assertNull(((io.questdb.replication.ReplicatedCairoEngine) nodeA.getEngine()).getFenceReason());
+                awaitUploaded(nodeA, "t");
+                awaitUploaded(nodeA, "late");
+                awaitSame(nodeA, nodeB, "t");
+                awaitSame(nodeA, nodeB, "late");
+                nodeB.assertSql("SELECT v, s FROM t ORDER BY v", "v\ts\n1\t\n2\ttwo\n");
+                nodeB.assertSql("SELECT v FROM late", "v\n7\n");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-03', 3, 'three')");
+                awaitSame(nodeA, nodeB, "t");
+            }
+        });
+    }
+
+    @Test
     public void testDatabaseOfAnotherStoreIsRefused() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = nodeRoot("a");
@@ -153,6 +199,49 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
                         ((io.questdb.replication.ReplicatedCairoEngine) nodeC.getEngine()).getFenceReason());
                 Assert.assertNull(nodeC.getEngine().getTableTokenIfExists("t"));
                 nodeC.assertSql("SELECT count() n FROM x", "n\n1\n");
+            }
+        });
+    }
+
+    @Test
+    public void testFormerPrimaryAheadOfDivergedStoreIsFenced() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            // a long throttle window keeps a's last two inserts local when it crashes
+            writeConfiguration(a, "primary", PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000");
+            writeConfiguration(b, "replica");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                try (TestServerMain nodeB = start(b)) {
+                    awaitRole(nodeB, EngineRole.REPLICA);
+                    TestUtils.assertEventually(() -> Assert.assertNotNull(nodeB.getEngine().getTableTokenIfExists("t")), 60);
+                }
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                awaitApplied(nodeA, "t");
+                nodeA.getReplicationService().crashForTesting();
+            }
+            // b takes over and writes one transaction of its own: a different transaction 2
+            writeConfiguration(b, "primary");
+            try (TestServerMain nodeB = start(b)) {
+                awaitRole(nodeB, EngineRole.PRIMARY);
+                nodeB.execute("INSERT INTO t VALUES ('2024-02-01', 100)");
+                awaitUploaded(nodeB, "t");
+            }
+            // a holds more transactions than the store, but they are not the store's: it must not upload them
+            writeConfiguration(a, "primary");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.FENCED);
+                TestUtils.assertContains(((io.questdb.replication.ReplicatedCairoEngine) nodeA.getEngine()).getFenceReason(), "could not catch up");
+                assertWriteRefused(nodeA, "INSERT INTO t VALUES ('2024-01-03', 3)");
+            }
+            // the store still holds b's history only
+            writeConfiguration(b, "primary");
+            try (TestServerMain nodeB = start(b)) {
+                awaitRole(nodeB, EngineRole.PRIMARY);
+                nodeB.assertSql("SELECT v FROM t", "v\n100\n");
             }
         });
     }

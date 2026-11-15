@@ -95,6 +95,43 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testFailedDrainAtShutdownIsUploadedAfterRestart() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            final String r = nodeRoot("r");
+            writeConfiguration(p, "primary", PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000");
+            writeConfiguration(r, "replica");
+            final AtomicBoolean isStoreDown = new AtomicBoolean();
+            try (TestServerMain primary = startFaulty(p, new FaultyObjectStore.Hook() {
+                @Override
+                public void before(String op, String key) {
+                    if (isStoreDown.get()) {
+                        throw ObjectStoreException.fatal("injected store outage");
+                    }
+                }
+            })) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(primary, "t");
+                // waits for the 10-minute window, then the store goes away before the graceful stop
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1), ('2024-01-02', 2)");
+                awaitApplied(primary, "t");
+                final io.questdb.cairo.TableToken t = primary.getEngine().verifyTableName("t");
+                Assert.assertEquals(0, primary.getReplicationService().getUploadedTxn(t));
+                isStoreDown.set(true);
+            }
+            // the stop could neither drain nor release the lease; nothing is lost: the next start uploads it
+            writeConfiguration(p, "primary");
+            try (TestServerMain primary = start(p); TestServerMain replica = start(r)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                awaitUploaded(primary, "t");
+                awaitSame(primary, replica, "t");
+                replica.assertSql("SELECT count() n FROM t", "n\n2\n");
+            }
+        });
+    }
+
+    @Test
     public void testIndexCommitErrorWhileAnotherPrimaryTookOverFences() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String p = nodeRoot("p");

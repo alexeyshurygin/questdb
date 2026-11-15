@@ -95,6 +95,53 @@ public class ReplicationCleanerTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testCheckpointHistorySurvivesRestart() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            final String[] settings = {
+                    PropertyKey.REPLICATION_PRIMARY_SEQUENCER_PART_TXN_COUNT.getPropertyPath() + "=2",
+                    PropertyKey.REPLICATION_PRIMARY_CLEANER_INTERVAL.getPropertyPath() + "=1s",
+                    PropertyKey.REPLICATION_PRIMARY_CLEANER_BACKUP_WINDOW_COUNT.getPropertyPath() + "=2"
+            };
+            writeConfiguration(p, "primary", settings);
+            final String tKey;
+            final String instanceId;
+            try (TestServerMain primary = start(p)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                for (int i = 1; i <= 4; i++) {
+                    primary.execute("INSERT INTO t VALUES ('2024-01-0" + i + "', " + i + ')');
+                }
+                awaitUploaded(primary, "t");
+                tKey = tableKey(primary, "t");
+                instanceId = primary.getReplicationService().getInstanceId();
+                primary.execute("CHECKPOINT CREATE");
+                primary.execute("CHECKPOINT RELEASE");
+                TestUtils.assertEventually(() -> Assert.assertTrue(Files.exists(Paths.get(storeRoot, "_checkpoints", instanceId))), 30);
+                Assert.assertEquals(2, seqObjects(tKey));
+            }
+            // one checkpoint is fewer than the window of two: the cleaner waits for the second, which
+            // the restarted primary appends to the history it finds in the store
+            writeConfiguration(p, "primary", settings);
+            try (TestServerMain primary = start(p)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                Assert.assertEquals(instanceId, primary.getReplicationService().getInstanceId());
+                for (int i = 5; i <= 8; i++) {
+                    primary.execute("INSERT INTO t VALUES ('2024-01-0" + i + "', " + i + ')');
+                }
+                awaitUploaded(primary, "t");
+                Assert.assertEquals(4, seqObjects(tKey));
+                primary.execute("CHECKPOINT CREATE");
+                primary.execute("CHECKPOINT RELEASE");
+                // the older of the two checkpoints holds txns 1..4: parts 0 and 1 go, parts 2 and 3 stay.
+                // Had the restart lost the first checkpoint, the cleaner would still wait for a second one.
+                TestUtils.assertEventually(() -> Assert.assertEquals(2, seqObjects(tKey)), 30);
+                primary.assertSql("SELECT count() n FROM t", "n\n8\n");
+            }
+        });
+    }
+
+    @Test
     public void testTableDroppedInEarlierTermIsCleanedAfterCooloff() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String p = nodeRoot("p");

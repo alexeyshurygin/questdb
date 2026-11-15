@@ -33,10 +33,13 @@ import io.questdb.replication.ReplicatedCairoEngine;
 import io.questdb.replication.ReplicationConfigurationImpl;
 import io.questdb.replication.ReplicationException;
 import io.questdb.replication.ReplicationRole;
+import io.questdb.replication.ReplicationWalDirectoryPolicy;
 import io.questdb.replication.ReplicationWorker;
 import io.questdb.replication.StoreKeys;
 import io.questdb.replication.TableReplayer;
 import io.questdb.replication.TableUploader;
+import io.questdb.replication.WalCleaner;
+import io.questdb.replication.codec.CheckpointHistory;
 import io.questdb.replication.codec.IndexTable;
 import io.questdb.replication.codec.NativeBuffer;
 import io.questdb.replication.codec.ObjectEnvelope;
@@ -324,6 +327,179 @@ public class ReplicaApplyTest extends AbstractTest {
         });
     }
 
+    @Test
+    public void testUploaderFailures() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = newDir("uploader-a");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final FaultyFilesFacade ff = new FaultyFilesFacade();
+            try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY, ff);
+                 ReplicationWorker pw = new ReplicationWorker(store, 1, true, ff, primary.getConfiguration().getMkDirMode(), primary,
+                         a + File.separator + ".replication");
+                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(ff, (tableDir, partId) -> false, null);
+                 Path path = new Path()) {
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                primary.execute("INSERT INTO t VALUES ('2024-01-03', 3)");
+                final TableToken token = primary.verifyTableName("t");
+                final IndexTable fresh = new IndexTable().of(token.getTableId(), 7, token.getDirName(), token.getTableName(), IndexTable.KIND_TABLE, 2);
+                final long last = primary.getTableSequencerAPI().lastTxn(token);
+                Assert.assertEquals(3, last);
+
+                // the create manifest needs the sequencer's _meta.0
+                ff.failOpenRO = "_meta.0";
+                assertReplication(() -> new TableUploader(token, copy(fresh), false).upload(primary, pw, EPOCH, last, 100),
+                        ReplicationException.Kind.CORRUPT, "could not open table file");
+                ff.failOpenRO = null;
+                ff.trackOpenRO = "_meta.0";
+                ff.isLengthFailing = true;
+                assertReplication(() -> new TableUploader(token, copy(fresh), false).upload(primary, pw, EPOCH, last, 100),
+                        ReplicationException.Kind.CORRUPT, "invalid table file length");
+                ff.isLengthFailing = false;
+                ff.isReadFailing = true;
+                assertReplication(() -> new TableUploader(token, copy(fresh), false).upload(primary, pw, EPOCH, last, 100),
+                        ReplicationException.Kind.CORRUPT, "could not read table file");
+                ff.isReadFailing = false;
+                ff.trackOpenRO = null;
+                Assert.assertNull("a failed upload leaves no manifest", store.getBytes(StoreKeys.create(fresh.getKey())));
+
+                // a healthy upload of the first transaction, committed: part 0 (txns 1..2) is half full
+                final TableUploader u = new TableUploader(token, copy(fresh), false);
+                Assert.assertEquals(1, u.upload(primary, pw, EPOCH, 1, 100));
+                u.onCommitted();
+                Assert.assertEquals(1, u.getCommittedTxn());
+                final IndexTable committed = copy(u.getEntry());
+                final String part0 = StoreKeys.seqPart(committed.getKey(), 0, EPOCH);
+                final byte[] goodPart = store.getBytes(part0);
+
+                // a restarted uploader continues the store's last part: it must be there and complete
+                store.delete(part0);
+                assertReplication(() -> new TableUploader(token, copy(committed), true).loadPart(pw),
+                        ReplicationException.Kind.GAP, "transaction log part is missing from the object store");
+                final TxnPart emptyPart = new TxnPart().of(committed.getTableId(), committed.getCreateTimestamp(), 0, committed.getPartTxnCount());
+                store.putRaw(part0, envelope(pw, emptyPart::encode));
+                assertReplication(() -> new TableUploader(token, copy(committed), true).loadPart(pw),
+                        ReplicationException.Kind.CORRUPT, "transaction log part ends before the index says");
+                store.putRaw(part0, goodPart);
+                final TableUploader restarted = new TableUploader(token, copy(committed), true);
+                restarted.loadPart(pw);
+                Assert.assertEquals(2, restarted.upload(primary, pw, EPOCH, last, 100));
+                restarted.onCommitted();
+                // part 0 now holds both of its transactions, part 1 the third
+                Assert.assertEquals(2, decodePart(pw, store.getBytes(part0)).getLastTxn());
+                Assert.assertEquals(3, decodePart(pw, store.getBytes(StoreKeys.seqPart(committed.getKey(), 1, EPOCH))).getLastTxn());
+                Assert.assertEquals(3, restarted.getCommittedTxn());
+
+                // startup markers: once the store holds the startup transaction, every segment marker of
+                // the table goes, whatever else lies in its directory
+                final CharSequence dbRoot = primary.getConfiguration().getDbRoot();
+                final java.nio.file.Path tableDir = Paths.get(dbRoot.toString(), token.getDirName());
+                final java.nio.file.Path marker = marker(tableDir);
+                Files.createDirectories(tableDir.resolve("walnotanumber"));
+                Files.createDirectories(tableDir.resolve("wal900").resolve("notasegment"));
+                Files.createFile(tableDir.resolve("wal900").resolve("5"));
+                Files.createFile(tableDir.resolve("wal901"));
+                Files.createDirectories(tableDir.resolve("wal902"));
+                Files.createFile(marker);
+                restarted.setStartupLastTxn(3);
+                // a table directory that cannot be listed keeps its markers for the next round
+                ff.failFindFirst = token.getDirName();
+                restarted.releaseMarkers(policy, path, dbRoot, ff);
+                Assert.assertTrue(Files.exists(marker));
+                ff.failFindFirst = "wal902";
+                restarted.setStartupLastTxn(3);
+                restarted.releaseMarkers(policy, path, dbRoot, ff);
+                ff.failFindFirst = null;
+                Assert.assertFalse(Files.exists(marker));
+            }
+        });
+    }
+
+    @Test
+    public void testWalCleanerPlans() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = newDir("cleaner-a");
+            // lists a history that is gone by the time the cleaner reads it
+            final MemoryObjectStore store = new MemoryObjectStore() {
+                @Override
+                public void list(@NotNull String prefix, String startAfter, @NotNull ListConsumer consumer) {
+                    if (prefix.equals(StoreKeys.CHECKPOINTS_PREFIX)) {
+                        consumer.onKey(StoreKeys.checkpointHistory("deleted-meanwhile"), 10);
+                    }
+                    super.list(prefix, startAfter, consumer);
+                }
+            };
+            try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
+                 ReplicationWorker pw = worker(store, primary, a)) {
+                final IndexTable entry = uploadSample(primary, pw);
+                final String dir = entry.getDirName();
+                final WalCleaner cleaner = new WalCleaner(new ReplicationConfigurationImpl().setCleanerBackupWindowCount(2), store);
+
+                // no instance kept two checkpoints yet: nothing may be cleaned
+                Assert.assertNull(cleaner.computeCutoffs(pw));
+                putHistory(store, pw, "one-checkpoint", checkpoint(dir, 3));
+                store.putRaw(StoreKeys.checkpointHistory("unreadable"), envelope(pw, raw -> raw.putStr("not a checkpoint history")));
+                Assert.assertNull(cleaner.computeCutoffs(pw));
+
+                // two instances with two checkpoints each: a table is needed from the oldest kept
+                // checkpoint on, and one that a kept checkpoint lacks is needed whole
+                putHistory(store, pw, "a", checkpoint(dir, 1), checkpoint(dir, 2), checkpoint(dir, 3));
+                final CheckpointHistory.Checkpoint withOther = checkpoint(dir, 3);
+                withOther.addTable("other~9", 5);
+                putHistory(store, pw, "b", withOther, checkpoint(dir, 3));
+                final java.util.Map<String, Long> cutoffs = cleaner.computeCutoffs(pw);
+                Assert.assertNotNull(cutoffs);
+                Assert.assertEquals(2, cutoffs.size());
+                Assert.assertEquals(2L, (long) cutoffs.get(dir));
+                Assert.assertEquals(0L, (long) cutoffs.get("other~9"));
+
+                // the table holds txns 1..3 in parts of two: part 0 goes once a checkpoint covers txn 2
+                Assert.assertNull(cleaner.planTable(entry, 1, pw));
+                final String seq = "t/" + entry.getKey() + "/seq/";
+                store.putRaw(seq + "stray", new byte[]{1});
+                store.putRaw(seq + "x.1", new byte[]{1});
+                final WalCleaner.TablePlan plan = cleaner.planTable(entry, 2, pw);
+                Assert.assertNotNull(plan);
+                Assert.assertEquals(3, plan.getNewFirstTxn());
+                Assert.assertTrue(plan.getKeys().contains(StoreKeys.seqPart(entry.getKey(), 0, EPOCH)));
+                Assert.assertFalse(plan.getKeys().contains(StoreKeys.seqPart(entry.getKey(), 1, EPOCH)));
+                Assert.assertFalse(plan.getKeys().contains(seq + "stray"));
+                Assert.assertFalse(plan.getKeys().contains(seq + "x.1"));
+                // the delta of txns 1..2 goes with part 0; what txn 3 needs stays
+                final TxnPart part1 = decodePart(pw, store.getBytes(StoreKeys.seqPart(entry.getKey(), 1, EPOCH)));
+                final TxnRecord third = part1.getRecord(3);
+                final String keptDelta = StoreKeys.segmentDelta(entry.getKey(), third.getWalId(), third.getSegmentId(),
+                        third.getDeltaFirstSegmentTxn(), third.getDeltaLastSegmentTxn(), third.getDeltaEpoch());
+                Assert.assertFalse(plan.getKeys().contains(keptDelta));
+                long deltas = 0;
+                for (String k : plan.getKeys()) {
+                    if (k.contains("/wal/")) {
+                        deltas++;
+                    }
+                }
+                Assert.assertTrue(deltas > 0);
+                // an already cleaned table, and one whose parts no epoch names, plan nothing more
+                final IndexTable cleaned = copy(entry);
+                cleaned.setFirstTxn(3);
+                Assert.assertNull(cleaner.planTable(cleaned, 2, pw));
+                final IndexTable noEpoch = copy(entry);
+                noEpoch.getEpochStarts().clear();
+                final WalCleaner.TablePlan blind = cleaner.planTable(noEpoch, 2, pw);
+                Assert.assertNotNull(blind);
+                for (String k : blind.getKeys()) {
+                    Assert.assertFalse(k, k.contains("/wal/"));
+                }
+
+                // a dropped table loses everything under its prefix
+                final java.util.List<String> all = cleaner.planDroppedTable(entry);
+                Assert.assertTrue(all.contains(StoreKeys.create(entry.getKey())));
+                Assert.assertTrue(all.contains(seq + "stray"));
+                Assert.assertTrue(all.contains(keptDelta));
+            }
+        });
+    }
+
     private static void assertCairo(ThrowingRunnable r, String message) {
         try {
             r.run();
@@ -348,6 +524,12 @@ public class ReplicaApplyTest extends AbstractTest {
         Assert.assertEquals(0, r.replay(replica, entry, w, null, 100));
         Assert.assertTrue("expected a stale table: " + message, r.isStale());
         TestUtils.assertContains(r.getStaleReason(), message);
+    }
+
+    private static CheckpointHistory.Checkpoint checkpoint(String tableDir, long seqTxn) {
+        final CheckpointHistory.Checkpoint c = new CheckpointHistory.Checkpoint(seqTxn * 1_000_000L);
+        c.addTable(tableDir, seqTxn);
+        return c;
     }
 
     private static IndexTable copy(IndexTable t) {
@@ -394,6 +576,16 @@ public class ReplicaApplyTest extends AbstractTest {
         return new SegmentDelta().of(raw.ptr(), raw.size());
     }
 
+    // the upload.pending marker of the table's first WAL segment
+    private static java.nio.file.Path marker(java.nio.file.Path tableDir) throws java.io.IOException {
+        try (java.util.stream.Stream<java.nio.file.Path> walDirs = Files.list(tableDir)) {
+            final java.nio.file.Path wal = walDirs
+                    .filter(d -> d.getFileName().toString().matches("wal\\d+") && Files.isDirectory(d.resolve("0")))
+                    .sorted().findFirst().orElseThrow();
+            return wal.resolve("0").resolve(ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER);
+        }
+    }
+
     private static ReplicatedCairoEngine newEngine(String dir, ReplicationRole role) {
         return newEngine(dir, role, null);
     }
@@ -436,6 +628,15 @@ public class ReplicaApplyTest extends AbstractTest {
     private static void freeDeltaBuffers() {
         Misc.freeObjList(DELTA_BUFFERS);
         DELTA_BUFFERS.clear();
+    }
+
+    private static void putHistory(MemoryObjectStore store, ReplicationWorker w, String instanceId, CheckpointHistory.Checkpoint... checkpoints) {
+        final CheckpointHistory history = new CheckpointHistory();
+        for (CheckpointHistory.Checkpoint c : checkpoints) {
+            history.add(c);
+        }
+        final byte[] text = history.encode();
+        store.putRaw(StoreKeys.checkpointHistory(instanceId), envelope(w, raw -> raw.putBytes(text, 0, text.length)));
     }
 
     private static TableCreateManifest readManifest(MemoryObjectStore store, IndexTable entry, ReplicationWorker w) {
@@ -485,8 +686,30 @@ public class ReplicaApplyTest extends AbstractTest {
     private static class FaultyFilesFacade extends TestFilesFacadeImpl {
         volatile String failMkdirs;
         volatile String failOpenClean;
+        volatile String failFindFirst;
+        volatile String failOpenRO;
         volatile String failOpenRW;
         volatile long failWriteLength = -1;
+        volatile boolean isLengthFailing;
+        volatile boolean isReadFailing;
+        volatile String trackOpenRO;
+        private volatile long trackedFd = -1;
+
+        @Override
+        public long findFirst(LPSZ path) {
+            if (failFindFirst != null && Utf8s.endsWithAscii(path, failFindFirst)) {
+                return 0;
+            }
+            return super.findFirst(path);
+        }
+
+        @Override
+        public long length(long fd) {
+            if (isLengthFailing && fd == trackedFd) {
+                return -1;
+            }
+            return super.length(fd);
+        }
 
         @Override
         public int mkdirs(Path path, int mode) {
@@ -505,11 +728,31 @@ public class ReplicaApplyTest extends AbstractTest {
         }
 
         @Override
+        public long openRO(LPSZ name) {
+            if (failOpenRO != null && Utf8s.containsAscii(name, failOpenRO)) {
+                return -1;
+            }
+            final long fd = super.openRO(name);
+            if (trackOpenRO != null && Utf8s.containsAscii(name, trackOpenRO)) {
+                trackedFd = fd;
+            }
+            return fd;
+        }
+
+        @Override
         public long openRW(LPSZ name, int opts) {
             if (failOpenRW != null && Utf8s.containsAscii(name, failOpenRW)) {
                 return -1;
             }
             return super.openRW(name, opts);
+        }
+
+        @Override
+        public long read(long fd, long buf, long len, long offset) {
+            if (isReadFailing && fd == trackedFd) {
+                return -1;
+            }
+            return super.read(fd, buf, len, offset);
         }
 
         @Override
