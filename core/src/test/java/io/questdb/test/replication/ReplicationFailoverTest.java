@@ -33,6 +33,8 @@ import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.File;
+
 /**
  * Restarts, promotion, lease takeover and divergence between two nodes.
  */
@@ -70,6 +72,87 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
                 awaitRole(nodeA, EngineRole.FENCED);
                 TestUtils.assertContains(((io.questdb.replication.ReplicatedCairoEngine) nodeA.getEngine()).getFenceReason(), "could not catch up");
                 assertWriteRefused(nodeA, "INSERT INTO t VALUES ('2024-01-03', 3)");
+            }
+        });
+    }
+
+    @Test
+    public void testDatabaseOfAnotherStoreIsRefused() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String c = nodeRoot("c");
+            final String mainStore = storeRoot;
+            writeConfiguration(a, "primary");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitApplied(nodeA, "t");
+            }
+            // c is the primary of another database, with a store of its own
+            storeRoot = root + File.separator + "store2";
+            TestUtils.createTestPath(storeRoot);
+            writeConfiguration(c, "primary");
+            storeRoot = mainStore;
+            try (TestServerMain nodeC = start(c)) {
+                awaitRole(nodeC, EngineRole.PRIMARY);
+                nodeC.execute("CREATE TABLE x (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitApplied(nodeC, "x");
+            }
+            // pointed at a's store, c refuses it as a primary and as a replica
+            writeConfiguration(c, "primary");
+            try (TestServerMain nodeC = start(c)) {
+                awaitRole(nodeC, EngineRole.FENCED);
+                Assert.assertEquals("the object store belongs to another database (DataID differs)",
+                        ((io.questdb.replication.ReplicatedCairoEngine) nodeC.getEngine()).getFenceReason());
+                assertWriteRefused(nodeC, "INSERT INTO x VALUES ('2024-01-02', 2)");
+                Assert.assertNull(nodeC.getEngine().getTableTokenIfExists("t"));
+            }
+            writeConfiguration(c, "replica");
+            try (TestServerMain nodeC = start(c)) {
+                TestUtils.assertEventually(() -> Assert.assertEquals(
+                        "stopped: the object store belongs to another database (DataID differs)",
+                        nodeC.getReplicationService().getStatus()), 30);
+                Assert.assertEquals(EngineRole.REPLICA, role(nodeC));
+                Assert.assertNull(nodeC.getEngine().getTableTokenIfExists("t"));
+                nodeC.assertSql("SELECT count() n FROM x", "n\n0\n");
+            }
+            // the store is untouched: a still owns it and serves its data
+            writeConfiguration(a, "primary");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.assertSql("SELECT count() n FROM t", "n\n1\n");
+            }
+        });
+    }
+
+    @Test
+    public void testPopulatedNodeWithoutDataIdIsRefused() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String c = nodeRoot("c");
+            writeConfiguration(a, "primary");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitApplied(nodeA, "t");
+            }
+            // c holds tables of its own but lost its database id, so it mints a new one at boot
+            writeConfiguration(c, "none");
+            try (TestServerMain nodeC = start(c)) {
+                nodeC.execute("CREATE TABLE x (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                nodeC.execute("INSERT INTO x VALUES ('2024-01-01', 1)");
+                TestUtils.assertEventually(() -> nodeC.assertSql("SELECT count() n FROM x", "n\n1\n"), 30);
+            }
+            final java.nio.file.Path dataId = java.nio.file.Paths.get(c, "db", io.questdb.cairo.DataID.FILENAME);
+            java.nio.file.Files.deleteIfExists(dataId);
+            writeConfiguration(c, "primary");
+            try (TestServerMain nodeC = start(c)) {
+                awaitRole(nodeC, EngineRole.FENCED);
+                Assert.assertEquals("the object store belongs to another database (DataID differs)",
+                        ((io.questdb.replication.ReplicatedCairoEngine) nodeC.getEngine()).getFenceReason());
+                Assert.assertNull(nodeC.getEngine().getTableTokenIfExists("t"));
+                nodeC.assertSql("SELECT count() n FROM x", "n\n1\n");
             }
         });
     }

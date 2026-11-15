@@ -253,6 +253,20 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
     }
 
+    /**
+     * The last transaction of the table that the object store holds from this primary, or -1 when it
+     * uploaded none.
+     */
+    public long getUploadedTxn(@NotNull TableToken token) {
+        final TableUploader u = uploaders.get(token.getDirName());
+        if (u == null) {
+            return -1;
+        }
+        synchronized (u) {
+            return u.getCommittedTxn();
+        }
+    }
+
     @Override
     public boolean isSeqPartPinned(@NotNull String tableDir, long partId) {
         final TableUploader u = uploaders.get(tableDir);

@@ -54,6 +54,17 @@ public abstract class AbstractReplicationTest extends AbstractBootstrapTest {
         );
     }
 
+    /**
+     * Waits until the primary's object store holds every transaction of the table.
+     */
+    protected static void awaitUploaded(TestServerMain primary, String table) throws Exception {
+        TestUtils.assertEventually(() -> {
+            final io.questdb.cairo.TableToken token = primary.getEngine().verifyTableName(table);
+            Assert.assertEquals(primary.getEngine().getTableSequencerAPI().lastTxn(token),
+                    primary.getReplicationService().getUploadedTxn(token));
+        }, 60);
+    }
+
     protected static void awaitRole(TestServerMain server, ReplicatedCairoEngine.EngineRole role) throws Exception {
         TestUtils.assertEventually(() -> Assert.assertEquals(role, role(server)), 60);
     }

@@ -94,6 +94,53 @@ public class ReplicationCleanerTest extends AbstractReplicationTest {
         });
     }
 
+    @Test
+    public void testTableDroppedInEarlierTermIsCleanedAfterCooloff() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            final String r = nodeRoot("r");
+            final String keepCooloff = PropertyKey.REPLICATION_PRIMARY_CLEANER_DROPPED_TABLE_COOLOFF.getPropertyPath() + "=1h";
+            final String interval = PropertyKey.REPLICATION_PRIMARY_CLEANER_INTERVAL.getPropertyPath() + "=1s";
+            writeConfiguration(p, "primary", interval, keepCooloff);
+            writeConfiguration(r, "replica");
+            final String goneKey;
+            try (TestServerMain primary = start(p)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("CREATE TABLE gone (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO gone VALUES ('2024-01-01', 1)");
+                awaitUploaded(primary, "gone");
+                goneKey = tableKey(primary, "gone");
+                primary.execute("DROP TABLE gone");
+                awaitUploaded(primary, "t");
+            }
+            final long objectsBeforeCooloff = objectCount(goneKey, null);
+            Assert.assertTrue(objectsBeforeCooloff > 0);
+
+            // the next term inherits the dropped table from the index and keeps it while it cools off
+            writeConfiguration(p, "primary", interval, keepCooloff);
+            try (TestServerMain primary = start(p); TestServerMain replica = start(r)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitUploaded(primary, "t");
+                awaitSame(primary, replica, "t");
+                Assert.assertNull(replica.getEngine().getTableTokenIfExists("gone"));
+                Assert.assertEquals(objectsBeforeCooloff, objectCount(goneKey, null));
+            }
+
+            // with the cooloff over, the cleaner removes it from the index and deletes its objects
+            writeConfiguration(p, "primary", interval, PropertyKey.REPLICATION_PRIMARY_CLEANER_DROPPED_TABLE_COOLOFF.getPropertyPath() + "=0");
+            try (TestServerMain primary = start(p); TestServerMain replica = start(r)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                TestUtils.assertEventually(() -> Assert.assertEquals(0, objectCount(goneKey, null)), 30);
+                primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                awaitSame(primary, replica, "t");
+                replica.assertSql("SELECT count() n FROM t", "n\n2\n");
+                Assert.assertNull(replica.getEngine().getTableTokenIfExists("gone"));
+            }
+        });
+    }
+
     private static String tableKey(TestServerMain server, String table) {
         // store keys are <table id>_<create timestamp>
         return server.getEngine().getTableTokenIfExists(table).getTableId() + "_";

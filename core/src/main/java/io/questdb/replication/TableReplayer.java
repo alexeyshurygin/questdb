@@ -72,25 +72,17 @@ public class TableReplayer {
     }
 
     /**
-     * Why the table stopped replicating, null while it replicates.
-     */
-    public @Nullable String getStaleReason() {
-        return staleReason;
-    }
-
-    public String getTableKey() {
-        return tableKey;
-    }
-
-    public @Nullable TableToken getToken() {
-        return token;
-    }
-
-    /**
      * True once a replicated drop was applied: nothing more will ever arrive for the table.
      */
     public boolean isDone() {
         return isDone;
+    }
+
+    /**
+     * Why the table stopped replicating, or null while it replicates.
+     */
+    public String getStaleReason() {
+        return staleReason;
     }
 
     public boolean isStale() {
@@ -241,7 +233,9 @@ public class TableReplayer {
         if (token == null) {
             token = engine.getTableTokenByDirName(entry.getDirName());
             if (token == null) {
-                if (entry.isDropped() && entry.getLastTxn() <= entry.getFirstTxn()) {
+                // a dropped table ends absent: a node without it has nothing to replay, and the directory
+                // of a drop this node applied itself may still wait for the purge job
+                if (entry.isDropped()) {
                     isDone = true;
                     return 0;
                 }
@@ -325,14 +319,5 @@ public class TableReplayer {
         cachedPart = null;
         cachedPartEpoch = -1;
         segmentHighWater.clear();
-    }
-
-    /**
-     * Lets a stale table retry, after an operator fixed its cause.
-     */
-    public void retry() {
-        staleReason = null;
-        prefixCheckedTxn = 0;
-        reset();
     }
 }

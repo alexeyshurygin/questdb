@@ -36,8 +36,11 @@ import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.TableWriterAPI;
 import io.questdb.cairo.file.BlockFileWriter;
+import io.questdb.cairo.mv.MatViewDefinition;
 import io.questdb.cairo.mv.MatViewStateStore;
 import io.questdb.cairo.mv.NoOpMatViewStateStore;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.view.ViewDefinition;
 import io.questdb.cairo.vm.api.MemoryMARW;
 import io.questdb.cairo.wal.LocalDurabilityPolicy;
 import io.questdb.cairo.wal.ViewWalWriter;
@@ -45,6 +48,8 @@ import io.questdb.cairo.wal.WalLocker;
 import io.questdb.cairo.wal.WalWriter;
 import io.questdb.cutlass.qwp.codec.QwpEgressMsgKind;
 import io.questdb.cutlass.qwp.codec.QwpServerInfoProvider;
+import io.questdb.griffin.engine.ops.CreateMatViewOperation;
+import io.questdb.griffin.engine.ops.CreateViewOperation;
 import io.questdb.griffin.engine.ops.OperationDispatcher;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
@@ -110,6 +115,27 @@ public class ReplicatedCairoEngine extends CairoEngine {
     }
 
     /**
+     * Refuses materialized views while read-only: they do not replicate, and a read-only node creates
+     * nothing a client asks for.
+     */
+    @Override
+    public @NotNull MatViewDefinition createMatView(
+            SecurityContext securityContext,
+            MemoryMARW mem,
+            BlockFileWriter blockFileWriter,
+            Path path,
+            boolean ifNotExists,
+            CreateMatViewOperation operation,
+            boolean keepLock,
+            boolean inVolume
+    ) {
+        if (isReadOnlyMode()) {
+            throw CairoException.readOnlyAccess();
+        }
+        return super.createMatView(securityContext, mem, blockFileWriter, path, ifNotExists, operation, keepLock, inVolume);
+    }
+
+    /**
      * Refuses client-created replicated tables while read-only. A read-only node still creates its own
      * system tables and the temporary tables that query exports materialize.
      */
@@ -137,6 +163,25 @@ public class ReplicatedCairoEngine extends CairoEngine {
      * Refuses client drops of replicated tables while read-only. Replication applies a primary's drop
      * through {@link #dropReplicatedTable(Path, TableToken)}.
      */
+    /**
+     * Refuses views while read-only, as every other DDL.
+     */
+    @Override
+    public @NotNull ViewDefinition createView(
+            SecurityContext securityContext,
+            MemoryMARW mem,
+            BlockFileWriter blockFileWriter,
+            Path path,
+            boolean ifNotExists,
+            CreateViewOperation operation,
+            @Nullable RecordMetadata metadata
+    ) {
+        if (isReadOnlyMode()) {
+            throw CairoException.readOnlyAccess();
+        }
+        return super.createView(securityContext, mem, blockFileWriter, path, ifNotExists, operation, metadata);
+    }
+
     @Override
     public void dropTableOrViewOrMatView(Path path, TableToken tableToken) {
         checkReplicatedWrite(tableToken);

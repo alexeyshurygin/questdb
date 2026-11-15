@@ -97,23 +97,22 @@ public class TableUploader {
         return ((long) walId << 32) | 0xffffffffL;
     }
 
+    /**
+     * The table's index entry including the uploaded but not yet committed batch.
+     */
+    /**
+     * The last transaction a committed index names for this table.
+     */
     public long getCommittedTxn() {
         return committedTxn;
     }
 
-    /**
-     * The table's index entry including the uploaded but not yet committed batch.
-     */
     public IndexTable getEntry() {
         return entry;
     }
 
     public long getPendingTxn() {
         return pendingTxn;
-    }
-
-    public String getTableKey() {
-        return tableKey;
     }
 
     public TableToken getToken() {
@@ -176,17 +175,6 @@ public class TableUploader {
         }
     }
 
-    /**
-     * The index commit failed: forget the uploaded batch, the next attempt uploads it again.
-     */
-    public void onCommitFailed() {
-        pendingTxn = committedTxn;
-        if (part != null) {
-            part.truncateAfter(committedTxn);
-            isPartDirty = true;
-        }
-    }
-
     public void onSegmentClosed(int walId, int segmentId) {
         closedSegments.add(segmentKey(walId, segmentId));
     }
@@ -223,10 +211,6 @@ public class TableUploader {
             releaseStartupMarkers(policy, path, dbRoot, ff);
             startupLastTxn = -1;
         }
-    }
-
-    public void setLocalPartSize(int localPartSize) {
-        this.localPartSize = localPartSize;
     }
 
     /**

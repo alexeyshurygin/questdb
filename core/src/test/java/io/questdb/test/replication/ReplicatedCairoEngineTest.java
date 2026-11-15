@@ -108,8 +108,21 @@ public class ReplicatedCairoEngineTest extends AbstractTest {
                     TestUtils.assertContains(e.getMessage(), "REBASE WAL is not supported when replication is enabled");
                 }
                 final TableToken t = engine.verifyTableName("t");
+                // views stay node-local, and a writable primary changes them
+                engine.execute("CREATE VIEW v AS SELECT ts, v FROM t");
+                engine.execute("ALTER VIEW v AS SELECT ts FROM t");
+                final TableToken view = engine.verifyTableName("v");
+                engine.getViewWalWriter(view).close();
+                engine.execute("CREATE MATERIALIZED VIEW mv AS SELECT ts, max(v) m FROM t SAMPLE BY 1d");
+                Assert.assertNotNull(engine.getTableTokenIfExists("mv"));
 
                 engine.setRole(EngineRole.REPLICA, "ignored for this role");
+                assertRefused(engine, "ALTER VIEW v AS SELECT v FROM t");
+                assertRefused(engine, "CREATE VIEW v2 AS SELECT ts FROM t");
+                assertRefused(engine, "CREATE MATERIALIZED VIEW mv2 AS SELECT ts, max(v) m FROM t SAMPLE BY 1d");
+                Assert.assertNull(engine.getTableTokenIfExists("v2"));
+                Assert.assertNull(engine.getTableTokenIfExists("mv2"));
+                assertRefused(() -> engine.getViewWalWriter(view));
                 Assert.assertNull(engine.getFenceReason());
                 Assert.assertTrue(engine.isReadOnlyMode());
                 Assert.assertTrue(engine.isForceAlterAllowed());

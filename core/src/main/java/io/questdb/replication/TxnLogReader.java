@@ -85,10 +85,6 @@ public class TxnLogReader implements QuietCloseable {
         partId = -1;
     }
 
-    public int getFormatVersion() {
-        return formatVersion;
-    }
-
     /**
      * Transactions per V2 part file; 0 for V1 logs.
      */
