@@ -1,0 +1,328 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+
+package io.questdb.replication;
+
+import io.questdb.cairo.CommitMode;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.wal.WalLocker;
+import io.questdb.cairo.wal.seq.TableSequencerAPI;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
+import io.questdb.replication.codec.IndexTable;
+import io.questdb.replication.codec.NativeBuffer;
+import io.questdb.replication.codec.SegmentDelta;
+import io.questdb.replication.codec.TableCreateManifest;
+import io.questdb.replication.codec.TxnPart;
+import io.questdb.replication.codec.TxnRecord;
+import io.questdb.std.LongLongHashMap;
+import io.questdb.std.datetime.MicrosecondClock;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+/**
+ * Brings one table on this node up to the object store: creates it when it is new, then downloads
+ * and applies its transactions in order. Used by replicas and by a primary catching up before it
+ * opens writes. Keeps the downloaded transaction log part and how far each local WAL segment was
+ * written, so that a run that starts where the previous one stopped downloads nothing twice.
+ * One instance per table; never used by two threads at once.
+ */
+public class TableReplayer {
+    private static final Log LOG = LogFactory.getLog(TableReplayer.class);
+    // (walId << 32 | segmentId) -> last segment txn written locally
+    private final LongLongHashMap segmentHighWater = new LongLongHashMap(16, 0.5, -1, -1);
+    private final String tableKey;
+    private TxnPart cachedPart;
+    private long cachedPartEpoch = -1;
+    private boolean isDone;
+    private long prefixCheckedTxn;
+    private String staleReason;
+    private TableToken token;
+
+    public TableReplayer(@NotNull String tableKey) {
+        this.tableKey = tableKey;
+    }
+
+    private static long segmentKey(int walId, int segmentId) {
+        return ((long) walId << 32) | (segmentId & 0xffffffffL);
+    }
+
+    /**
+     * Why the table stopped replicating, null while it replicates.
+     */
+    public @Nullable String getStaleReason() {
+        return staleReason;
+    }
+
+    public String getTableKey() {
+        return tableKey;
+    }
+
+    public @Nullable TableToken getToken() {
+        return token;
+    }
+
+    /**
+     * True once a replicated drop was applied: nothing more will ever arrive for the table.
+     */
+    public boolean isDone() {
+        return isDone;
+    }
+
+    public boolean isStale() {
+        return staleReason != null;
+    }
+
+    /**
+     * Applies up to {@code maxTxnCount} of the transactions the object store holds past the local
+     * log.
+     *
+     * @return the number of transactions applied
+     */
+    public long replay(
+            @NotNull ReplicatedCairoEngine engine,
+            @NotNull IndexTable entry,
+            @NotNull ReplicationWorker worker,
+            @Nullable ReplicaSegmentPins pins,
+            long maxTxnCount
+    ) {
+        if (isDone || staleReason != null) {
+            return 0;
+        }
+        try {
+            return replay0(engine, entry, worker, pins, maxTxnCount);
+        } catch (ReplicationException e) {
+            staleReason = e.getMessage();
+            LOG.critical().$("table stopped replicating [table=").$(entry.getTableName()).$(", key=").$(tableKey)
+                    .$(", kind=").$(e.getKind().name()).$(", error=").$safe(e.getMessage()).I$();
+            return 0;
+        }
+    }
+
+    private void applyDelta(
+            ReplicatedCairoEngine engine,
+            TxnRecord record,
+            ReplicationWorker worker,
+            boolean isDurable,
+            @Nullable ReplicaSegmentPins pins
+    ) {
+        final long segKey = segmentKey(record.getWalId(), record.getSegmentId());
+        final long highWater = segmentHighWater.get(segKey);
+        if (highWater != -1 && highWater >= record.getSegmentTxn()) {
+            return;
+        }
+        if (record.getDeltaEpoch() < 0 || record.getDeltaFirstSegmentTxn() < 0
+                || record.getSegmentTxn() < record.getDeltaFirstSegmentTxn()
+                || record.getSegmentTxn() > record.getDeltaLastSegmentTxn()) {
+            throw ReplicationException.corrupt("data transaction does not name its WAL delta [table=" + entry(token)
+                    + ", txn=" + record.getTxn() + ']');
+        }
+        final String key = StoreKeys.segmentDelta(tableKey, record.getWalId(), record.getSegmentId(),
+                record.getDeltaFirstSegmentTxn(), record.getDeltaLastSegmentTxn(), record.getDeltaEpoch());
+        final NativeBuffer buf = worker.getBuffer();
+        if (!worker.getIo().get(key, buf)) {
+            throw ReplicationException.gap("WAL delta is missing from the object store [key=" + key + ']');
+        }
+        final SegmentDelta delta = worker.getDelta().of(buf.ptr(), buf.size());
+        if (delta.getWalId() != record.getWalId() || delta.getSegmentId() != record.getSegmentId()
+                || delta.getFirstSegmentTxn() != record.getDeltaFirstSegmentTxn()
+                || delta.getLastSegmentTxn() != record.getDeltaLastSegmentTxn()) {
+            throw ReplicationException.corrupt("WAL delta does not match its key [key=" + key + ']');
+        }
+        worker.getDeltaWriter().apply(engine.getConfiguration().getDbRoot(), token.getDirName(), delta, isDurable);
+        segmentHighWater.put(segKey, delta.getLastSegmentTxn());
+        if (pins != null) {
+            pins.onDownloaded(token.getDirName(), record.getWalId(), record.getSegmentId(), System.currentTimeMillis());
+        }
+    }
+
+    /**
+     * Verifies that this node's last transaction that the store also holds is the same transaction in
+     * both: equal WAL coordinates, structure version, commit timestamp and change.
+     */
+    void checkCommonPrefix(ReplicatedCairoEngine engine, IndexTable entry, ReplicationWorker worker, long local) {
+        final long txn = Math.min(local, entry.getLastTxn());
+        if (txn < entry.getFirstTxn() || txn < 1) {
+            return;
+        }
+        final long partNo = IndexTable.partOf(txn, entry.getPartTxnCount());
+        final TxnPart p = loadPart(entry, worker, partNo, entry.getAuthoritativeEpoch(partNo), txn);
+        final TxnRecord stored = p.getRecord(txn);
+        final TxnRecord localRecord = new TxnRecord();
+        final TxnLogReader reader = worker.getTxnLogReader().of(engine.getConfiguration().getDbRoot(), token.getDirName());
+        try {
+            reader.readRecord(txn, localRecord);
+        } finally {
+            reader.closeFiles();
+        }
+        if (!localRecord.isSameTxn(stored)) {
+            throw ReplicationException.divergence("local history differs from the object store [table=" + entry.getTableName()
+                    + ", txn=" + txn + ", local=" + localRecord + ", store=" + stored + ']');
+        }
+    }
+
+    private String entry(TableToken t) {
+        return t != null ? t.getTableName() : tableKey;
+    }
+
+    private TxnPart loadPart(IndexTable entry, ReplicationWorker worker, long part, long epoch, long txn) {
+        if (cachedPart != null && cachedPart.getPart() == part && cachedPartEpoch == epoch && cachedPart.getLastTxn() >= txn) {
+            return cachedPart;
+        }
+        if (epoch < 0) {
+            throw ReplicationException.corrupt("no epoch wrote the transaction log part [table=" + entry.getTableName()
+                    + ", part=" + part + ']');
+        }
+        final String key = StoreKeys.seqPart(tableKey, part, epoch);
+        final NativeBuffer buf = worker.getPartBuffer();
+        if (!worker.getIo().get(key, buf)) {
+            throw ReplicationException.gap("transaction log part is missing from the object store [key=" + key + ']');
+        }
+        final TxnPart p;
+        try {
+            p = TxnPart.decode(buf.ptr(), buf.size());
+        } catch (io.questdb.replication.codec.NativeReader.CorruptObjectException e) {
+            throw ReplicationException.corrupt("corrupt transaction log part [key=" + key + ", error=" + e.getMessage() + ']');
+        }
+        if (p.getTableId() != entry.getTableId() || p.getCreateTimestamp() != entry.getCreateTimestamp()
+                || p.getPart() != part || p.getPartTxnCount() != entry.getPartTxnCount()) {
+            throw ReplicationException.corrupt("transaction log part does not match its table [key=" + key + ']');
+        }
+        if (p.getLastTxn() < txn) {
+            // the index commits after the part upload, so this is an inconsistent store, not a race
+            throw ReplicationException.corrupt("transaction log part ends before the index says [key=" + key
+                    + ", partLastTxn=" + p.getLastTxn() + ", needed=" + txn + ']');
+        }
+        cachedPart = p;
+        cachedPartEpoch = epoch;
+        return p;
+    }
+
+    private long replay0(
+            ReplicatedCairoEngine engine,
+            IndexTable entry,
+            ReplicationWorker worker,
+            @Nullable ReplicaSegmentPins pins,
+            long maxTxnCount
+    ) {
+        final TableSequencerAPI api = engine.getTableSequencerAPI();
+        if (token == null) {
+            token = engine.getTableTokenByDirName(entry.getDirName());
+            if (token == null) {
+                if (entry.isDropped() && entry.getLastTxn() <= entry.getFirstTxn()) {
+                    isDone = true;
+                    return 0;
+                }
+                if (entry.getFirstTxn() > 1) {
+                    throw ReplicationException.gap("the object store holds the table from transaction " + entry.getFirstTxn()
+                            + " only; bootstrap this node from a checkpoint copy [table=" + entry.getTableName() + ']');
+                }
+                final NativeBuffer buf = worker.getBuffer();
+                final String key = StoreKeys.create(tableKey);
+                if (!worker.getIo().get(key, buf)) {
+                    throw ReplicationException.gap("table create manifest is missing from the object store [key=" + key + ']');
+                }
+                final TableCreateManifest manifest;
+                try {
+                    manifest = TableCreateManifest.decode(buf.ptr(), buf.size());
+                } catch (io.questdb.replication.codec.NativeReader.CorruptObjectException e) {
+                    throw ReplicationException.corrupt("corrupt table create manifest [key=" + key + ", error=" + e.getMessage() + ']');
+                }
+                if (manifest.getTableId() != entry.getTableId() || manifest.getCreateTimestamp() != entry.getCreateTimestamp()
+                        || !manifest.getDirName().equals(entry.getDirName())) {
+                    throw ReplicationException.corrupt("table create manifest does not match its table [key=" + key + ']');
+                }
+                token = worker.getTableApplier().createTable(manifest);
+            }
+        }
+        long local = api.lastTxn(token);
+        final long common = Math.min(local, entry.getLastTxn());
+        if (common > prefixCheckedTxn) {
+            // a node that wrote history of its own (a former primary) must never extend it with the store's
+            checkCommonPrefix(engine, entry, worker, local);
+            prefixCheckedTxn = common;
+        }
+        if (local < entry.getFirstTxn() - 1) {
+            throw ReplicationException.gap("the object store no longer holds the transactions after this node's last one [table="
+                    + entry.getTableName() + ", local=" + local + ", storeFirst=" + entry.getFirstTxn() + ']');
+        }
+        if (local >= entry.getLastTxn()) {
+            // ahead of the store, as a copy taken before the primary uploaded is: wait for the store
+            return 0;
+        }
+        final boolean isDurable = CommitMode.isPowerLossDurable(engine.getConfiguration().getCommitMode());
+        final MicrosecondClock clock = engine.getConfiguration().getMicrosecondClock();
+        final WalLocker walLocker = engine.getWalLocker();
+        long applied = 0;
+        long rows = 0;
+        while (local < entry.getLastTxn() && applied < maxTxnCount) {
+            final long txn = local + 1;
+            final long part = IndexTable.partOf(txn, entry.getPartTxnCount());
+            final TxnPart p = loadPart(entry, worker, part, entry.getAuthoritativeEpoch(part), txn);
+            final TxnRecord record = p.getRecord(txn);
+            if (record.isData()) {
+                // a WAL writer lock keeps the purge job off the segment until its transaction is sequenced
+                walLocker.lockWriter(token, record.getWalId(), record.getSegmentId());
+                try {
+                    applyDelta(engine, record, worker, isDurable, pins);
+                    token = worker.getTableApplier().apply(token, record);
+                } finally {
+                    walLocker.unlockWriter(token, record.getWalId());
+                }
+                rows += record.getRowCount();
+            } else {
+                token = worker.getTableApplier().apply(token, record);
+            }
+            local = txn;
+            applied++;
+            if (record.isDrop()) {
+                isDone = true;
+                break;
+            }
+        }
+        if (applied > 0 && !isDone) {
+            engine.getRecentWriteTracker().recordReplicaDownload(token, local, clock.getTicks(), rows, local < entry.getLastTxn());
+        }
+        return applied;
+    }
+
+    /**
+     * Forgets cached state after the table changed underneath (for example a failed apply).
+     */
+    public void reset() {
+        cachedPart = null;
+        cachedPartEpoch = -1;
+        segmentHighWater.clear();
+    }
+
+    /**
+     * Lets a stale table retry, after an operator fixed its cause.
+     */
+    public void retry() {
+        staleReason = null;
+        prefixCheckedTxn = 0;
+        reset();
+    }
+}

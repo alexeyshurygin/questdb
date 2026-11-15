@@ -877,7 +877,9 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                     "'cairo.writer.misc.append.page.size', 'line.tcp.io.worker.count', 'cairo.sql.copy.export.root', " +
                                     "'wal.apply.worker.count', 'export.worker.count', 'mat.view.refresh.worker.count', " +
                                     "'live.view.refresh.worker.count', 'view.compiler.worker.count', " +
-                                    "'http.export.connection.limit', 'cairo.mat.view.parallel.sql.enabled', 'cairo.timer.shards'" +
+                                    "'http.export.connection.limit', 'cairo.mat.view.parallel.sql.enabled', 'cairo.timer.shards', " +
+                                    // derived from the CPU count, like the worker counts above
+                                    "'replication.primary.compression.threads'" +
                                     ") order by 1",
                             actualSink
                     );
@@ -1623,7 +1625,41 @@ public class ServerMainTest extends AbstractBootstrapTest {
                                             "line.tcp.tls.private.key.path\tQDB_LINE_TCP_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
                                             "pg.tls.enabled\tQDB_PG_TLS_ENABLED\t\tdefault\tfalse\tfalse\n" +
                                             "pg.tls.cert.path\tQDB_PG_TLS_CERT_PATH\t\tdefault\tfalse\tfalse\n" +
-                                            "pg.tls.private.key.path\tQDB_PG_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse"
+                                            "pg.tls.private.key.path\tQDB_PG_TLS_PRIVATE_KEY_PATH\t\tdefault\tfalse\tfalse\n" +
+                                            "replication.role\tQDB_REPLICATION_ROLE\tnone\tdefault\tfalse\tfalse\n" +
+                                            "replication.object.store\tQDB_REPLICATION_OBJECT_STORE\t****\tdefault\ttrue\tfalse\n" +
+                                            "replication.requests.max.concurrent\tQDB_REPLICATION_REQUESTS_MAX_CONCURRENT\t128\tdefault\tfalse\tfalse\n" +
+                                            "replication.requests.retry.attempts\tQDB_REPLICATION_REQUESTS_RETRY_ATTEMPTS\t3\tdefault\tfalse\tfalse\n" +
+                                            "replication.requests.retry.interval\tQDB_REPLICATION_REQUESTS_RETRY_INTERVAL\t200\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.throttle.window.duration\tQDB_REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION\t10000\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.throttle.non.data\tQDB_REPLICATION_PRIMARY_THROTTLE_NON_DATA\tfalse\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.sequencer.part.txn.count\tQDB_REPLICATION_PRIMARY_SEQUENCER_PART_TXN_COUNT\t5000\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.compression.level\tQDB_REPLICATION_PRIMARY_COMPRESSION_LEVEL\t1\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.checksum\tQDB_REPLICATION_PRIMARY_CHECKSUM\tservice-dependent\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.keepalive.interval\tQDB_REPLICATION_PRIMARY_KEEPALIVE_INTERVAL\t10000\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.index.upload.throttle.interval\tQDB_REPLICATION_PRIMARY_INDEX_UPLOAD_THROTTLE_INTERVAL\t\tdefault\tfalse\tfalse\n" +
+                                            "replication.replica.poll.interval\tQDB_REPLICATION_REPLICA_POLL_INTERVAL\t1000\tdefault\tfalse\tfalse\n" +
+                                            "replication.requests.buffer.size\tQDB_REPLICATION_REQUESTS_BUFFER_SIZE\t32768\tdefault\tfalse\tfalse\n" +
+                                            "replication.summary.interval\tQDB_REPLICATION_SUMMARY_INTERVAL\t60000\tdefault\tfalse\tfalse\n" +
+                                            "replication.metrics.per.table\tQDB_REPLICATION_METRICS_PER_TABLE\ttrue\tdefault\tfalse\tfalse\n" +
+                                            "replication.metrics.dropped.table.poll.count\tQDB_REPLICATION_METRICS_DROPPED_TABLE_POLL_COUNT\t10\tdefault\tfalse\tfalse\n" +
+                                            "replication.requests.max.batch.size.fast\tQDB_REPLICATION_REQUESTS_MAX_BATCH_SIZE_FAST\t64\tdefault\tfalse\tfalse\n" +
+                                            "replication.requests.max.batch.size.slow\tQDB_REPLICATION_REQUESTS_MAX_BATCH_SIZE_SLOW\t2\tdefault\tfalse\tfalse\n" +
+                                            "replication.requests.base.timeout\tQDB_REPLICATION_REQUESTS_BASE_TIMEOUT\t10000\tdefault\tfalse\tfalse\n" +
+                                            "replication.requests.min.throughput\tQDB_REPLICATION_REQUESTS_MIN_THROUGHPUT\t262144\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.enabled\tQDB_REPLICATION_PRIMARY_CLEANER_ENABLED\ttrue\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.interval\tQDB_REPLICATION_PRIMARY_CLEANER_INTERVAL\t600000\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.checkpoint.source\tQDB_REPLICATION_PRIMARY_CLEANER_CHECKPOINT_SOURCE\ttrue\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.backup.window.count\tQDB_REPLICATION_PRIMARY_CLEANER_BACKUP_WINDOW_COUNT\t5\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.delete.concurrency\tQDB_REPLICATION_PRIMARY_CLEANER_DELETE_CONCURRENCY\t4\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.max.requests.per.second\tQDB_REPLICATION_PRIMARY_CLEANER_MAX_REQUESTS_PER_SECOND\t\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.progress.write.interval\tQDB_REPLICATION_PRIMARY_CLEANER_PROGRESS_WRITE_INTERVAL\t5000\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.dropped.table.cooloff\tQDB_REPLICATION_PRIMARY_CLEANER_DROPPED_TABLE_COOLOFF\t3600000\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.retry.attempts\tQDB_REPLICATION_PRIMARY_CLEANER_RETRY_ATTEMPTS\t20\tdefault\tfalse\tfalse\n" +
+                                            "replication.primary.cleaner.retry.interval\tQDB_REPLICATION_PRIMARY_CLEANER_RETRY_INTERVAL\t2000\tdefault\tfalse\tfalse\n" +
+                                            "checkpoint.history.enabled\tQDB_CHECKPOINT_HISTORY_ENABLED\ttrue\tdefault\tfalse\tfalse\n" +
+                                            "checkpoint.history.keep.count\tQDB_CHECKPOINT_HISTORY_KEEP_COUNT\t100\tdefault\tfalse\tfalse\n" +
+                                            "checkpoint.history.long.retry.interval\tQDB_CHECKPOINT_HISTORY_LONG_RETRY_INTERVAL\t60000\tdefault\tfalse\tfalse"
                             )
                             .split("\n");
 

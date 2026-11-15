@@ -29,11 +29,16 @@ open module io.questdb {
     requires jdk.management;
     requires java.desktop;
     requires java.sql;
+    requires java.net.http;
 
     uses io.questdb.griffin.FunctionFactory;
     exports io.questdb;
     exports io.questdb.lifecycle;
     exports io.questdb.tls;
+    exports io.questdb.replication;
+    exports io.questdb.replication.codec;
+    exports io.questdb.replication.store;
+    exports io.questdb.replication.store.s3;
     exports io.questdb.cairo;
     exports io.questdb.cairo.vm;
     exports io.questdb.cairo.map;

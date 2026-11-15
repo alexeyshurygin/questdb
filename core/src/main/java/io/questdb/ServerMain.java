@@ -104,6 +104,7 @@ public class ServerMain implements Closeable {
     // thread observes the non-null guard and suppresses the redundant re-run.
     private volatile Thread hydrateMetadataThread;
     private volatile LifecycleOrchestrator orchestrator;
+    private io.questdb.replication.ReplicationService replicationService;
     private Thread shutdownHookThread;
 
     public ServerMain(String... args) {
@@ -122,6 +123,17 @@ public class ServerMain implements Closeable {
         engine = freeOnExit(bootstrap.newCairoEngine());
         engine.setDurabilityFailureHandler(this::onFatalDurabilityFailure);
         try {
+            if (engine instanceof io.questdb.replication.ReplicatedCairoEngine replicatedEngine) {
+                // before the engine envelope runs completeInit(): no sequencer may open without the WAL policy
+                final io.questdb.replication.ReplicationConfiguration replicationConfig = replicatedEngine.getReplicationConfiguration();
+                final io.questdb.replication.store.ObjectStore store = io.questdb.replication.store.ObjectStoreFactory.create(
+                        io.questdb.replication.store.ObjectStoreSettings.parse(replicationConfig.getObjectStore()),
+                        replicationConfig,
+                        bootstrap.getEnv()
+                );
+                replicationService = freeOnExit(new io.questdb.replication.ReplicationService(replicatedEngine, store));
+                replicationService.installHooks();
+            }
             final ServerConfiguration config = bootstrap.getConfiguration();
             config.init(engine, freeOnExit);
             freeOnExit(config.getFactoryProvider());
@@ -1046,6 +1058,9 @@ public class ServerMain implements Closeable {
         components.add(new IlpTcpEnvelope(bootstrap.getLog()));
         components.add(new WebHttpEnvelope(bootstrap.getLog()));
         components.add(new QwipEnvelope(bootstrap.getLog()));
+        if (replicationService != null) {
+            components.add(new ReplicationEnvelope());
+        }
         return components;
     }
 
@@ -1061,6 +1076,13 @@ public class ServerMain implements Closeable {
         for (int i = 0, n = components.size(); i < n; i++) {
             orch.register(components.getQuick(i));
         }
+    }
+
+    /**
+     * The replication service, null unless {@code replication.role} is set.
+     */
+    public io.questdb.replication.ReplicationService getReplicationService() {
+        return replicationService;
     }
 
     protected Services services() {
@@ -1228,6 +1250,47 @@ public class ServerMain implements Closeable {
      * This envelope performs a no-op state transition (INIT -> STARTING -> READY)
      * and has no hard deps.
      */
+    /**
+     * Starts replication once the engine is loaded: a replica begins following the object store, a
+     * primary catches up and takes the ownership lease before its engine accepts writes. Stopping it
+     * drains a primary's uploads and releases the lease.
+     */
+    private final class ReplicationEnvelope implements Component {
+        private final ObjList<String> empty = new ObjList<>();
+        private final ObjList<String> hardDeps = new ObjList<>();
+
+        ReplicationEnvelope() {
+            hardDeps.add("engine");
+        }
+
+        @Override
+        public ObjList<String> hardRequiredDependencies() {
+            return hardDeps;
+        }
+
+        @Override
+        public String name() {
+            return "replication";
+        }
+
+        @Override
+        public ObjList<String> softDependencies() {
+            return empty;
+        }
+
+        @Override
+        public void start(LifecycleContext ctx) {
+            ctx.publish(State.STARTING);
+            replicationService.start();
+            ctx.publish(State.READY);
+        }
+
+        @Override
+        public void stop() {
+            replicationService.close();
+        }
+    }
+
     private static final class FactoryProviderEnvelope implements Component {
         private final ObjList<String> empty = new ObjList<>();
 

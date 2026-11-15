@@ -45,6 +45,7 @@ import io.questdb.log.LogRecord;
 import io.questdb.metrics.MetricsConfiguration;
 import io.questdb.mp.WorkerPoolConfiguration;
 import io.questdb.mp.WorkerPoolConfigurationWrapper;
+import io.questdb.replication.ReplicationConfiguration;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.FilesFacadeImpl;
 import io.questdb.std.ObjHashSet;
@@ -421,6 +422,12 @@ public class DynamicPropServerConfiguration implements ServerConfiguration, Conf
     public PublicPassthroughConfiguration getPublicPassthroughConfiguration() {
         // nested object is kept non-reloadable
         return serverConfig.get().getPublicPassthroughConfiguration();
+    }
+
+    @Override
+    public ReplicationConfiguration getReplicationConfiguration() {
+        // nested object is kept non-reloadable: a role or store change needs a restart
+        return serverConfig.get().getReplicationConfiguration();
     }
 
     @Override

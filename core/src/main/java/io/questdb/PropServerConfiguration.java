@@ -85,6 +85,11 @@ import io.questdb.network.NetworkFacade;
 import io.questdb.network.NetworkFacadeImpl;
 import io.questdb.network.SelectFacade;
 import io.questdb.network.SelectFacadeImpl;
+import io.questdb.replication.ChecksumMode;
+import io.questdb.replication.ReplicationConfiguration;
+import io.questdb.replication.ReplicationConfigurationImpl;
+import io.questdb.replication.ReplicationRole;
+import io.questdb.replication.store.ObjectStoreSettings;
 import io.questdb.std.Chars;
 import io.questdb.std.ConcurrentCacheConfiguration;
 import io.questdb.std.Files;
@@ -433,6 +438,7 @@ public class PropServerConfiguration implements ServerConfiguration {
     private final MemoryConfiguration memoryConfiguration;
     private final int metadataStringPoolCapacity;
     private final MetricsConfiguration metricsConfiguration = new PropMetricsConfiguration();
+    private final ReplicationConfigurationImpl replicationConfiguration = new ReplicationConfigurationImpl();
     private final boolean metricsEnabled;
     private final String metricsPersistExclude;
     private final boolean metricsPersistEnabled;
@@ -1095,6 +1101,8 @@ public class PropServerConfiguration implements ServerConfiguration {
                 memoryUsageLogInterval
         );
         this.isReadOnlyInstance = getBoolean(properties, env, PropertyKey.READ_ONLY_INSTANCE, false);
+        // Parsed early: the primary role changes the defaults of cairo.wal.segment.rollover.size and cairo.commit.mode.
+        parseReplicationConfiguration(properties, env);
         this.isQueryTracingEnabled = getBoolean(properties, env, PropertyKey.QUERY_TRACING_ENABLED, false);
         this.cairoMetadataCacheSnapshotOrdered = getBoolean(properties, env, PropertyKey.CAIRO_METADATA_CACHE_SNAPSHOT_ORDERED, true);
         this.cairoTableRegistryAutoReloadFrequency = getMillis(properties, env, PropertyKey.CAIRO_TABLE_REGISTRY_AUTO_RELOAD_FREQUENCY, 500);
@@ -1117,7 +1125,14 @@ public class PropServerConfiguration implements ServerConfiguration {
         this.walSupported = getBoolean(properties, env, PropertyKey.CAIRO_WAL_SUPPORTED, true);
         walApplyEnabled = getBoolean(properties, env, PropertyKey.CAIRO_WAL_APPLY_ENABLED, true);
         this.walSegmentRolloverRowCount = getLong(properties, env, PropertyKey.CAIRO_WAL_SEGMENT_ROLLOVER_ROW_COUNT, 200_000);
-        this.walSegmentRolloverSize = getLongSize(properties, env, PropertyKey.CAIRO_WAL_SEGMENT_ROLLOVER_SIZE, 50 * Numbers.SIZE_1MB);
+        // As in QuestDB Enterprise, a primary rolls WAL segments at 2 MiB unless the setting is explicit: a closed
+        // segment uploads in full and an open one keeps its upload pending, so small segments bound the work per upload.
+        this.walSegmentRolloverSize = getLongSize(
+                properties,
+                env,
+                PropertyKey.CAIRO_WAL_SEGMENT_ROLLOVER_SIZE,
+                replicationConfiguration.getRole() == ReplicationRole.PRIMARY ? 2 * Numbers.SIZE_1MB : 50 * Numbers.SIZE_1MB
+        );
         if ((this.walSegmentRolloverSize != 0) && (this.walSegmentRolloverSize < 1024)) {  // 1KiB segments minimum
             throw CairoException.critical(0).put("cairo.wal.segment.rollover.size must be 0 (disabled) or >= 1024 (1KiB)");
         }
@@ -1798,8 +1813,15 @@ public class PropServerConfiguration implements ServerConfiguration {
             this.exportWorkerSleepTimeout = getMillis(properties, env, PropertyKey.EXPORT_WORKER_SLEEP_TIMEOUT, 10);
             this.exportWorkerYieldThreshold = getLong(properties, env, PropertyKey.EXPORT_WORKER_YIELD_THRESHOLD, 1000);
 
-            // Enterprise overrides this default when replication is configured, but an explicit cairo.commit.mode wins over both.
-            this.commitMode = getCommitMode(properties, env, PropertyKey.CAIRO_COMMIT_MODE, CommitMode.toString(CommitMode.DEFAULT));
+            // Replication changes this default, as in QuestDB Enterprise, but an explicit cairo.commit.mode wins over both.
+            // A replicated node defaults to adaptive: its WAL is durable before the commit returns, and the save points let
+            // a former primary rewind to the object store's history instead of copying the table again.
+            this.commitMode = getCommitMode(
+                    properties,
+                    env,
+                    PropertyKey.CAIRO_COMMIT_MODE,
+                    CommitMode.toString(replicationConfiguration.getRole().isEnabled() ? CommitMode.ADAPTIVE : CommitMode.DEFAULT)
+            );
             this.adaptiveEpochIntervalMs = getMillis(properties, env, PropertyKey.CAIRO_ADAPTIVE_EPOCH_INTERVAL, 60000);
             this.adaptiveEpochMaxRows = getLong(properties, env, PropertyKey.CAIRO_ADAPTIVE_EPOCH_MAX_ROWS, 5_000_000);
             // 0 fdatasyncs every commit before it returns. A negative value clamps to 0, so a
@@ -2885,6 +2907,11 @@ public class PropServerConfiguration implements ServerConfiguration {
     }
 
     @Override
+    public ReplicationConfiguration getReplicationConfiguration() {
+        return replicationConfiguration;
+    }
+
+    @Override
     public QwpUdpReceiverConfiguration getQwpUdpReceiverConfiguration() {
         return qwpUdpReceiverConfiguration;
     }
@@ -3291,6 +3318,134 @@ public class PropServerConfiguration implements ServerConfiguration {
         }
         sink.put(']');
         return sink.toString();
+    }
+
+    private void parseReplicationConfiguration(
+            Properties properties,
+            @Nullable Map<String, String> env
+    ) throws ServerConfigurationException {
+        final ReplicationConfigurationImpl c = replicationConfiguration;
+        final String roleText = getString(properties, env, PropertyKey.REPLICATION_ROLE, ReplicationRole.NONE.getConfigName());
+        final ReplicationRole role = ReplicationRole.fromConfig(roleText);
+        if (role == null) {
+            throw new ServerConfigurationException("invalid configuration value [key=" + PropertyKey.REPLICATION_ROLE.getPropertyPath()
+                    + ", value=" + roleText + "], expected one of: none, primary, replica");
+        }
+        c.setRole(role);
+        final String store = getString(properties, env, PropertyKey.REPLICATION_OBJECT_STORE, null);
+        c.setObjectStore(store == null || store.isEmpty() ? null : store);
+        if (role.isEnabled()) {
+            if (isReadOnlyInstance) {
+                throw new ServerConfigurationException(PropertyKey.REPLICATION_ROLE.getPropertyPath() + '=' + role.getConfigName()
+                        + " cannot be combined with " + PropertyKey.READ_ONLY_INSTANCE.getPropertyPath()
+                        + "=true; a replica refuses writes by itself");
+            }
+            if (c.getObjectStore() == null) {
+                throw new ServerConfigurationException(PropertyKey.REPLICATION_OBJECT_STORE.getPropertyPath()
+                        + " must be set when " + PropertyKey.REPLICATION_ROLE.getPropertyPath() + '=' + role.getConfigName());
+            }
+            try {
+                ObjectStoreSettings.parse(c.getObjectStore());
+            } catch (IllegalArgumentException e) {
+                // the message names the offending part, never a value: the string may carry secrets
+                throw new ServerConfigurationException("invalid " + PropertyKey.REPLICATION_OBJECT_STORE.getPropertyPath() + ": " + e.getMessage());
+            }
+        }
+        c.setMaxConcurrentRequests(intInRange(properties, env, PropertyKey.REPLICATION_REQUESTS_MAX_CONCURRENT, c.getMaxConcurrentRequests(), 1, 4096));
+        c.setRetryAttempts(intInRange(properties, env, PropertyKey.REPLICATION_REQUESTS_RETRY_ATTEMPTS, c.getRetryAttempts(), 0, 1000));
+        c.setRetryInterval(millisInRange(properties, env, PropertyKey.REPLICATION_REQUESTS_RETRY_INTERVAL, c.getRetryInterval(), 0, Micros.HOUR_MICROS / 1000));
+        c.setThrottleWindowDuration(millisInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION, c.getThrottleWindowDuration(), 0, Micros.HOUR_MICROS / 1000));
+        c.setThrottleNonData(getBoolean(properties, env, PropertyKey.REPLICATION_PRIMARY_THROTTLE_NON_DATA, c.isThrottleNonData()));
+        c.setSequencerPartTxnCount(intInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_SEQUENCER_PART_TXN_COUNT, c.getSequencerPartTxnCount(), 1, 10_000_000));
+        c.setCompressionThreads(intInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_COMPRESSION_THREADS, c.getCompressionThreads(), 1, 1024));
+        c.setCompressionLevel(intInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_COMPRESSION_LEVEL, c.getCompressionLevel(), -7, 22));
+        final String checksumText = getString(properties, env, PropertyKey.REPLICATION_PRIMARY_CHECKSUM, c.getChecksumMode().getConfigName());
+        final ChecksumMode checksumMode = ChecksumMode.fromConfig(checksumText);
+        if (checksumMode == null) {
+            throw new ServerConfigurationException("invalid configuration value [key=" + PropertyKey.REPLICATION_PRIMARY_CHECKSUM.getPropertyPath()
+                    + ", value=" + checksumText + "], expected one of: service-dependent, never, always");
+        }
+        c.setChecksumMode(checksumMode);
+        c.setKeepaliveInterval(millisInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_KEEPALIVE_INTERVAL, c.getKeepaliveInterval(), 100, Micros.HOUR_MICROS / 1000));
+        final String indexThrottle = getString(properties, env, PropertyKey.REPLICATION_PRIMARY_INDEX_UPLOAD_THROTTLE_INTERVAL, "");
+        if (indexThrottle != null && !indexThrottle.isEmpty()) {
+            c.setIndexUploadThrottleInterval(millisInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_INDEX_UPLOAD_THROTTLE_INTERVAL, -1, 0, Micros.HOUR_MICROS / 1000));
+        }
+        c.setReplicaPollInterval(millisInRange(properties, env, PropertyKey.REPLICATION_REPLICA_POLL_INTERVAL, c.getReplicaPollInterval(), 10, Micros.HOUR_MICROS / 1000));
+        c.setRequestBufferSize(intInRange(properties, env, PropertyKey.REPLICATION_REQUESTS_BUFFER_SIZE, c.getRequestBufferSize(), 1024, 64 * 1024 * 1024));
+        c.setSummaryInterval(millisInRange(properties, env, PropertyKey.REPLICATION_SUMMARY_INTERVAL, c.getSummaryInterval(), 0, 24 * Micros.HOUR_MICROS / 1000));
+        c.setMetricsPerTable(getBoolean(properties, env, PropertyKey.REPLICATION_METRICS_PER_TABLE, c.isMetricsPerTable()));
+        c.setMetricsDroppedTablePollCount(intInRange(properties, env, PropertyKey.REPLICATION_METRICS_DROPPED_TABLE_POLL_COUNT, c.getMetricsDroppedTablePollCount(), 0, 1_000_000));
+        c.setMaxBatchSizeFast(intInRange(properties, env, PropertyKey.REPLICATION_REQUESTS_MAX_BATCH_SIZE_FAST, c.getMaxBatchSizeFast(), 1, 4096));
+        c.setMaxBatchSizeSlow(intInRange(properties, env, PropertyKey.REPLICATION_REQUESTS_MAX_BATCH_SIZE_SLOW, c.getMaxBatchSizeSlow(), 1, 4096));
+        c.setRequestBaseTimeout(millisInRange(properties, env, PropertyKey.REPLICATION_REQUESTS_BASE_TIMEOUT, c.getRequestBaseTimeout(), 100, Micros.HOUR_MICROS / 1000));
+        c.setMinThroughput(longInRange(properties, env, PropertyKey.REPLICATION_REQUESTS_MIN_THROUGHPUT, c.getMinThroughput(), 1, Long.MAX_VALUE));
+        c.setCleanerEnabled(getBoolean(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_ENABLED, c.isCleanerEnabled()));
+        c.setCleanerInterval(millisInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_INTERVAL, c.getCleanerInterval(), 1_000, 24 * Micros.HOUR_MICROS / 1000));
+        c.setCleanerCheckpointSource(getBoolean(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_CHECKPOINT_SOURCE, c.isCleanerCheckpointSource()));
+        c.setCleanerBackupWindowCount(intInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_BACKUP_WINDOW_COUNT, c.getCleanerBackupWindowCount(), 1, 100_000));
+        // Derived from the request concurrency, as in Enterprise, unless set: one delete task per 32 allowed requests.
+        final int derivedDeleteConcurrency = Math.max(4, Math.min(32, c.getMaxConcurrentRequests() / 32));
+        c.setCleanerDeleteConcurrency(intInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_DELETE_CONCURRENCY, derivedDeleteConcurrency, 4, 32));
+        final String maxRps = getString(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_MAX_REQUESTS_PER_SECOND, "");
+        if (maxRps != null && !maxRps.isEmpty()) {
+            c.setCleanerMaxRequestsPerSecond(intInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_MAX_REQUESTS_PER_SECOND, -1, 0, 10_000));
+        }
+        c.setCleanerProgressWriteInterval(millisInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_PROGRESS_WRITE_INTERVAL, c.getCleanerProgressWriteInterval(), 100, 60_000));
+        c.setCleanerDroppedTableCooloff(millisInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_DROPPED_TABLE_COOLOFF, c.getCleanerDroppedTableCooloff(), 0, Long.MAX_VALUE / 1000));
+        c.setCleanerRetryAttempts(intInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_RETRY_ATTEMPTS, c.getCleanerRetryAttempts(), 0, 100));
+        c.setCleanerRetryInterval(millisInRange(properties, env, PropertyKey.REPLICATION_PRIMARY_CLEANER_RETRY_INTERVAL, c.getCleanerRetryInterval(), 0, 300_000));
+        c.setCheckpointHistoryEnabled(getBoolean(properties, env, PropertyKey.CHECKPOINT_HISTORY_ENABLED, c.isCheckpointHistoryEnabled()));
+        c.setCheckpointHistoryKeepCount(intInRange(properties, env, PropertyKey.CHECKPOINT_HISTORY_KEEP_COUNT, c.getCheckpointHistoryKeepCount(), 1, 1_000_000));
+        c.setCheckpointHistoryLongRetryInterval(millisInRange(properties, env, PropertyKey.CHECKPOINT_HISTORY_LONG_RETRY_INTERVAL, c.getCheckpointHistoryLongRetryInterval(), 100, 24 * Micros.HOUR_MICROS / 1000));
+    }
+
+    private int intInRange(
+            Properties properties,
+            @Nullable Map<String, String> env,
+            ConfigPropertyKey key,
+            int defaultValue,
+            int min,
+            int max
+    ) throws ServerConfigurationException {
+        final int value = getInt(properties, env, key, defaultValue);
+        if (value < min || value > max) {
+            throw new ServerConfigurationException("configuration value out of range [key=" + key.getPropertyPath()
+                    + ", value=" + value + ", min=" + min + ", max=" + max + ']');
+        }
+        return value;
+    }
+
+    private long longInRange(
+            Properties properties,
+            @Nullable Map<String, String> env,
+            ConfigPropertyKey key,
+            long defaultValue,
+            long min,
+            long max
+    ) throws ServerConfigurationException {
+        final long value = getLong(properties, env, key, defaultValue);
+        if (value < min || value > max) {
+            throw new ServerConfigurationException("configuration value out of range [key=" + key.getPropertyPath()
+                    + ", value=" + value + ", min=" + min + ", max=" + max + ']');
+        }
+        return value;
+    }
+
+    private long millisInRange(
+            Properties properties,
+            @Nullable Map<String, String> env,
+            ConfigPropertyKey key,
+            long defaultValue,
+            long min,
+            long max
+    ) throws ServerConfigurationException {
+        final long value = getMillis(properties, env, key, defaultValue);
+        if (value < min || value > max) {
+            throw new ServerConfigurationException("configuration value out of range [key=" + key.getPropertyPath()
+                    + ", value=" + value + "ms, min=" + min + "ms, max=" + max + "ms]");
+        }
+        return value;
     }
 
     private boolean isPropertyExplicitlySet(Properties properties, @Nullable Map<String, String> env, ConfigPropertyKey key) {
