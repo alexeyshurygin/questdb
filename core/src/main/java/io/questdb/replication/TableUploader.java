@@ -70,6 +70,8 @@ public class TableUploader {
     private boolean isCreateCommitted;
     private boolean isCreateUploaded;
     private boolean isDropCommitted;
+    // records were added to the current part since it was last uploaded
+    private boolean isPartDirty;
     private int localPartSize;
     private TxnPart part;
     private long pendingTxn;
@@ -181,6 +183,7 @@ public class TableUploader {
         pendingTxn = committedTxn;
         if (part != null) {
             part.truncateAfter(committedTxn);
+            isPartDirty = true;
         }
     }
 
@@ -286,10 +289,14 @@ public class TableUploader {
         for (int i = 0, n = batch.size(); i < n; i++) {
             final TxnRecord rec = batch.getQuick(i);
             if (part.isFull()) {
-                uploadPart(worker, buf, epoch);
+                // a part filled by an earlier batch is in the store already, and the cleaner may have removed it
+                if (isPartDirty) {
+                    uploadPart(worker, buf, epoch);
+                }
                 part = new TxnPart().of(entry.getTableId(), entry.getCreateTimestamp(), part.getPart() + 1, entry.getPartTxnCount());
             }
             part.add(rec);
+            isPartDirty = true;
             if (rec.isStructural() && rec.getPayload() != null
                     && ReplicaTableApplier.readCommand(rec.getPayload()) == io.questdb.griffin.engine.ops.AlterOperation.RENAME_TABLE) {
                 entry.setTableName(ReplicaTableApplier.readRenameTarget(rec.getPayload()));
@@ -430,6 +437,7 @@ public class TableUploader {
     private void uploadPart(ReplicationWorker worker, NativeBuffer buf, long epoch) {
         part.encode(buf);
         worker.getIo().put(StoreKeys.seqPart(tableKey, part.getPart(), epoch), buf, false);
+        isPartDirty = false;
     }
 
     private static byte @Nullable [] readFile(FilesFacade ff, Path path) {

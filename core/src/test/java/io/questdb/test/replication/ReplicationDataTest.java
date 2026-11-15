@@ -206,6 +206,43 @@ public class ReplicationDataTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testV2SequencerWithPurgeAndSkippedViews() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            final String r = nodeRoot("r");
+            final String[] v2 = {
+                    PropertyKey.CAIRO_DEFAULT_SEQ_PART_TXN_COUNT.getPropertyPath() + "=3",
+                    PropertyKey.CAIRO_WAL_PURGE_INTERVAL.getPropertyPath() + "=100",
+                    PropertyKey.CAIRO_WAL_SEGMENT_ROLLOVER_ROW_COUNT.getPropertyPath() + "=4"
+            };
+            writeConfiguration(p, "primary", v2);
+            writeConfiguration(r, "replica", v2);
+            try (TestServerMain primary = start(p); TestServerMain replica = start(r)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("CREATE VIEW v AS (SELECT * FROM t)");
+                primary.execute("CREATE MATERIALIZED VIEW mv AS (SELECT ts, count() c FROM t SAMPLE BY 1d) PARTITION BY DAY");
+                for (int i = 0; i < 20; i++) {
+                    primary.execute("INSERT INTO t (ts, v) SELECT timestamp_sequence('2024-01-" + (10 + i) + "', 1_000_000), x FROM long_sequence(3)");
+                    if (i == 10) {
+                        primary.execute("ALTER TABLE t ADD COLUMN c" + i + " INT");
+                    }
+                }
+                awaitSame(primary, replica, "t");
+                // views and materialized views are not replicated in this version
+                Assert.assertNull(replica.getEngine().getTableTokenIfExists("v"));
+                Assert.assertNull(replica.getEngine().getTableTokenIfExists("mv"));
+            }
+            // a restart lists the views among the existing tables and skips them again
+            try (TestServerMain primary = start(p); TestServerMain replica = start(r)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("INSERT INTO t (ts, v) VALUES ('2024-03-01', 99)");
+                awaitSame(primary, replica, "t");
+            }
+        });
+    }
+
+    @Test
     public void testUploadMarkersComeOff() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String p = nodeRoot("p");
