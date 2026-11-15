@@ -50,6 +50,14 @@ public class ReplicationException extends RuntimeException {
         return new ReplicationException(Kind.GAP, message);
     }
 
+    /**
+     * An object the index names is not in the store: the cleaner may have removed it after this node
+     * read the index, so a fresh index can tell whether it is really gone.
+     */
+    public static ReplicationException missing(String message) {
+        return new ReplicationException(Kind.MISSING, message);
+    }
+
     public static ReplicationException unsupported(String message) {
         return new ReplicationException(Kind.UNSUPPORTED, message);
     }
@@ -71,6 +79,10 @@ public class ReplicationException extends RuntimeException {
          * The object store no longer holds transactions this node needs.
          */
         GAP,
+        /**
+         * An object the index names is missing; retried with a fresh index before it counts as a gap.
+         */
+        MISSING,
         /**
          * The table uses something replication does not handle.
          */

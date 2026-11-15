@@ -54,6 +54,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -76,12 +77,16 @@ import java.util.concurrent.locks.ReentrantLock;
  * sequencer opens without the replication WAL policy; {@link #start()} once the engine is loaded;
  * {@link #close()} at shutdown, which drains a primary's pending uploads and releases its lease.
  */
-public class ReplicationService implements QuietCloseable, ReplicationWalListener.Sink, ReplicationWalDirectoryPolicy.Pins {
+public class ReplicationService implements QuietCloseable, ReplicationWalListener.Sink, ReplicationWalDirectoryPolicy.Pins,
+        io.questdb.cairo.CheckpointListener {
     private static final long CATCHUP_BATCH = 10_000;
     private static final String INSTANCE_FILE = "instance";
     private static final Log LOG = LogFactory.getLog(ReplicationService.class);
     private static final long UPLOAD_BATCH = 10_000;
     private final ConcurrentLinkedQueue<ReplicationWorker> allWorkers = new ConcurrentLinkedQueue<>();
+    private final WalCleaner cleaner;
+    private final io.questdb.cairo.CheckpointListener configuredCheckpointListener;
+    private final ConcurrentLinkedQueue<io.questdb.replication.codec.CheckpointHistory.Checkpoint> pendingCheckpoints = new ConcurrentLinkedQueue<>();
     private final ReplicationConfiguration config;
     private final ConcurrentHashMap<String, TableToken> createdTables = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> dirtyTables = new ConcurrentHashMap<>();
@@ -109,9 +114,12 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private volatile boolean isNonDataPending;
     private volatile boolean isRunning;
     private volatile boolean isStarted;
+    private io.questdb.replication.codec.CheckpointHistory checkpointHistory;
     private ReplicationIndex lastIndex;
     private long lastIndexWriteNanos;
     private Thread mainThread;
+    private long nextCheckpointUploadNanos;
+    private long nextCleanerRunNanos;
     private volatile long sequence;
     private volatile String status = "starting";
 
@@ -124,6 +132,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         this.workDir = Paths.get(cairoConfig.getInstallRoot(), ".replication").toString();
         this.isChecksum = ObjectIO.isChecksum(config.getChecksumMode(), store);
         this.indexClient = new IndexClient(store, isChecksum);
+        this.cleaner = new WalCleaner(config, store);
+        this.configuredCheckpointListener = cairoConfig.getCheckpointListener();
         this.pins = isPrimary ? null : new ReplicaSegmentPins(10 * 60_000L);
         this.policy = new ReplicationWalDirectoryPolicy(cairoConfig.getFilesFacade(), isPrimary ? this : null, pins);
         final int threads = Math.max(1, Math.min(config.getMaxConcurrentRequests(), config.getMaxBatchSizeFast()));
@@ -235,6 +245,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      */
     public void installHooks() {
         engine.setWalDirectoryPolicy(policy);
+        if (config.isCheckpointHistoryEnabled()) {
+            engine.setCheckpointListener(this);
+        }
         if (isPrimary) {
             engine.setWalListener(new ReplicationWalListener(this));
         }
@@ -249,6 +262,31 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // not tracked yet: keep it, unless the table is node-local or gone
         final TableToken token = engine.getTableTokenByDirName(tableDir);
         return token != null && ReplicationWalDirectoryPolicy.isReplicated(token);
+    }
+
+    @Override
+    public void onCheckpointReleased(long timestampMicros, io.questdb.std.CharSequenceLongHashMap tableDirNamesToSeqTxn) {
+        try {
+            configuredCheckpointListener.onCheckpointReleased(timestampMicros, tableDirNamesToSeqTxn);
+        } finally {
+            final io.questdb.replication.codec.CheckpointHistory.Checkpoint c = new io.questdb.replication.codec.CheckpointHistory.Checkpoint(timestampMicros);
+            final ObjList<CharSequence> keys = tableDirNamesToSeqTxn.keys();
+            for (int i = 0, n = keys.size(); i < n; i++) {
+                final CharSequence dir = keys.getQuick(i);
+                final long seqTxn = tableDirNamesToSeqTxn.get(dir);
+                if (seqTxn != io.questdb.std.Numbers.LONG_NULL && seqTxn >= 0) {
+                    c.addTable(dir.toString(), seqTxn);
+                }
+            }
+            pendingCheckpoints.add(c);
+            nextCheckpointUploadNanos = 0;
+            wake();
+        }
+    }
+
+    @Override
+    public void onCheckpointRestoreComplete() {
+        configuredCheckpointListener.onCheckpointRestoreComplete();
     }
 
     @Override
@@ -752,6 +790,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 }
                 continue;
             }
+            runHousekeeping(true);
             awaitWake(Math.max(1, Math.min(window, config.getKeepaliveInterval()) / 4));
         }
         // drain what is committed, then hand the lease over
@@ -844,9 +883,148 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 status = "stopped: " + e.getMessage();
                 return;
             }
+            runHousekeeping(false);
             if (applied == 0) {
                 awaitWake(config.getReplicaPollInterval());
             }
+        }
+    }
+
+    // checkpoint history uploads on every node, the WAL cleaner on the primary
+    private void runHousekeeping(boolean isPrimaryNode) {
+        final long now = System.nanoTime();
+        if (!pendingCheckpoints.isEmpty() && now >= nextCheckpointUploadNanos) {
+            try {
+                uploadCheckpointHistory();
+            } catch (Throwable th) {
+                LOG.error().$("could not record the checkpoint history, will retry [error=").$(th).I$();
+                nextCheckpointUploadNanos = now + TimeUnit.MILLISECONDS.toNanos(config.getCheckpointHistoryLongRetryInterval());
+            }
+        }
+        if (isPrimaryNode && config.isCleanerEnabled()) {
+            if (nextCleanerRunNanos == 0) {
+                nextCleanerRunNanos = now + TimeUnit.MILLISECONDS.toNanos(config.getCleanerInterval());
+            } else if (now >= nextCleanerRunNanos) {
+                try {
+                    runCleaner();
+                } catch (Throwable th) {
+                    LOG.error().$("WAL cleaner run failed, will retry [error=").$(th).I$();
+                }
+                nextCleanerRunNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.getCleanerInterval());
+            }
+        }
+    }
+
+    private void runCleaner() {
+        final ReplicationWorker w = worker.get();
+        final Map<String, Long> cutoffs = config.isCleanerCheckpointSource() ? cleaner.computeCutoffs(w) : null;
+        final List<String> keys = new ArrayList<>();
+        boolean isIndexChanged = false;
+        if (cutoffs != null) {
+            for (TableUploader u : uploaders.values()) {
+                synchronized (u) {
+                    if (u.isDropCommitted() || u.hasPending()) {
+                        continue;
+                    }
+                    final Long cutoff = cutoffs.get(u.getEntry().getDirName());
+                    if (cutoff == null || cutoff <= 0) {
+                        continue;
+                    }
+                    final WalCleaner.TablePlan plan = cleaner.planTable(u.getEntry(), cutoff, w);
+                    if (plan != null) {
+                        u.getEntry().setFirstTxn(plan.getNewFirstTxn());
+                        keys.addAll(plan.getKeys());
+                        isIndexChanged = true;
+                        LOG.info().$("WAL cleaner frees table history [table=").$(u.getToken()).$(", newFirstTxn=")
+                                .$(plan.getNewFirstTxn()).$(", objects=").$(plan.getKeys().size()).I$();
+                    }
+                }
+            }
+        }
+        final long nowMicros = engine.getConfiguration().getMicrosecondClock().getTicks();
+        final long cooloffMicros = config.getCleanerDroppedTableCooloff() * 1000;
+        for (Map.Entry<String, IndexTable> e : retainedEntries.entrySet()) {
+            final IndexTable t = e.getValue();
+            if (t.isDropped() && nowMicros - t.getDroppedAt() >= cooloffMicros) {
+                keys.addAll(cleaner.planDroppedTable(t));
+                retainedEntries.remove(e.getKey());
+                isIndexChanged = true;
+            }
+        }
+        for (Map.Entry<String, TableUploader> e : uploaders.entrySet()) {
+            final TableUploader u = e.getValue();
+            if (u.isDropCommitted() && nowMicros - u.getEntry().getDroppedAt() >= cooloffMicros) {
+                keys.addAll(cleaner.planDroppedTable(u.getEntry()));
+                uploaders.remove(e.getKey());
+                isIndexChanged = true;
+            }
+        }
+        // the index stops naming the objects before they go
+        if (isIndexChanged && !commitIndex(false)) {
+            return;
+        }
+        deleteObjects(keys);
+    }
+
+    private void deleteObjects(List<String> keys) {
+        if (keys.isEmpty()) {
+            return;
+        }
+        int rps = config.getCleanerMaxRequestsPerSecond();
+        if (rps < 0) {
+            rps = store.getDefaultCleanerMaxRequestsPerSecond();
+        }
+        final int concurrency = Math.max(1, config.getCleanerDeleteConcurrency());
+        final long startNanos = System.nanoTime();
+        int deleted = 0;
+        for (int i = 0, n = keys.size(); i < n && isRunning; i += concurrency) {
+            final List<Future<?>> futures = new ArrayList<>();
+            for (int j = i; j < Math.min(n, i + concurrency); j++) {
+                final String key = keys.get(j);
+                futures.add(executor.submit(() -> store.delete(key)));
+            }
+            for (Future<?> f : futures) {
+                try {
+                    f.get();
+                    deleted++;
+                } catch (Exception e) {
+                    LOG.error().$("could not delete an object, the next run retries [error=").$(e.getCause() != null ? e.getCause() : e).I$();
+                }
+            }
+            if (rps > 0) {
+                final long dueNanos = startNanos + TimeUnit.SECONDS.toNanos(Math.min(n, i + concurrency)) / rps;
+                final long sleepNanos = dueNanos - System.nanoTime();
+                if (sleepNanos > 0) {
+                    sleepQuietly(TimeUnit.NANOSECONDS.toMillis(sleepNanos) + 1);
+                }
+            }
+        }
+        LOG.info().$("WAL cleaner deleted objects [count=").$(deleted).$(", requested=").$(keys.size()).I$();
+    }
+
+    private void uploadCheckpointHistory() {
+        final ReplicationWorker w = worker.get();
+        final String key = StoreKeys.checkpointHistory(instanceId);
+        if (checkpointHistory == null) {
+            if (w.getIo().get(key, w.getBuffer())) {
+                final byte[] text = new byte[(int) w.getBuffer().size()];
+                io.questdb.std.Unsafe.copyMemory(null, w.getBuffer().ptr(), text, io.questdb.std.Unsafe.BYTE_OFFSET, text.length);
+                checkpointHistory = io.questdb.replication.codec.CheckpointHistory.decode(text, 0, text.length);
+            } else {
+                checkpointHistory = new io.questdb.replication.codec.CheckpointHistory();
+            }
+        }
+        final int queued = pendingCheckpoints.size();
+        for (int i = 0; i < queued; i++) {
+            checkpointHistory.add(pendingCheckpoints.peek());
+            checkpointHistory.keepLatest(config.getCheckpointHistoryKeepCount());
+            final byte[] text = checkpointHistory.encode();
+            w.getBuffer().clear();
+            w.getBuffer().putBytes(text, 0, text.length);
+            w.getIo().put(key, w.getBuffer(), false);
+            pendingCheckpoints.poll();
+            LOG.info().$("recorded a checkpoint in the replication history [instance=").$(instanceId)
+                    .$(", checkpoints=").$(checkpointHistory.getCheckpoints().size()).I$();
         }
     }
 

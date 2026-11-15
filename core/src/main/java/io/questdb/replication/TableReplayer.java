@@ -56,7 +56,9 @@ public class TableReplayer {
     private final String tableKey;
     private TxnPart cachedPart;
     private long cachedPartEpoch = -1;
+    private static final int MAX_MISSING_ROUNDS = 5;
     private boolean isDone;
+    private int missingRounds;
     private long prefixCheckedTxn;
     private String staleReason;
     private TableToken token;
@@ -112,8 +114,16 @@ public class TableReplayer {
             return 0;
         }
         try {
-            return replay0(engine, entry, worker, pins, maxTxnCount);
+            final long applied = replay0(engine, entry, worker, pins, maxTxnCount);
+            missingRounds = 0;
+            return applied;
         } catch (ReplicationException e) {
+            if (e.getKind() == ReplicationException.Kind.MISSING && ++missingRounds < MAX_MISSING_ROUNDS) {
+                LOG.info().$("object missing from the store, retrying with a fresh index [table=").$(entry.getTableName())
+                        .$(", error=").$safe(e.getMessage()).I$();
+                reset();
+                return 0;
+            }
             staleReason = e.getMessage();
             LOG.critical().$("table stopped replicating [table=").$(entry.getTableName()).$(", key=").$(tableKey)
                     .$(", kind=").$(e.getKind().name()).$(", error=").$safe(e.getMessage()).I$();
@@ -143,7 +153,7 @@ public class TableReplayer {
                 record.getDeltaFirstSegmentTxn(), record.getDeltaLastSegmentTxn(), record.getDeltaEpoch());
         final NativeBuffer buf = worker.getBuffer();
         if (!worker.getIo().get(key, buf)) {
-            throw ReplicationException.gap("WAL delta is missing from the object store [key=" + key + ']');
+            throw ReplicationException.missing("WAL delta is missing from the object store [key=" + key + ']');
         }
         final SegmentDelta delta = worker.getDelta().of(buf.ptr(), buf.size());
         if (delta.getWalId() != record.getWalId() || delta.getSegmentId() != record.getSegmentId()
@@ -198,7 +208,7 @@ public class TableReplayer {
         final String key = StoreKeys.seqPart(tableKey, part, epoch);
         final NativeBuffer buf = worker.getPartBuffer();
         if (!worker.getIo().get(key, buf)) {
-            throw ReplicationException.gap("transaction log part is missing from the object store [key=" + key + ']');
+            throw ReplicationException.missing("transaction log part is missing from the object store [key=" + key + ']');
         }
         final TxnPart p;
         try {
@@ -242,7 +252,7 @@ public class TableReplayer {
                 final NativeBuffer buf = worker.getBuffer();
                 final String key = StoreKeys.create(tableKey);
                 if (!worker.getIo().get(key, buf)) {
-                    throw ReplicationException.gap("table create manifest is missing from the object store [key=" + key + ']');
+                    throw ReplicationException.missing("table create manifest is missing from the object store [key=" + key + ']');
                 }
                 final TableCreateManifest manifest;
                 try {
