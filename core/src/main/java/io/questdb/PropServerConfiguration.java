@@ -1813,9 +1813,9 @@ public class PropServerConfiguration implements ServerConfiguration {
             this.exportWorkerSleepTimeout = getMillis(properties, env, PropertyKey.EXPORT_WORKER_SLEEP_TIMEOUT, 10);
             this.exportWorkerYieldThreshold = getLong(properties, env, PropertyKey.EXPORT_WORKER_YIELD_THRESHOLD, 1000);
 
-            // Replication changes this default, as in QuestDB Enterprise, but an explicit cairo.commit.mode wins over both.
-            // A replicated node defaults to adaptive: its WAL is durable before the commit returns, and the save points let
-            // a former primary rewind to the object store's history instead of copying the table again.
+            // A replicated node defaults to adaptive, the mode QuestDB Enterprise tells operators to set on every node
+            // that can become primary: a primary then uploads only what is durable locally, so a power loss cannot leave
+            // its log behind the object store. An explicit cairo.commit.mode wins.
             this.commitMode = getCommitMode(
                     properties,
                     env,

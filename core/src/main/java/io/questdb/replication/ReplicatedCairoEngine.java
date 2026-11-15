@@ -66,8 +66,8 @@ import java.util.concurrent.locks.Lock;
  * The storage engine of a replicated node. It carries the node's replication role and refuses client
  * writes whenever the node is not a writable primary: a replica, a primary still catching up with
  * the object store, and a primary that lost its ownership lease all answer {@link #isReadOnlyMode()}
- * with true, which every SQL, PGWire, HTTP, ILP and QWP write path consults. Writes made on behalf of
- * replication go through the unfenced {@code *Unsafe} acquire paths.
+ * with true, which every SQL, PGWire, HTTP, ILP and QWP write path consults. Replication itself writes
+ * through the table sequencer and the WAL apply job, which these client paths do not gate.
  * <p>
  * Constructed with partial initialization: {@code ServerMain}'s engine envelope runs
  * {@link #completeInit()} after the replication hooks are installed.
@@ -354,7 +354,8 @@ public class ReplicatedCairoEngine extends CairoEngine {
     }
 
     /**
-     * A replica runs no materialized view refresh: refresh output arrives as replicated WAL.
+     * A replica refreshes no materialized view. Materialized views do not replicate: one that the node
+     * created while it was a primary stays as it was until the node is a primary again.
      */
     @Override
     protected MatViewStateStore createMatViewStateStore() {

@@ -95,6 +95,64 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testCoordinatorSurvivesAnUnexpectedFailure() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            final String r = nodeRoot("r");
+            writeConfiguration(p, "primary");
+            writeConfiguration(r, "replica");
+            // not a store error: a failure nobody foresaw, thrown where only the coordinator runs
+            final AtomicInteger bugs = new AtomicInteger();
+            try (TestServerMain primary = startFaulty(p, new FaultyObjectStore.Hook() {
+                @Override
+                public void before(String op, String key) {
+                    if (op.equals("put") && key.equals(IndexClient.INDEX_KEY) && bugs.getAndDecrement() > 0) {
+                        throw new IllegalStateException("injected unexpected failure");
+                    }
+                }
+            }); TestServerMain replica = start(r)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(primary, "t");
+                bugs.set(2);
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                TestUtils.assertEventually(() -> Assert.assertTrue(bugs.get() < 0), 30);
+                // the coordinator is still there: the insert goes up, the lease is renewed, later writes replicate
+                awaitUploaded(primary, "t");
+                Assert.assertEquals(EngineRole.PRIMARY, role(primary));
+                TestUtils.assertContains(primary.getReplicationService().getStatus(), "primary, epoch");
+                primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                awaitSame(primary, replica, "t");
+                replica.assertSql("SELECT count() n FROM t", "n\n2\n");
+            }
+        });
+    }
+
+    @Test
+    public void testDeletedIndexFencesPrimary() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            writeConfiguration(p, "primary");
+            try (TestServerMain primary = start(p)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(primary, "t");
+                // somebody wipes the store under a running primary
+                java.nio.file.Files.delete(java.nio.file.Paths.get(storeRoot, "_index"));
+                awaitRole(primary, EngineRole.FENCED);
+                TestUtils.assertContains(((io.questdb.replication.ReplicatedCairoEngine) primary.getEngine()).getFenceReason(),
+                        "the replication index is gone from the object store");
+                try {
+                    primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                    Assert.fail("a fenced primary must refuse writes");
+                } catch (Throwable e) {
+                    TestUtils.assertContains(String.valueOf(e.getMessage()) + e.getCause(), io.questdb.cairo.CairoException.READ_ONLY_ACCESS_MESSAGE);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testFailedCheckpointHistoryUploadIsNotRecordedTwice() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String p = nodeRoot("p");
@@ -598,6 +656,31 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testViewsAndMaterializedViewsKeepNoUploadMarkers() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            // a long window: whatever carries a marker keeps it for the length of the test
+            writeConfiguration(p, "primary", PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000");
+            try (TestServerMain primary = start(p)) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE base (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(primary, "base");
+                primary.execute("CREATE MATERIALIZED VIEW mv AS SELECT ts, max(v) m FROM base SAMPLE BY 1d");
+                primary.execute("CREATE VIEW plain AS SELECT ts, v FROM base");
+                primary.execute("INSERT INTO base VALUES ('2024-01-01', 1), ('2024-01-02', 2)");
+                awaitApplied(primary, "base");
+                TestUtils.assertEventually(() -> primary.assertSql("SELECT count() n FROM mv", "n\n2\n"), 30);
+                final String dbRoot = primary.getEngine().getConfiguration().getDbRoot();
+                // the table's unsent segment is pinned; views are not uploaded, so nothing of theirs is,
+                // and the purge job stays free to remove their WAL
+                Assert.assertTrue(allMarkers(java.nio.file.Paths.get(dbRoot, primary.getEngine().verifyTableName("base").getDirName())) > 0);
+                Assert.assertEquals(0, allMarkers(java.nio.file.Paths.get(dbRoot, primary.getEngine().verifyTableName("mv").getDirName())));
+                Assert.assertEquals(0, allMarkers(java.nio.file.Paths.get(dbRoot, primary.getEngine().verifyTableName("plain").getDirName())));
+            }
+        });
+    }
+
+    @Test
     public void testWorkerContextsAreReusedAndFreed() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String p = nodeRoot("p");
@@ -647,6 +730,13 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
             final byte[] text = new byte[(int) raw.size()];
             io.questdb.std.Unsafe.copyMemory(null, raw.ptr(), text, io.questdb.std.Unsafe.BYTE_OFFSET, text.length);
             return io.questdb.replication.codec.CheckpointHistory.decode(text, 0, text.length);
+        }
+    }
+
+    // the number of upload.pending markers anywhere under a table's directory
+    private static long allMarkers(java.nio.file.Path tableDir) throws Exception {
+        try (java.util.stream.Stream<java.nio.file.Path> files = java.nio.file.Files.walk(tableDir)) {
+            return files.filter(f -> f.getFileName().toString().equals(io.questdb.replication.ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER)).count();
         }
     }
 

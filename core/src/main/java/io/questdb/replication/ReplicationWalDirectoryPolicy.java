@@ -81,7 +81,9 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
     }
 
     public static boolean isReplicated(@NotNull TableToken token) {
-        return token.isWal() && !token.isLiveView() && !token.isSystem();
+        // views and materialized views are not uploaded: marking their WAL as pending would keep the
+        // purge job off it for good
+        return token.isWal() && !token.isLiveView() && !token.isSystem() && !token.isView() && !token.isMatView();
     }
 
     @Override

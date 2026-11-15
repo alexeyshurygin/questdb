@@ -538,7 +538,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         try {
             indexClient.write(idx, config.getCompressionLevel());
         } catch (ObjectStoreException e) {
-            final boolean isConflict = e.getKind() == ObjectStoreException.Kind.PRECONDITION_FAILED;
+            // S3 answers a conditional replace of an object that is gone with "not found"
+            final boolean isConflict = e.getKind() == ObjectStoreException.Kind.PRECONDITION_FAILED
+                    || e.getKind() == ObjectStoreException.Kind.NOT_FOUND;
             if (!isConflict && !e.isRetryable()) {
                 throw e;
             }
@@ -557,7 +559,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             } catch (RuntimeException readError) {
                 // somebody replaced the index with something this node cannot read
                 LOG.critical().$("the replication index is unreadable [error=").$safe(String.valueOf(readError.getMessage())).I$();
-                onLeaseLost();
+                onLeaseLost("the replication index in the object store is unreadable: this node lost its lease");
                 return false;
             }
             final boolean isOurs = current != null && instanceId.equals(current.getOwnerInstanceId());
@@ -577,7 +579,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 LOG.error().$("could not commit the replication index, will retry [error=").$safe(e.getMessage()).I$();
                 return false;
             } else {
-                onLeaseLost();
+                onLeaseLost(current == null
+                        ? "the replication index is gone from the object store: this node lost its lease"
+                        : "another primary replaced the replication index: this node lost its lease");
                 return false;
             }
         }
@@ -599,9 +603,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     // another node committed an index after the one this node last saw
-    private void onLeaseLost() {
+    private void onLeaseLost(String reason) {
         if (engine.getRole() == ReplicatedCairoEngine.EngineRole.PRIMARY) {
-            fence("another primary replaced the replication index: this node lost its lease");
+            fence(reason);
         } else {
             // not writable yet, so nothing of this node's is at stake: catch up and wait for the lease again
             LOG.info().$("another node took the replication lease first, waiting for it again").$();
@@ -740,11 +744,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         engine.getTableTokens(tokens, false);
         for (int i = 0, n = tokens.size(); i < n; i++) {
             final TableToken token = tokens.get(i);
-            if (!ReplicationWalDirectoryPolicy.isReplicated(token)) {
-                continue;
-            }
             if (token.isView() || token.isMatView()) {
                 LOG.advisory().$("views and materialized views are not replicated in this version [name=").$(token).I$();
+                continue;
+            }
+            if (!ReplicationWalDirectoryPolicy.isReplicated(token)) {
                 continue;
             }
             final IndexTable t = stored.remove(token.getDirName());
@@ -947,6 +951,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 } catch (ObjectStoreException e) {
                     LOG.error().$("replication upload round failed, will retry [error=").$safe(e.getMessage()).I$();
                     sleepQuietly(config.getRetryInterval());
+                } catch (Throwable th) {
+                    // an unforeseen failure must not end the coordinator: the node would stay writable
+                    // with nothing uploading and the lease running out
+                    LOG.critical().$("replication upload round failed unexpectedly, will retry [error=").$(th).I$();
+                    sleepQuietly(config.getRetryInterval());
                 }
                 continue;
             }
@@ -1078,6 +1087,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 LOG.critical().$("replication stopped [error=").$safe(e.getMessage()).I$();
                 status = "stopped: " + e.getMessage();
                 return;
+            } catch (Throwable th) {
+                LOG.critical().$("replica round failed unexpectedly, will retry [error=").$(th).I$();
             }
             runHousekeeping(false);
             if (applied == 0) {
@@ -1284,8 +1295,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         } catch (Throwable th) {
             LOG.critical().$("replication coordinator failed [error=").$(th).I$();
             status = "failed: " + th.getMessage();
-            if (isPrimary && engine.getRole() != ReplicatedCairoEngine.EngineRole.PRIMARY) {
-                fence(String.valueOf(th.getMessage()));
+            if (isPrimary) {
+                // without its coordinator a primary uploads nothing and renews nothing: it must not go on
+                // acknowledging writes
+                fence(th instanceof ReplicationException ? th.getMessage() : "replication coordinator failed: " + th.getMessage());
             }
         } finally {
             releaseWorkerOfThisThread();
