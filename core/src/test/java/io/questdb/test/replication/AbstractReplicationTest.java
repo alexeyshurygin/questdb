@@ -108,6 +108,18 @@ public abstract class AbstractReplicationTest extends AbstractBootstrapTest {
         }
     }
 
+    /**
+     * The index the object store holds now.
+     */
+    protected io.questdb.replication.codec.ReplicationIndex readIndex() {
+        try (io.questdb.replication.store.FsObjectStore store = new io.questdb.replication.store.FsObjectStore(
+                io.questdb.replication.store.ObjectStoreSettings.parse("fs::root=" + storeRoot + ';'),
+                new io.questdb.replication.ReplicationConfigurationImpl());
+             io.questdb.replication.IndexClient client = new io.questdb.replication.IndexClient(store, true)) {
+            return client.read();
+        }
+    }
+
     protected String nodeRoot(String name) {
         return root + File.separator + name;
     }

@@ -137,6 +137,69 @@ public class ReplicaApplyTest extends AbstractTest {
     }
 
     @Test
+    public void testConcurrentTableCreationKeepsEachSchema() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = newDir("concurrent-a");
+            final String b = newDir("concurrent-b");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final FaultyFilesFacade ff = new FaultyFilesFacade();
+            try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
+                 ReplicatedCairoEngine replica = newEngine(b, ReplicationRole.REPLICA, ff);
+                 ReplicationWorker pw = worker(store, primary, a);
+                 // two replica workers, as two threads of the service have, sharing its work directory
+                 ReplicationWorker first = new ReplicationWorker(store, 1, true, ff, replica.getConfiguration().getMkDirMode(), replica, b + File.separator + ".replication");
+                 ReplicationWorker second = new ReplicationWorker(store, 1, true, ff, replica.getConfiguration().getMkDirMode(), replica, b + File.separator + ".replication")) {
+                primary.execute("CREATE TABLE wide (ts TIMESTAMP, a INT, b LONG, c SYMBOL, d DOUBLE) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("CREATE TABLE narrow (ts TIMESTAMP, v VARCHAR) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                final TableCreateManifest wide = uploadCreate(primary, pw, store, "wide");
+                final TableCreateManifest narrow = uploadCreate(primary, pw, store, "narrow");
+                Assert.assertNotEquals(wide.getMeta0().length, narrow.getMeta0().length);
+
+                // the first worker stops right after it wrote its temporary _meta.0, until the second
+                // worker has created its whole table
+                final java.util.concurrent.CountDownLatch firstWrote = new java.util.concurrent.CountDownLatch(1);
+                final java.util.concurrent.CountDownLatch secondDone = new java.util.concurrent.CountDownLatch(1);
+                ff.onWriteLength = wide.getMeta0().length;
+                ff.onWrite = () -> {
+                    firstWrote.countDown();
+                    try {
+                        Assert.assertTrue(secondDone.await(30, java.util.concurrent.TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        throw new AssertionError(e);
+                    }
+                };
+                final java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+                final Thread thread = new Thread(() -> {
+                    try {
+                        first.getTableApplier().createTable(wide);
+                    } catch (Throwable th) {
+                        failure.set(th);
+                    } finally {
+                        Path.clearThreadLocals();
+                    }
+                });
+                thread.start();
+                try {
+                    Assert.assertTrue(firstWrote.await(30, java.util.concurrent.TimeUnit.SECONDS));
+                    second.getTableApplier().createTable(narrow);
+                } finally {
+                    secondDone.countDown();
+                    thread.join(60_000);
+                }
+                Assert.assertFalse(thread.isAlive());
+                Assert.assertNull(String.valueOf(failure.get()), failure.get());
+
+                Assert.assertEquals("ts,a,b,c,d", columnNames(replica, "wide"));
+                Assert.assertEquals("ts,v", columnNames(replica, "narrow"));
+                // nothing is left in the work directory
+                try (java.util.stream.Stream<java.nio.file.Path> files = Files.list(Paths.get(b, ".replication"))) {
+                    Assert.assertEquals(0, files.filter(f -> f.getFileName().toString().contains("_meta.0")).count());
+                }
+            }
+        });
+    }
+
+    @Test
     public void testFileErrors() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = newDir("files-a");
@@ -202,6 +265,97 @@ public class ReplicaApplyTest extends AbstractTest {
                         Files.readAllBytes(Paths.get(dbRoot.toString(), token.getDirName(), "wal83", "0", "x.d")));
             } finally {
                 freeDeltaBuffers();
+            }
+        });
+    }
+
+    @Test
+    public void testMarkerStaysUntilTheStoreHoldsTheWholeSegment() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = newDir("marker-a");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final io.questdb.std.FilesFacade ff = FilesFacadeImpl.INSTANCE;
+            try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
+                 ReplicationWorker pw = worker(store, primary, a);
+                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(ff, (tableDir, partId) -> false, null);
+                 Path path = new Path()) {
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                final TableToken token = primary.verifyTableName("t");
+                final CharSequence dbRoot = primary.getConfiguration().getDbRoot();
+                final java.nio.file.Path tableDir = Paths.get(dbRoot.toString(), token.getDirName());
+                final IndexTable fresh = new IndexTable().of(token.getTableId(), 7, token.getDirName(), token.getTableName(), IndexTable.KIND_TABLE, 100);
+
+                // the first term uploads txn 1; its writer does not survive the restart
+                final TableUploader first = new TableUploader(token, copy(fresh), false);
+                Assert.assertEquals(1, first.upload(primary, pw, EPOCH, 1, 100));
+                first.onCommitted();
+                final IndexTable committed = copy(first.getEntry());
+                primary.releaseAllWalWriters();
+                final java.nio.file.Path oldSegment = segments(tableDir).get(0);
+                Assert.assertEquals(1, segments(tableDir).size());
+
+                // the restarted uploader notes the segments that exist at startup, then new writes open another
+                final TableUploader u = new TableUploader(token, copy(committed), true);
+                u.loadPart(pw);
+                u.setStartupLastTxn(1, path, dbRoot, ff);
+                primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                primary.execute("INSERT INTO t VALUES ('2024-01-03', 3)");
+                primary.execute("INSERT INTO t VALUES ('2024-01-04', 4)");
+                final java.util.List<java.nio.file.Path> all = segments(tableDir);
+                Assert.assertEquals(2, all.size());
+                final java.nio.file.Path newSegment = all.get(0).equals(oldSegment) ? all.get(1) : all.get(0);
+                final int newWalId = Integer.parseInt(newSegment.getParent().getFileName().toString().substring(3));
+                final java.nio.file.Path oldMarker = oldSegment.resolve(ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER);
+                final java.nio.file.Path newMarker = newSegment.resolve(ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER);
+                Files.createFile(oldMarker);
+                Files.createFile(newMarker);
+
+                // a batch that ends inside the new segment: the startup segment is complete in the store,
+                // the new one is neither closed nor complete
+                Assert.assertEquals(1, u.upload(primary, pw, EPOCH, 4, 1));
+                u.onCommitted();
+                u.releaseMarkers(policy, path, dbRoot);
+                Assert.assertFalse(Files.exists(oldMarker));
+                Assert.assertTrue(Files.exists(newMarker));
+
+                // its writer closes it after txn 4, with txn 2 the last one in the store: the purge job
+                // must still find the marker, or it deletes txns 3 and 4 before they are uploaded
+                primary.releaseAllWalWriters();
+                u.onSegmentClosed(newWalId, 0, 4);
+                u.releaseMarkers(policy, path, dbRoot);
+                Assert.assertTrue(Files.exists(newMarker));
+                Assert.assertEquals(1, u.upload(primary, pw, EPOCH, 4, 1));
+                u.onCommitted();
+                u.releaseMarkers(policy, path, dbRoot);
+                Assert.assertTrue("txn 4 of the segment is not in the store yet", Files.exists(newMarker));
+
+                // the last batch completes the segment
+                Assert.assertEquals(1, u.upload(primary, pw, EPOCH, 4, 1));
+                u.onCommitted();
+                u.releaseMarkers(policy, path, dbRoot);
+                Assert.assertFalse(Files.exists(newMarker));
+
+                // a whole WAL closing counts for its segments as well
+                primary.execute("INSERT INTO t VALUES ('2024-01-05', 5)");
+                primary.execute("INSERT INTO t VALUES ('2024-01-06', 6)");
+                final java.util.List<java.nio.file.Path> withThird = segments(tableDir);
+                withThird.remove(oldSegment);
+                withThird.remove(newSegment);
+                Assert.assertEquals(1, withThird.size());
+                final java.nio.file.Path thirdMarker = withThird.get(0).resolve(ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER);
+                final int thirdWalId = Integer.parseInt(withThird.get(0).getParent().getFileName().toString().substring(3));
+                Files.createFile(thirdMarker);
+                Assert.assertEquals(1, u.upload(primary, pw, EPOCH, 6, 1));
+                u.onCommitted();
+                primary.releaseAllWalWriters();
+                u.onWalClosed(thirdWalId, 6);
+                u.releaseMarkers(policy, path, dbRoot);
+                Assert.assertTrue(Files.exists(thirdMarker));
+                Assert.assertEquals(1, u.upload(primary, pw, EPOCH, 6, 1));
+                u.onCommitted();
+                u.releaseMarkers(policy, path, dbRoot);
+                Assert.assertFalse(Files.exists(thirdMarker));
             }
         });
     }
@@ -328,6 +482,75 @@ public class ReplicaApplyTest extends AbstractTest {
     }
 
     @Test
+    public void testUploaderRecoversFromFailedPartUpload() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = newDir("part-a");
+            final String b = newDir("part-b");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
+                 ReplicatedCairoEngine replica = newEngine(b, ReplicationRole.REPLICA);
+                 ReplicationWorker pw = worker(store, primary, a);
+                 ReplicationWorker rw = worker(store, replica, b)) {
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                primary.execute("RENAME TABLE t TO renamed");
+                primary.execute("INSERT INTO renamed VALUES ('2024-01-03', 3)");
+                primary.execute("INSERT INTO renamed VALUES ('2024-01-04', 4)");
+                final TableToken token = primary.verifyTableName("renamed");
+                final long last = primary.getTableSequencerAPI().lastTxn(token);
+                Assert.assertEquals(5, last);
+                // parts of two transactions: the batch below fills part 0, then writes parts 1 and 2
+                final IndexTable fresh = new IndexTable().of(token.getTableId(), 7, token.getDirName(), "t", IndexTable.KIND_TABLE, 2);
+                final TableUploader u = new TableUploader(token, copy(fresh), false);
+                Assert.assertEquals(1, u.upload(primary, pw, EPOCH, 1, 100));
+                u.onCommitted();
+
+                // the store refuses transaction log parts: first the one a full part triggers mid-batch,
+                // then, on the next attempt, the last one
+                final java.util.concurrent.atomic.AtomicInteger seqPuts = new java.util.concurrent.atomic.AtomicInteger();
+                final int[] failOn = {1};
+                store.setFaultHook((op, key) -> {
+                    if (op.equals("put") && key.contains("/seq/") && seqPuts.incrementAndGet() == failOn[0]) {
+                        throw io.questdb.replication.store.ObjectStoreException.retryable("injected part upload failure", null);
+                    }
+                });
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    try {
+                        u.upload(primary, pw, EPOCH, last, 100);
+                        Assert.fail("expected the injected failure");
+                    } catch (io.questdb.replication.store.ObjectStoreException e) {
+                        TestUtils.assertContains(e.getMessage(), "injected part upload failure");
+                    }
+                    // nothing of the failed batch shows: not the frontier, not the rename it carried
+                    Assert.assertEquals(1, u.getPendingTxn());
+                    Assert.assertFalse(u.hasPending());
+                    Assert.assertEquals(1, u.getEntry().getLastTxn());
+                    Assert.assertEquals("t", u.getEntry().getTableName());
+                    seqPuts.set(0);
+                    failOn[0] = 3;
+                }
+                store.setFaultHook(null);
+
+                // the same uploader carries on from where the store is
+                Assert.assertEquals(4, u.upload(primary, pw, EPOCH, last, 100));
+                Assert.assertEquals(5, u.getPendingTxn());
+                Assert.assertEquals("renamed", u.getEntry().getTableName());
+                u.onCommitted();
+                Assert.assertEquals(5, u.getCommittedTxn());
+
+                // and a replica replays every transaction from what was uploaded
+                final IndexTable entry = copy(u.getEntry());
+                final TableReplayer replayer = new TableReplayer(entry.getKey());
+                Assert.assertEquals(5, replayer.replay(replica, entry, rw, null, 100));
+                Assert.assertNull(replayer.getStaleReason());
+                Assert.assertNotNull(replica.getTableTokenIfExists("renamed"));
+                Assert.assertEquals(5, replica.getTableSequencerAPI().lastTxn(replica.verifyTableName("renamed")));
+            }
+        });
+    }
+
+    @Test
     public void testUploaderFailures() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = newDir("uploader-a");
@@ -391,8 +614,8 @@ public class ReplicaApplyTest extends AbstractTest {
                 Assert.assertEquals(3, decodePart(pw, store.getBytes(StoreKeys.seqPart(committed.getKey(), 1, EPOCH))).getLastTxn());
                 Assert.assertEquals(3, restarted.getCommittedTxn());
 
-                // startup markers: once the store holds the startup transaction, every segment marker of
-                // the table goes, whatever else lies in its directory
+                // startup markers: once the store holds the startup transaction, the marker of every
+                // segment found at startup goes, whatever else lies in the table's directory
                 final CharSequence dbRoot = primary.getConfiguration().getDbRoot();
                 final java.nio.file.Path tableDir = Paths.get(dbRoot.toString(), token.getDirName());
                 final java.nio.file.Path marker = marker(tableDir);
@@ -402,15 +625,15 @@ public class ReplicaApplyTest extends AbstractTest {
                 Files.createFile(tableDir.resolve("wal901"));
                 Files.createDirectories(tableDir.resolve("wal902"));
                 Files.createFile(marker);
-                restarted.setStartupLastTxn(3);
-                // a table directory that cannot be listed keeps its markers for the next round
+                // a table directory that cannot be listed at startup keeps its markers
                 ff.failFindFirst = token.getDirName();
-                restarted.releaseMarkers(policy, path, dbRoot, ff);
+                restarted.setStartupLastTxn(3, path, dbRoot, ff);
+                restarted.releaseMarkers(policy, path, dbRoot);
                 Assert.assertTrue(Files.exists(marker));
                 ff.failFindFirst = "wal902";
-                restarted.setStartupLastTxn(3);
-                restarted.releaseMarkers(policy, path, dbRoot, ff);
+                restarted.setStartupLastTxn(3, path, dbRoot, ff);
                 ff.failFindFirst = null;
+                restarted.releaseMarkers(policy, path, dbRoot);
                 Assert.assertFalse(Files.exists(marker));
             }
         });
@@ -530,6 +753,16 @@ public class ReplicaApplyTest extends AbstractTest {
         final CheckpointHistory.Checkpoint c = new CheckpointHistory.Checkpoint(seqTxn * 1_000_000L);
         c.addTable(tableDir, seqTxn);
         return c;
+    }
+
+    private static String columnNames(ReplicatedCairoEngine engine, String table) {
+        final StringBuilder names = new StringBuilder();
+        try (io.questdb.cairo.sql.TableMetadata metadata = engine.getTableMetadata(engine.verifyTableName(table))) {
+            for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+                names.append(i > 0 ? "," : "").append(metadata.getColumnName(i));
+            }
+        }
+        return names.toString();
     }
 
     private static IndexTable copy(IndexTable t) {
@@ -660,6 +893,36 @@ public class ReplicaApplyTest extends AbstractTest {
         return b;
     }
 
+    // the wal<N>/<segment> directories of a table
+    private static java.util.List<java.nio.file.Path> segments(java.nio.file.Path tableDir) throws java.io.IOException {
+        final java.util.List<java.nio.file.Path> result = new java.util.ArrayList<>();
+        try (java.util.stream.Stream<java.nio.file.Path> walDirs = Files.list(tableDir)) {
+            for (java.nio.file.Path wal : (Iterable<java.nio.file.Path>) walDirs::iterator) {
+                if (!wal.getFileName().toString().matches("wal\\d+") || !Files.isDirectory(wal)) {
+                    continue;
+                }
+                try (java.util.stream.Stream<java.nio.file.Path> segmentDirs = Files.list(wal)) {
+                    for (java.nio.file.Path segment : (Iterable<java.nio.file.Path>) segmentDirs::iterator) {
+                        if (segment.getFileName().toString().matches("\\d+") && Files.isDirectory(segment)) {
+                            result.add(segment);
+                        }
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    // uploads the create manifest of an existing primary table and returns it
+    private static TableCreateManifest uploadCreate(ReplicatedCairoEngine primary, ReplicationWorker w, MemoryObjectStore store, String table) {
+        final TableToken token = primary.verifyTableName(table);
+        final IndexTable entry = new IndexTable().of(token.getTableId(), 7, token.getDirName(), token.getTableName(), IndexTable.KIND_TABLE, 2);
+        final TableUploader u = new TableUploader(token, entry, false);
+        Assert.assertEquals(0, u.upload(primary, w, EPOCH, 0, 100));
+        Assert.assertTrue(u.isCreateUploaded());
+        return readManifest(store, copy(u.getEntry()), w);
+    }
+
     // creates and fills a table on the primary, uploads it, and returns its committed index entry
     private static IndexTable uploadSample(ReplicatedCairoEngine primary, ReplicationWorker w) throws Exception {
         primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG, s STRING) TIMESTAMP(ts) PARTITION BY DAY WAL");
@@ -691,6 +954,9 @@ public class ReplicaApplyTest extends AbstractTest {
         volatile String failOpenRW;
         volatile long failWriteLength = -1;
         volatile boolean isLengthFailing;
+        // runs once, after the first write of onWriteLength bytes
+        volatile Runnable onWrite;
+        volatile long onWriteLength = -1;
         volatile boolean isReadFailing;
         volatile String trackOpenRO;
         private volatile long trackedFd = -1;
@@ -760,7 +1026,13 @@ public class ReplicaApplyTest extends AbstractTest {
             if (len == failWriteLength) {
                 return -1;
             }
-            return super.write(fd, address, len, offset);
+            final long written = super.write(fd, address, len, offset);
+            final Runnable hook = onWrite;
+            if (hook != null && len == onWriteLength) {
+                onWrite = null;
+                hook.run();
+            }
+            return written;
         }
     }
 

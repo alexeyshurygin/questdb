@@ -247,6 +247,48 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testGracefulStopUploadsEveryBatchBeforeReleasing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            // a long throttle window leaves everything to the drain at shutdown
+            writeConfiguration(a, "primary", PropertyKey.REPLICATION_PRIMARY_THROTTLE_WINDOW_DURATION.getPropertyPath() + "=600000");
+            final int txnCount = 12_000; // more than one upload batch of 10_000 transactions
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(nodeA, "t");
+                final io.questdb.cairo.TableToken token = nodeA.getEngine().verifyTableName("t");
+                try (io.questdb.cairo.wal.WalWriter writer = nodeA.getEngine().getWalWriter(token)) {
+                    for (int i = 0; i < txnCount; i++) {
+                        final io.questdb.cairo.TableWriter.Row row = writer.newRow(1_704_067_200_000_000L + i * 1_000_000L);
+                        row.putLong(1, i);
+                        row.append();
+                        writer.commit();
+                    }
+                }
+                Assert.assertEquals(txnCount, nodeA.getEngine().getTableSequencerAPI().lastTxn(token));
+                Assert.assertEquals(0, nodeA.getReplicationService().getUploadedTxn(token));
+                awaitApplied(nodeA, "t");
+            }
+            // the store holds all of it, and only then says the lease is free
+            final io.questdb.replication.codec.ReplicationIndex index = readIndex();
+            Assert.assertNotNull(index);
+            Assert.assertEquals(1, index.getTables().size());
+            Assert.assertEquals(txnCount, index.getTables().getQuick(0).getLastTxn());
+            Assert.assertTrue(index.isReleased());
+
+            // another node takes over without a wait and without missing a row
+            writeConfiguration(b, "primary");
+            try (TestServerMain nodeB = start(b)) {
+                awaitRole(nodeB, EngineRole.PRIMARY);
+                awaitApplied(nodeB, "t");
+                nodeB.assertSql("SELECT count() n, max(v) m FROM t", "n\tm\n" + txnCount + "\t" + (txnCount - 1) + "\n");
+            }
+        });
+    }
+
+    @Test
     public void testIndexReplacedByAnotherWriterFencesPrimary() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = nodeRoot("a");

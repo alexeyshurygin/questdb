@@ -60,7 +60,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
@@ -105,7 +106,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private final ObjectStore store;
     private final ConcurrentHashMap<String, TableUploader> uploaders = new ConcurrentHashMap<>();
     private final Condition wakeUp = lock.newCondition();
-    private final ThreadLocal<ReplicationWorker> worker;
+    private final ThreadLocal<ReplicationWorker> workerSlot = new ThreadLocal<>();
     private final String workDir;
     private volatile long epoch;
     private volatile String instanceId;
@@ -138,31 +139,34 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         this.pins = isPrimary ? null : new ReplicaSegmentPins(10 * 60_000L);
         this.policy = new ReplicationWalDirectoryPolicy(cairoConfig.getFilesFacade(), isPrimary ? this : null, pins);
         final int threads = Math.max(1, Math.min(config.getMaxConcurrentRequests(), config.getMaxBatchSizeFast()));
-        this.executor = new ThreadPoolExecutor(threads, threads, 60, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
-            final Thread t = new Thread(() -> {
-                try {
-                    r.run();
-                } finally {
-                    Path.clearThreadLocals();
+        // No queue: a task goes to an idle thread, else to a new one up to the limit, else the submitting
+        // thread runs it. Threads end after a minute of idleness, and each frees its context as it ends,
+        // so the contexts alive match the concurrency in use.
+        this.executor = new ThreadPoolExecutor(
+                0,
+                threads,
+                60,
+                TimeUnit.SECONDS,
+                new SynchronousQueue<>(),
+                r -> {
+                    final Thread t = new Thread(() -> {
+                        try {
+                            r.run();
+                        } finally {
+                            releaseWorkerOfThisThread();
+                            Path.clearThreadLocals();
+                        }
+                    }, "qdb-replication-worker");
+                    t.setDaemon(true);
+                    return t;
+                },
+                (task, pool) -> {
+                    if (pool.isShutdown()) {
+                        throw new RejectedExecutionException("replication is stopping");
+                    }
+                    task.run();
                 }
-            }, "qdb-replication-worker");
-            t.setDaemon(true);
-            return t;
-        });
-        ((ThreadPoolExecutor) executor).allowCoreThreadTimeOut(true);
-        this.worker = ThreadLocal.withInitial(() -> {
-            final ReplicationWorker w = new ReplicationWorker(
-                    store,
-                    config.getCompressionLevel(),
-                    isChecksum,
-                    cairoConfig.getFilesFacade(),
-                    cairoConfig.getMkDirMode(),
-                    engine,
-                    workDir
-            );
-            allWorkers.add(w);
-            return w;
-        });
+        );
     }
 
     @Override
@@ -176,7 +180,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final Thread t = mainThread;
         if (t != null) {
             try {
-                t.join(Math.max(5_000, 3 * config.getRequestBaseTimeout()));
+                t.join(shutdownTimeoutMillis());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -219,6 +223,23 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    /**
+     * The number of per-thread contexts alive: one for the coordinator and one for each pool thread
+     * that has not ended.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public int getWorkerContextCount() {
+        return allWorkers.size();
+    }
+
+    /**
+     * Test seam: how long an idle pool thread lives.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setWorkerKeepAliveForTesting(long millis) {
+        ((ThreadPoolExecutor) executor).setKeepAliveTime(millis, TimeUnit.MILLISECONDS);
     }
 
     public long getEpoch() {
@@ -301,11 +322,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     @Override
-    public void onSegmentClosed(TableToken token, int walId, int segmentId) {
+    public void onSegmentClosed(TableToken token, int walId, int segmentId, long lastTxn) {
         final TableUploader u = uploaders.get(token.getDirName());
         if (u != null) {
             synchronized (u) {
-                u.onSegmentClosed(walId, segmentId);
+                u.onSegmentClosed(walId, segmentId, lastTxn);
             }
         }
         if (!config.isThrottleNonData()) {
@@ -323,11 +344,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     @Override
-    public void onWalClosed(TableToken token, int walId) {
+    public void onWalClosed(TableToken token, int walId, long lastTxn) {
         final TableUploader u = uploaders.get(token.getDirName());
         if (u != null) {
             synchronized (u) {
-                u.onWalClosed(walId);
+                u.onWalClosed(walId, lastTxn);
             }
         }
     }
@@ -444,6 +465,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         idx.setDataId(dataID.getHi(), dataID.getLo());
         idx.setOwner(isReleased ? null : instanceId, epoch, engine.getConfiguration().getMicrosecondClock().getTicks(), sequence + 1, isReleased);
         for (TableUploader u : uploaders.values()) {
+            // a replica asks for the create manifest of every table the index lists and gives the table
+            // up when it stays missing, so a table created under replication waits for its manifest
+            if (!u.isCreateUploaded() && u.getEntry().getFirstTxn() <= 1) {
+                continue;
+            }
             final IndexTable t = new IndexTable();
             t.copyFrom(u.getEntry());
             idx.addTable(t);
@@ -471,7 +497,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 if (local > t.getLastTxn()) {
                     // the local tail goes up next, provided local history agrees with the store's
                     try {
-                        r.checkCommonPrefix(engine, t, worker.get(), local);
+                        r.checkCommonPrefix(engine, t, worker(), local);
                     } catch (ReplicationException e) {
                         LOG.critical().$("table diverged from the object store [table=").$(token).$(", error=").$safe(e.getMessage()).I$();
                         isClean = false;
@@ -481,7 +507,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             }
             long applied;
             do {
-                applied = r.replay(engine, t, worker.get(), null, CATCHUP_BATCH);
+                applied = r.replay(engine, t, worker(), null, CATCHUP_BATCH);
             } while (applied > 0 && isRunning);
             if (r.isStale()) {
                 isClean = false;
@@ -490,28 +516,58 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         return isClean;
     }
 
+    /**
+     * Replaces the index: the commit point of everything uploaded since the last one, and the renewal
+     * of the lease.
+     *
+     * @return false when nothing was committed: a transient failure the caller retries, or a lost
+     * lease, in which case a writable primary is fenced and a node still taking the lease keeps trying
+     */
     private boolean commitIndex(boolean isReleased) {
         final ReplicationIndex idx = buildIndex(isReleased);
         try {
             indexClient.write(idx, config.getCompressionLevel());
         } catch (ObjectStoreException e) {
-            if (e.getKind() == ObjectStoreException.Kind.PRECONDITION_FAILED) {
-                fence("another primary replaced the replication index: this node lost its lease");
-                return false;
-            }
-            if (!e.isRetryable()) {
+            final boolean isConflict = e.getKind() == ObjectStoreException.Kind.PRECONDITION_FAILED;
+            if (!isConflict && !e.isRetryable()) {
                 throw e;
             }
-            // the write may have landed despite the error: ask the index itself
-            final ReplicationIndex current = indexClient.read();
+            // Ask the index itself what happened. The write may have landed despite the error; a store
+            // client that retries a request whose answer was lost even reports a conflict with its own
+            // first attempt.
+            final ReplicationIndex current;
+            try {
+                current = indexClient.read();
+            } catch (ObjectStoreException readError) {
+                if (!readError.isRetryable()) {
+                    throw readError;
+                }
+                LOG.error().$("could not commit the replication index, will retry [error=").$safe(e.getMessage()).I$();
+                return false;
+            } catch (RuntimeException readError) {
+                // somebody replaced the index with something this node cannot read
+                LOG.critical().$("the replication index is unreadable [error=").$safe(String.valueOf(readError.getMessage())).I$();
+                onLeaseLost();
+                return false;
+            }
             final boolean isOurs = current != null && instanceId.equals(current.getOwnerInstanceId());
-            if (current != null && current.getSequence() == idx.getSequence() && (isOurs || isReleased && current.isReleased())) {
+            final boolean isOurTerm = current != null && current.getSequence() == idx.getSequence() && current.getEpoch() == idx.getEpoch()
+                    && (isOurs || current.isReleased());
+            if (isOurTerm && current.getRenewedAt() == idx.getRenewedAt() && current.isReleased() == isReleased) {
                 LOG.info().$("replication index commit landed despite an error [sequence=").$(idx.getSequence()).I$();
-            } else if (current != null && !isOurs) {
-                fence("another primary replaced the replication index: this node lost its lease");
+            } else if (isOurTerm) {
+                // an earlier write of this node landed without it noticing, and the store holds that one,
+                // not this one: build the next index on top of it
+                sequence = current.getSequence();
+                LOG.info().$("an earlier replication index commit had landed, committing again [sequence=").$(sequence).I$();
+                return false;
+            } else if (current == null ? sequence == 0 : current.getSequence() == sequence) {
+                // the index this write was based on is still there: the write did not land and nobody
+                // else wrote; the read above refreshed the tag the next attempt compares against
+                LOG.error().$("could not commit the replication index, will retry [error=").$safe(e.getMessage()).I$();
                 return false;
             } else {
-                LOG.error().$("could not commit the replication index, will retry [error=").$safe(e.getMessage()).I$();
+                onLeaseLost();
                 return false;
             }
         }
@@ -530,6 +586,48 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         status = "fenced: " + reason;
         engine.setRole(ReplicatedCairoEngine.EngineRole.FENCED, reason);
         isRunning = false;
+    }
+
+    // another node committed an index after the one this node last saw
+    private void onLeaseLost() {
+        if (engine.getRole() == ReplicatedCairoEngine.EngineRole.PRIMARY) {
+            fence("another primary replaced the replication index: this node lost its lease");
+        } else {
+            // not writable yet, so nothing of this node's is at stake: catch up and wait for the lease again
+            LOG.info().$("another node took the replication lease first, waiting for it again").$();
+        }
+    }
+
+    // gives up the calling thread's context, if it has one
+    private void releaseWorkerOfThisThread() {
+        final ReplicationWorker w = workerSlot.get();
+        if (w != null) {
+            workerSlot.remove();
+            // close() frees whatever is still registered: only one of the two gets each context
+            if (allWorkers.remove(w)) {
+                Misc.free(w);
+            }
+        }
+    }
+
+    // the calling thread's buffers, codecs and readers, created on first use
+    private ReplicationWorker worker() {
+        ReplicationWorker w = workerSlot.get();
+        if (w == null) {
+            final CairoConfiguration cairoConfig = engine.getConfiguration();
+            w = new ReplicationWorker(
+                    store,
+                    config.getCompressionLevel(),
+                    isChecksum,
+                    cairoConfig.getFilesFacade(),
+                    cairoConfig.getMkDirMode(),
+                    engine,
+                    workDir
+            );
+            allWorkers.add(w);
+            workerSlot.set(w);
+        }
+        return w;
     }
 
     private String loadInstanceId() {
@@ -577,7 +675,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             return engine.getTableSequencerAPI().lastTxn(token);
         } catch (CairoException e) {
             // a dropped table: read the log itself, which the drop leaves in place until it is uploaded
-            final TxnLogReader r = worker.get().getTxnLogReader();
+            final TxnLogReader r = worker().getTxnLogReader();
             try {
                 return r.of(engine.getConfiguration().getDbRoot(), token.getDirName()).getMaxTxn();
             } finally {
@@ -613,7 +711,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             } else {
                 u = newUploader(token, local);
             }
-            u.setStartupLastTxn(local);
+            u.setStartupLastTxn(local, path, engine.getConfiguration().getDbRoot(), engine.getConfiguration().getFilesFacade());
             uploaders.put(token.getDirName(), u);
             dirtyTables.put(token.getDirName(), Boolean.TRUE);
         }
@@ -653,10 +751,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      * One primary round: uploads the dirty tables when {@code isUpload}, then commits the index if
      * there is anything to commit, the lease needs renewing, or this is the final round.
      */
-    private void primaryRound(boolean isUpload, boolean isFinal) {
+    /**
+     * Uploads what the dirty tables hold, one batch per table, and commits it.
+     *
+     * @return the number of transactions uploaded
+     */
+    private long primaryRound(boolean isUpload) {
         if (!isUpload) {
             commitIndex(false);
-            return;
+            return 0;
         }
         // pick up tables created since the last round
         for (TableToken token : createdTables.values()) {
@@ -681,7 +784,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                             u.setToken(current);
                         }
                         final long last = localLastTxn(u);
-                        final long n = u.upload(engine, worker.get(), epoch, durableTarget(u, last), UPLOAD_BATCH);
+                        final long n = u.upload(engine, worker(), epoch, durableTarget(u, last), UPLOAD_BATCH);
                         if (u.getPendingTxn() < last) {
                             // more to upload: a batch limit or a durable frontier still behind the log
                             dirtyTables.put(dir, Boolean.TRUE);
@@ -710,16 +813,17 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             hasPending |= u.hasPending();
         }
         final boolean isKeepaliveDue = System.nanoTime() - lastIndexWriteNanos >= TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval());
-        if (hasPending || isKeepaliveDue || isFinal) {
-            if (commitIndex(isFinal) && uploaded > 0) {
+        if (hasPending || isKeepaliveDue) {
+            if (commitIndex(false) && uploaded > 0) {
                 status = "primary, epoch " + epoch;
                 for (TableUploader u : uploaders.values()) {
                     synchronized (u) {
-                        u.releaseMarkers(policy, path, engine.getConfiguration().getDbRoot(), engine.getConfiguration().getFilesFacade());
+                        u.releaseMarkers(policy, path, engine.getConfiguration().getDbRoot());
                     }
                 }
             }
         }
+        return uploaded;
     }
 
     private void primaryMain() {
@@ -757,7 +861,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             prepareUploaders(idx);
             for (TableUploader u : uploaders.values()) {
                 if (!u.isDropCommitted()) {
-                    u.loadPart(worker.get());
+                    u.loadPart(worker());
                 }
             }
             if (commitIndex(false)) {
@@ -787,7 +891,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 }
                 try {
                     // a keepalive alone renews the lease and leaves data to its window
-                    primaryRound(isUploadDue, false);
+                    primaryRound(isUploadDue);
                 } catch (ObjectStoreException e) {
                     LOG.error().$("replication upload round failed, will retry [error=").$safe(e.getMessage()).I$();
                     sleepQuietly(config.getRetryInterval());
@@ -800,15 +904,47 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // drain what is committed, then hand the lease over
         if (engine.getRole() == ReplicatedCairoEngine.EngineRole.PRIMARY && !isCrashed) {
             try {
-                for (TableUploader u : uploaders.values()) {
-                    dirtyTables.put(u.getToken().getDirName(), Boolean.TRUE);
-                }
-                primaryRound(true, true);
-                LOG.info().$("replication drained and released the lease [epoch=").$(epoch).I$();
+                drainAndRelease();
             } catch (Throwable th) {
                 LOG.error().$("could not drain replication uploads at shutdown [error=").$safe(String.valueOf(th.getMessage())).I$();
             }
         }
+    }
+
+    /**
+     * Uploads every committed transaction, batch after batch, and only then releases the lease. A
+     * released lease tells the next primary that the store is complete and that it need not wait; when
+     * the drain falls short (a store failure, the deadline), the lease stays held and expires on its
+     * own, as after a crash.
+     */
+    private void drainAndRelease() {
+        for (TableUploader u : uploaders.values()) {
+            dirtyTables.put(u.getToken().getDirName(), Boolean.TRUE);
+        }
+        // close() waits this long for the coordinator before it frees what the drain uses
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() * 3 / 4);
+        long uploaded;
+        do {
+            uploaded = primaryRound(true);
+        } while (uploaded > 0
+                && !dirtyTables.isEmpty()
+                && engine.getRole() == ReplicatedCairoEngine.EngineRole.PRIMARY
+                && System.nanoTime() < deadline);
+        if (engine.getRole() != ReplicatedCairoEngine.EngineRole.PRIMARY) {
+            return;
+        }
+        if (dirtyTables.isEmpty() && createdTables.isEmpty()) {
+            if (commitIndex(true)) {
+                LOG.info().$("replication drained and released the lease [epoch=").$(epoch).I$();
+            }
+            return;
+        }
+        LOG.error().$("replication stops with transactions it could not upload; the lease stays held until it expires [tables=")
+                .$(dirtyTables.size() + createdTables.size()).I$();
+    }
+
+    private long shutdownTimeoutMillis() {
+        return Math.max(5_000, 3 * config.getRequestBaseTimeout());
     }
 
     private long readCreateTimestamp(TableToken token) {
@@ -860,7 +996,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 if (r.isDone() || r.isStale()) {
                     continue;
                 }
-                futures.add(executor.submit(() -> r.replay(engine, t, worker.get(), pins, CATCHUP_BATCH)));
+                futures.add(executor.submit(() -> r.replay(engine, t, worker(), pins, CATCHUP_BATCH)));
             }
             for (Future<Long> f : futures) {
                 try {
@@ -920,7 +1056,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     private void runCleaner() {
-        final ReplicationWorker w = worker.get();
+        final ReplicationWorker w = worker();
         final Map<String, Long> cutoffs = config.isCleanerCheckpointSource() ? cleaner.computeCutoffs(w) : null;
         final List<String> keys = new ArrayList<>();
         boolean isIndexChanged = false;
@@ -1007,7 +1143,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     private void uploadCheckpointHistory() {
-        final ReplicationWorker w = worker.get();
+        final ReplicationWorker w = worker();
         final String key = StoreKeys.checkpointHistory(instanceId);
         if (checkpointHistory == null) {
             if (w.getIo().get(key, w.getBuffer())) {
@@ -1020,8 +1156,14 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
         final int queued = pendingCheckpoints.size();
         for (int i = 0; i < queued; i++) {
-            checkpointHistory.add(pendingCheckpoints.peek());
-            checkpointHistory.keepLatest(config.getCheckpointHistoryKeepCount());
+            final io.questdb.replication.codec.CheckpointHistory.Checkpoint checkpoint = pendingCheckpoints.peek();
+            final List<io.questdb.replication.codec.CheckpointHistory.Checkpoint> recorded = checkpointHistory.getCheckpoints();
+            // a put that failed leaves the checkpoint in the history: the retry must not record it twice,
+            // or the copies would pass for the distinct checkpoints the cleaner waits for
+            if (recorded.isEmpty() || recorded.get(recorded.size() - 1) != checkpoint) {
+                checkpointHistory.add(checkpoint);
+                checkpointHistory.keepLatest(config.getCheckpointHistoryKeepCount());
+            }
             final byte[] text = checkpointHistory.encode();
             w.getBuffer().clear();
             w.getBuffer().putBytes(text, 0, text.length);
@@ -1061,6 +1203,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 fence(String.valueOf(th.getMessage()));
             }
         } finally {
+            releaseWorkerOfThisThread();
             Path.clearThreadLocals();
         }
     }

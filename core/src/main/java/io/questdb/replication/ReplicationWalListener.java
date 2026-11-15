@@ -57,7 +57,7 @@ public class ReplicationWalListener implements WalListener {
     @Override
     public void segmentClosed(TableToken tableToken, long txn, int walId, int segmentId) {
         if (ReplicationWalDirectoryPolicy.isReplicated(tableToken)) {
-            sink.onSegmentClosed(tableToken, walId, segmentId);
+            sink.onSegmentClosed(tableToken, walId, segmentId, txn);
         }
     }
 
@@ -85,7 +85,7 @@ public class ReplicationWalListener implements WalListener {
     @Override
     public void walClosed(TableToken tableToken, long txn, int walId) {
         if (ReplicationWalDirectoryPolicy.isReplicated(tableToken)) {
-            sink.onWalClosed(tableToken, walId);
+            sink.onWalClosed(tableToken, walId, txn);
         }
     }
 
@@ -99,10 +99,14 @@ public class ReplicationWalListener implements WalListener {
          */
         void onCommit(TableToken token, long txn, boolean isNonData);
 
-        void onSegmentClosed(TableToken token, int walId, int segmentId);
+        /**
+         * @param lastTxn the writer's last sequenced transaction at the close; every transaction of
+         *                the segment is at or below it
+         */
+        void onSegmentClosed(TableToken token, int walId, int segmentId, long lastTxn);
 
         void onTableCreated(TableToken token);
 
-        void onWalClosed(TableToken token, int walId);
+        void onWalClosed(TableToken token, int walId, long lastTxn);
     }
 }

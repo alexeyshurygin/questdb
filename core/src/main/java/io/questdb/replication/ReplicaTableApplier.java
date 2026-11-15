@@ -55,6 +55,7 @@ import io.questdb.std.str.Path;
 import org.jetbrains.annotations.NotNull;
 
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Applies replicated changes to a replica's tables through the engine's own machinery: it creates a
@@ -66,9 +67,11 @@ import java.nio.charset.StandardCharsets;
 public class ReplicaTableApplier implements QuietCloseable {
     private static final Log LOG = LogFactory.getLog(ReplicaTableApplier.class);
     private static final String META0_TEMP_FILE = "_meta.0.tmp";
+    private static final AtomicLong META0_TEMP_FILE_COUNTER = new AtomicLong();
     private final NativeBuffer alterBuffer = new NativeBuffer();
     private final MemoryFCRImpl alterMem = new MemoryFCRImpl();
     private final CairoConfiguration configuration;
+    private final String meta0TempFile;
     private final ReplicatedCairoEngine engine;
     private final FilesFacade ff;
     private final Path path = new Path();
@@ -82,6 +85,8 @@ public class ReplicaTableApplier implements QuietCloseable {
         this.configuration = engine.getConfiguration();
         this.ff = configuration.getFilesFacade();
         this.workDir = workDir;
+        // appliers of different workers create tables at the same time in the same work directory
+        this.meta0TempFile = META0_TEMP_FILE + '.' + META0_TEMP_FILE_COUNTER.incrementAndGet();
     }
 
     /**
@@ -300,7 +305,7 @@ public class ReplicaTableApplier implements QuietCloseable {
         if (ff.mkdirs(path.slash(), configuration.getMkDirMode()) != 0) {
             throw CairoException.critical(ff.errno()).put("could not create replication work directory [path=").put(path).put(']');
         }
-        path.of(workDir).concat(META0_TEMP_FILE);
+        path.of(workDir).concat(meta0TempFile);
         final long fd = ff.openCleanRW(path.$(), meta0.length);
         if (fd < 0) {
             throw CairoException.critical(ff.errno()).put("could not create file [path=").put(path).put(']');

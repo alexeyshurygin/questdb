@@ -59,12 +59,17 @@ import java.util.Map;
  */
 public class TableUploader {
     private static final Log LOG = LogFactory.getLog(TableUploader.class);
-    // segments closed by their writer: (walId << 32 | segmentId), plus whole WALs as (walId << 32 | 0xffffffff)
-    private final HashSet<Long> closedSegments = new HashSet<>();
+    // segments closed by their writer -> the writer's last sequenced transaction at the close:
+    // (walId << 32 | segmentId), plus whole WALs as (walId << 32 | 0xffffffff)
+    private final HashMap<Long, Long> closedSegments = new HashMap<>();
     private final IndexTable entry = new IndexTable();
+    // the entry as it was before the batch being uploaded touched it
+    private final IndexTable entryBefore = new IndexTable();
     private final ObjList<TxnRecord> batch = new ObjList<>();
     // segment -> highest txn referencing it that was uploaded
     private final HashMap<Long, Long> segmentRefs = new HashMap<>();
+    // segments found at startup: their writers did not survive the restart
+    private final HashSet<Long> startupSegments = new HashSet<>();
     private final String tableKey;
     private long committedTxn;
     private boolean isCreateCommitted;
@@ -123,6 +128,13 @@ public class TableUploader {
         return pendingTxn > committedTxn || (isCreateUploaded && !isCreateCommitted);
     }
 
+    /**
+     * True once the store holds the table's create manifest.
+     */
+    public boolean isCreateUploaded() {
+        return isCreateUploaded;
+    }
+
     public boolean isDropCommitted() {
         return isDropCommitted;
     }
@@ -175,20 +187,25 @@ public class TableUploader {
         }
     }
 
-    public void onSegmentClosed(int walId, int segmentId) {
-        closedSegments.add(segmentKey(walId, segmentId));
+    /**
+     * @param lastSeqTxn the writer's last sequenced transaction at the close; every transaction of the
+     *                   segment is at or below it
+     */
+    public void onSegmentClosed(int walId, int segmentId, long lastSeqTxn) {
+        closedSegments.merge(segmentKey(walId, segmentId), lastSeqTxn, Math::max);
     }
 
-    public void onWalClosed(int walId) {
-        closedSegments.add(walKey(walId));
+    public void onWalClosed(int walId, long lastSeqTxn) {
+        closedSegments.merge(walKey(walId), lastSeqTxn, Math::max);
     }
 
     /**
      * Removes the {@code upload.pending} markers of every segment the store now holds entirely: closed
-     * by its writer and with no transaction past the committed one.
+     * by its writer, and with the writer's last transaction at the close committed. The highest
+     * transaction uploaded so far says nothing: a batch can end in the middle of a segment, and the
+     * purge job deletes an applied segment as soon as its marker goes.
      */
-    public void releaseMarkers(@NotNull ReplicationWalDirectoryPolicy policy, @NotNull Path path, @NotNull CharSequence dbRoot,
-                               @NotNull FilesFacade ff) {
+    public void releaseMarkers(@NotNull ReplicationWalDirectoryPolicy policy, @NotNull Path path, @NotNull CharSequence dbRoot) {
         if (isCreateCommitted) {
             policy.removeMarker(path.of(dbRoot).concat(token.getDirName()).concat(WalUtils.SEQ_DIR));
         }
@@ -198,8 +215,11 @@ public class TableUploader {
             final long key = e.getKey();
             final int walId = (int) (key >>> 32);
             final int segmentId = (int) key;
-            final boolean isClosed = closedSegments.contains(key) || closedSegments.contains(walKey(walId));
-            if (isClosed && e.getValue() <= committedTxn) {
+            Long closeTxn = closedSegments.get(key);
+            if (closeTxn == null) {
+                closeTxn = closedSegments.get(walKey(walId));
+            }
+            if (closeTxn != null && closeTxn <= committedTxn && e.getValue() <= committedTxn) {
                 path.of(dbRoot).concat(token.getDirName()).concat(WalUtils.WAL_NAME_BASE).put(walId).slash().put(segmentId);
                 policy.removeMarker(path);
                 it.remove();
@@ -207,18 +227,26 @@ public class TableUploader {
             }
         }
         if (startupLastTxn > -1 && committedTxn >= startupLastTxn) {
-            // segments that existed at startup are all closed: their writers did not survive the restart
-            releaseStartupMarkers(policy, path, dbRoot, ff);
+            // every transaction of the segments found at startup is at or below the log's last one then
+            for (long key : startupSegments) {
+                path.of(dbRoot).concat(token.getDirName()).concat(WalUtils.WAL_NAME_BASE).put((int) (key >>> 32)).slash().put((int) key);
+                policy.removeMarker(path);
+                segmentRefs.remove(key);
+            }
+            startupSegments.clear();
             startupLastTxn = -1;
         }
     }
 
     /**
-     * Notes the local log's last transaction at startup: once the store holds it, every segment
-     * marker left from before the restart can go.
+     * Notes the local log's last transaction at startup and the WAL segments that exist then, before
+     * any writer opens: once the store holds that transaction, the markers of those segments can go.
+     * A segment created later answers to its own close.
      */
-    public void setStartupLastTxn(long startupLastTxn) {
+    public void setStartupLastTxn(long startupLastTxn, @NotNull Path path, @NotNull CharSequence dbRoot, @NotNull FilesFacade ff) {
         this.startupLastTxn = startupLastTxn;
+        startupSegments.clear();
+        listSegments(path, dbRoot, ff);
     }
 
     public void setToken(@NotNull TableToken token) {
@@ -267,36 +295,53 @@ public class TableUploader {
             return 0;
         }
         uploadDeltas(dbRoot, worker, epoch);
-        final long firstTxn = batch.getQuick(0).getTxn();
-        entry.addEpochStart(epoch, firstTxn);
-        final NativeBuffer buf = worker.getBuffer();
-        for (int i = 0, n = batch.size(); i < n; i++) {
-            final TxnRecord rec = batch.getQuick(i);
-            if (part.isFull()) {
-                // a part filled by an earlier batch is in the store already, and the cleaner may have removed it
-                if (isPartDirty) {
-                    uploadPart(worker, buf, epoch);
+        // From here the batch changes the part and the index entry before the store holds it. A failed
+        // put must leave both where pendingTxn says they are: the next attempt reads the same
+        // transactions again, and a keepalive must not commit an entry whose part was never written.
+        final TxnPart partBefore = part;
+        final boolean wasPartDirty = isPartDirty;
+        entryBefore.copyFrom(entry);
+        try {
+            final long firstTxn = batch.getQuick(0).getTxn();
+            entry.addEpochStart(epoch, firstTxn);
+            final NativeBuffer buf = worker.getBuffer();
+            for (int i = 0, n = batch.size(); i < n; i++) {
+                final TxnRecord rec = batch.getQuick(i);
+                if (part.isFull()) {
+                    // a part filled by an earlier batch is in the store already, and the cleaner may have removed it
+                    if (isPartDirty) {
+                        uploadPart(worker, buf, epoch);
+                    }
+                    part = new TxnPart().of(entry.getTableId(), entry.getCreateTimestamp(), part.getPart() + 1, entry.getPartTxnCount());
                 }
-                part = new TxnPart().of(entry.getTableId(), entry.getCreateTimestamp(), part.getPart() + 1, entry.getPartTxnCount());
+                part.add(rec);
+                isPartDirty = true;
+                if (rec.isStructural() && rec.getPayload() != null
+                        && ReplicaTableApplier.readCommand(rec.getPayload()) == io.questdb.griffin.engine.ops.AlterOperation.RENAME_TABLE) {
+                    entry.setTableName(ReplicaTableApplier.readRenameTarget(rec.getPayload()));
+                }
+                if (rec.isDrop()) {
+                    entry.setDropped(engine.getConfiguration().getMicrosecondClock().getTicks());
+                }
             }
-            part.add(rec);
-            isPartDirty = true;
-            if (rec.isStructural() && rec.getPayload() != null
-                    && ReplicaTableApplier.readCommand(rec.getPayload()) == io.questdb.griffin.engine.ops.AlterOperation.RENAME_TABLE) {
-                entry.setTableName(ReplicaTableApplier.readRenameTarget(rec.getPayload()));
-            }
-            if (rec.isDrop()) {
-                entry.setDropped(engine.getConfiguration().getMicrosecondClock().getTicks());
-            }
+            uploadPart(worker, buf, epoch);
+        } catch (Throwable th) {
+            part = partBefore;
+            part.truncateAfter(pendingTxn);
+            // a part object this batch did write stays in the store with records the index does not
+            // name yet; the retry adds the same records and writes it again
+            isPartDirty = wasPartDirty;
+            entry.copyFrom(entryBefore);
+            throw th;
         }
-        uploadPart(worker, buf, epoch);
         final long last = batch.getLast().getTxn();
         entry.setLastTxn(last);
         pendingTxn = last;
         return batch.size();
     }
 
-    private void releaseStartupMarkers(ReplicationWalDirectoryPolicy policy, Path path, CharSequence dbRoot, FilesFacade ff) {
+    // collects wal<N>/<segment> directories of the table into startupSegments
+    private void listSegments(Path path, CharSequence dbRoot, FilesFacade ff) {
         path.of(dbRoot).concat(token.getDirName());
         final int tableLen = path.size();
         final DirectUtf8StringZ name = new DirectUtf8StringZ();
@@ -337,11 +382,7 @@ public class TableUploader {
                         } catch (NumberFormatException e) {
                             continue;
                         }
-                        final Long lastRef = segmentRefs.get(segmentKey(walId, segmentId));
-                        if (lastRef == null || lastRef <= committedTxn) {
-                            policy.removeMarker(path.trimTo(walLen).concat(seg));
-                            segmentRefs.remove(segmentKey(walId, segmentId));
-                        }
+                        startupSegments.add(segmentKey(walId, segmentId));
                     } while (ff.findNext(segFind) > 0);
                 } finally {
                     ff.findClose(segFind);
