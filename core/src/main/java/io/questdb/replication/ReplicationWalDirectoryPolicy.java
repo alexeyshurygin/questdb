@@ -31,6 +31,7 @@ import io.questdb.cairo.wal.WalDirectoryPolicy;
 import io.questdb.cairo.wal.WalUtils;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.QuietCloseable;
+import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.Utf8Sequence;
 import org.jetbrains.annotations.NotNull;
@@ -53,6 +54,8 @@ import org.jetbrains.annotations.Nullable;
 public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietCloseable {
     public static final String UPLOAD_PENDING_MARKER = "upload.pending";
     private final FilesFacade ff;
+    // guarded by markerPath
+    private boolean isClosed;
     private final Path markerPath = new Path();
     private final @Nullable Pins primaryPins;
     private final @Nullable ReplicaSegmentPins replicaPins;
@@ -63,9 +66,16 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
         this.replicaPins = replicaPins;
     }
 
+    /**
+     * Frees the marker path. The engine outlives the replication service and still consults the policy
+     * while it shuts down (a pooled WAL writer rolls back an empty segment, the purge job asks about a
+     * directory): the policy keeps answering, and frees the path again after each such call, because a
+     * closed {@link Path} allocates anew when used.
+     */
     @Override
     public void close() {
         synchronized (markerPath) {
+            isClosed = true;
             markerPath.close();
         }
     }
@@ -85,14 +95,13 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
             return;
         }
         synchronized (markerPath) {
-            markerPath.of(dirPath);
-            if (markerPath.size() > 0 && markerPath.byteAt(markerPath.size() - 1) != '/') {
-                markerPath.slash();
-            }
-            markerPath.put(UPLOAD_PENDING_MARKER);
-            final long fd = ff.openRW(markerPath.$(), 0);
-            if (fd > -1) {
-                ff.close(fd);
+            try {
+                final long fd = ff.openRW(markerOf(dirPath), 0);
+                if (fd > -1) {
+                    ff.close(fd);
+                }
+            } finally {
+                releaseMarkerPath();
             }
         }
     }
@@ -101,11 +110,11 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
     public boolean isInUse(Path path) {
         if (primaryPins != null) {
             synchronized (markerPath) {
-                markerPath.of(path);
-                if (markerPath.size() > 0 && markerPath.byteAt(markerPath.size() - 1) != '/') {
-                    markerPath.slash();
+                try {
+                    return ff.exists(markerOf(path));
+                } finally {
+                    releaseMarkerPath();
                 }
-                return ff.exists(markerPath.put(UPLOAD_PENDING_MARKER).$());
             }
         }
         if (replicaPins != null) {
@@ -137,17 +146,32 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
             return;
         }
         synchronized (markerPath) {
-            markerPath.of(dirPath);
-            if (markerPath.size() > 0 && markerPath.byteAt(markerPath.size() - 1) != '/') {
-                markerPath.slash();
+            try {
+                ff.removeQuiet(markerOf(dirPath));
+            } finally {
+                releaseMarkerPath();
             }
-            ff.removeQuiet(markerPath.put(UPLOAD_PENDING_MARKER).$());
         }
     }
 
     @Override
     public boolean truncateFilesOnClose() {
         return DefaultWalDirectoryPolicy.INSTANCE.truncateFilesOnClose();
+    }
+
+    // the marker file of a directory, in markerPath; the caller holds its lock
+    private LPSZ markerOf(Path dirPath) {
+        markerPath.of(dirPath);
+        if (markerPath.size() > 0 && markerPath.byteAt(markerPath.size() - 1) != '/') {
+            markerPath.slash();
+        }
+        return markerPath.put(UPLOAD_PENDING_MARKER).$();
+    }
+
+    private void releaseMarkerPath() {
+        if (isClosed) {
+            markerPath.close();
+        }
     }
 
     // <root>/<tableDir>/wal<N>/<segment>

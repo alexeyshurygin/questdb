@@ -229,10 +229,6 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         return instanceId;
     }
 
-    public @NotNull ReplicationWalDirectoryPolicy getPolicy() {
-        return policy;
-    }
-
     /**
      * Human-readable state of the coordinator, for logs and tests.
      */

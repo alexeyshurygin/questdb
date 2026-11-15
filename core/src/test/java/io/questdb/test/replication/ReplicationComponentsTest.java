@@ -195,6 +195,23 @@ public class ReplicationComponentsTest extends AbstractTest {
                 path.of("txn_seq");
                 Assert.assertFalse(primary.isSeqPartInUse(path, 5));
                 Assert.assertTrue(primary.truncateFilesOnClose());
+
+
+                // the engine still consults the policy after the replication service closed it, and nobody
+                // closes it a second time: the answers stay right, and the leak check proves that each
+                // call frees what it allocates
+                final ReplicationWalDirectoryPolicy closed = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, (tableDir, partId) -> false, null);
+                closed.close();
+                path.of(dir).concat("t~1").concat("wal3").concat("2");
+                Assert.assertFalse(closed.isInUse(path));
+                closed.initDirectory(path, table);
+                Assert.assertTrue(closed.isInUse(path));
+                Assert.assertTrue(new File(dir, "t~1/wal3/2/" + ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER).exists());
+                closed.rollbackDirectory(path);
+                Assert.assertFalse(closed.isInUse(path));
+                closed.initDirectory(path, table);
+                closed.removeMarker(path);
+                Assert.assertFalse(new File(dir, "t~1/wal3/2/" + ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER).exists());
             }
             final ReplicaSegmentPins pins = new ReplicaSegmentPins(1_000);
             try (Path path = new Path();

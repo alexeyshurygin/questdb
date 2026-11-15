@@ -80,15 +80,6 @@ public final class NativeBuffer implements QuietCloseable {
         size++;
     }
 
-    /**
-     * Copies {@code length} bytes from native memory at {@code src}.
-     */
-    public void putBytes(long src, long length) {
-        final long dst = ensureCapacity(length);
-        Unsafe.copyMemory(src, dst, length);
-        size += length;
-    }
-
     public void putInt(int value) {
         Unsafe.getUnsafe().putInt(ensureCapacity(4), value);
         size += 4;
