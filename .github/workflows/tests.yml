@@ -1,0 +1,172 @@
+name: Tests
+
+# Upstream runs its Java tests in Azure Pipelines (ci/test-pipeline.yml) on its own machines, which a
+# fork does not have. This workflow runs the same tests on GitHub's runners: the test groups and the
+# Maven options follow ci/test-pipeline.yml and ci/templates/steps.yml.
+
+# One run per push: the pull request event covers every push to a branch with an open pull request.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MAVEN_OPTS: "-Xmx3g -XX:+UseParallelGC"
+  MAVEN_RUN_OPTS: >-
+    -Dmaven.resolver.transport=wagon
+    -Dmaven.wagon.httpconnectionManager.ttlSeconds=30
+    -Dmaven.wagon.http.retryHandler.count=3
+
+jobs:
+  rust-library:
+    name: Build Rust library
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Rust toolchain
+        run: python3 .github/prepare_rust_env.py --export-cargo-install-env --match core/rust/qdbr/rust-toolchain.toml
+      - name: Build libquestdbr
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -eux
+          (cd core/rust/qdbr && cargo build --release --lib --target-dir ../../target/rust-maven-plugin/qdbr)
+          mkdir qdbr-native
+          cp core/target/rust-maven-plugin/qdbr/release/libquestdbr.so qdbr-native/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qdbr-native-linux-x86-64
+          path: qdbr-native
+          retention-days: 3
+
+  java:
+    name: Java (${{ matrix.name }})
+    needs: rust-library
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: griffin-root
+            include: "**/griffin/*"
+            exclude: ""
+          - name: griffin-sub
+            include: "**/griffin/**/*"
+            exclude: "**/griffin/*"
+          - name: cairo-a
+            include: "**/cairo/*,**/cairo/fuzz/**"
+            exclude: ""
+          - name: cairo-b
+            include: "**/cairo/o3/**,**/cairo/wal/**,**/cairo/mv/**,**/cairo/map/**,**/cairo/pool/**,**/cairo/view/**,**/cairo/vm/**,**/cairo/file/**,**/cairo/sql/**,**/cairo/crash/**"
+            exclude: ""
+          # the cairo packages that none of upstream's five groups names
+          - name: cairo-c
+            include: "**/cairo/**/*"
+            exclude: "**/cairo/*,**/cairo/fuzz/**,**/cairo/o3/**,**/cairo/wal/**,**/cairo/mv/**,**/cairo/map/**,**/cairo/pool/**,**/cairo/view/**,**/cairo/vm/**,**/cairo/file/**,**/cairo/sql/**,**/cairo/crash/**"
+          - name: other-a
+            include: "**/cutlass/pgwire/**,**/cutlass/http/**,**/std/*,**/std/str/**,**/std/datetime/microtime/**,**/std/fastdouble/**,**/std/bytes/**,**/log/**,**/sqllogictest/*,**/network/**"
+            exclude: ""
+          # everything else, the tls and replication packages and the compat and utils modules included
+          - name: other-b
+            include: "%regex[.*[^o].class]"
+            exclude: "**/griffin/**,**/cairo/**,**/cutlass/pgwire/**,**/cutlass/http/**,**/std/*,**/std/str/**,**/std/datetime/microtime/**,**/std/fastdouble/**,**/std/bytes/**,**/log/**,**/sqllogictest/*,**/network/**"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - uses: actions/download-artifact@v4
+        with:
+          name: qdbr-native-linux-x86-64
+          path: qdbr-native
+      - name: Raise the open file limit
+        run: sudo sysctl -w fs.file-max=500000
+      - name: Run tests
+        run: |
+          mvn clean test --batch-mode --quiet \
+            "-Dtest.include=${{ matrix.include }}" \
+            "-Dtest.exclude=${{ matrix.exclude }}" \
+            -Dout="$GITHUB_WORKSPACE/ci/qlog.conf" \
+            -DfailIfNoTests=false \
+            -Dsurefire.failIfNoSpecifiedTests=false \
+            -P build-web-console \
+            $MAVEN_RUN_OPTS \
+            -DskipNative "-Dqdbr.prebuilt.dir=$GITHUB_WORKSPACE/qdbr-native"
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-${{ matrix.name }}
+          path: |
+            **/target/surefire-reports/*.txt
+            **/hs_err_pid*.log
+          retention-days: 7
+
+  rust:
+    name: Rust tests and lints
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Rust toolchain
+        run: python3 .github/prepare_rust_env.py --export-cargo-install-env --components rustfmt clippy --match core/rust/qdbr/rust-toolchain.toml
+      - name: Clippy and fmt
+        run: |
+          set -eux
+          for crate in core/rust/qdb-core core/rust/qdb-parquet-meta core/rust/qdbr; do
+            (cd "$crate" && cargo clippy --all-targets --all-features -- -D warnings && cargo fmt --check)
+          done
+      - name: Tests
+        run: |
+          set -eux
+          export RUSTFLAGS="-D warnings"
+          for crate in core/rust/qdb-core core/rust/qdb-parquet-meta core/rust/qdbr; do
+            (cd "$crate" && cargo test --all-targets --no-fail-fast)
+          done
+          export PARQUET2_IGNORE_PYARROW_TESTS=1
+          bash ci/submodule-update.sh core/rust/parquet2/testing/parquet-testing
+          (cd core/rust/parquet2 && cargo test --all-targets --no-fail-fast)
+
+  checks:
+    name: Script checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: CI script unit test
+        run: python3 ci/test_configure_hetzner_apt_mirrors.py
+      - name: Unterminated log statements
+        run: python3 find_unterminated_logs.py core/src --exclude=LogParanoiaTest.java
+      - name: PR title checker tests
+        run: cd ci/validate-pr-title && node validate.test.js && node check.test.js
+
+  docker:
+    name: Docker TLS and replication suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      # the TLS suite talks to the server with psql, curl and openssl
+      - name: Install the suite's tools
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client openssl curl
+      - name: Build the images
+        run: |
+          set -eux
+          docker build -f core/Dockerfile --target questdb -t questdb-base:local .
+          docker build --build-arg BASE_IMAGE=questdb-base:local -t questdb-tls core/docker-tls
+      - name: TLS suite
+        run: IMAGE=questdb-tls bash core/docker-tls/test-tls.sh
+      # the TLS-only branch has no replication suite
+      - name: Replication suite
+        if: hashFiles('core/docker-tls/test-replication.sh') != ''
+        run: IMAGE=questdb-tls bash core/docker-tls/test-replication.sh
