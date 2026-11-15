@@ -549,10 +549,119 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
     }
 
     @Test
-    public void testLeaseLapsesWhenTheCoordinatorIsStuck() throws Exception {
+    public void testLeaseKeeperRenewsThroughTheShutdownDrain() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String p = nodeRoot("p");
             writeConfiguration(p, "primary");
+            final AtomicBoolean isBlocking = new AtomicBoolean();
+            final CountDownLatch blocked = new CountDownLatch(1);
+            final CountDownLatch release = new CountDownLatch(1);
+            final TestServerMain primary = startFaulty(p, blockingUploads(isBlocking, blocked, release));
+            final Thread closer = new Thread(primary::close, "test-closer");
+            try {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 0)");
+                awaitUploaded(primary, "t");
+                TestUtils.assertEventually(() -> Assert.assertEquals(1, lastTxn(readIndex(), "t")), 30);
+                isBlocking.set(true);
+                primary.execute("INSERT INTO t VALUES ('2024-01-02', 1)");
+                Assert.assertTrue("no upload started", blocked.await(30, TimeUnit.SECONDS));
+
+                // the node is stopped while that upload is in flight: the stop waits for it
+                closer.start();
+                Os.sleep(500);
+                final long sequenceAtStop = readIndex().getSequence();
+                // Another node may be waiting for this lease, and takes it after three keepalive intervals
+                // without an index write. The stop takes four here, and the lease is renewed throughout.
+                final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(4_000);
+                long previous = sequenceAtStop;
+                long previousNanos = System.nanoTime();
+                long longestGapNanos = 0;
+                while (System.nanoTime() < deadline) {
+                    final ReplicationIndex index = readIndex();
+                    Assert.assertFalse(index.isReleased());
+                    if (index.getSequence() != previous) {
+                        previous = index.getSequence();
+                        previousNanos = System.nanoTime();
+                    }
+                    longestGapNanos = Math.max(longestGapNanos, System.nanoTime() - previousNanos);
+                    Os.sleep(20);
+                }
+                Assert.assertTrue("sequence " + sequenceAtStop + " -> " + previous, previous >= sequenceAtStop + 2);
+                Assert.assertTrue("no index write for " + TimeUnit.NANOSECONDS.toMillis(longestGapNanos) + " ms", longestGapNanos < TimeUnit.MILLISECONDS.toNanos(3_000));
+                Assert.assertEquals(1, lastTxn(readIndex(), "t"));
+                Assert.assertTrue(closer.isAlive());
+            } finally {
+                release.countDown();
+                if (closer.isAlive() || closer.getState() != Thread.State.NEW) {
+                    closer.join(60_000);
+                }
+                primary.close();
+            }
+            // the stop then uploaded the rest and released the lease
+            final ReplicationIndex released = readIndex();
+            Assert.assertTrue(released.isReleased());
+            Assert.assertEquals(2, lastTxn(released, "t"));
+        });
+    }
+
+    @Test
+    public void testSlowIndexWritesDoNotLetTheLeaseLapse() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            writeConfiguration(p, "primary");
+            final AtomicBoolean isBlocking = new AtomicBoolean();
+            final AtomicBoolean isSlow = new AtomicBoolean();
+            final CountDownLatch blocked = new CountDownLatch(1);
+            final CountDownLatch release = new CountDownLatch(1);
+            final FaultyObjectStore.Hook uploads = blockingUploads(isBlocking, blocked, release);
+            try (TestServerMain primary = startFaulty(p, new FaultyObjectStore.Hook() {
+                @Override
+                public void before(String op, String key) {
+                    if (isSlow.get() && op.equals("put") && key.equals(IndexClient.INDEX_KEY)) {
+                        // the store takes 0.6 of a keepalive interval to accept an index
+                        Os.sleep(600);
+                    }
+                    uploads.before(op, key);
+                }
+            })) {
+                try {
+                    awaitRole(primary, EngineRole.PRIMARY);
+                    primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                    primary.execute("INSERT INTO t VALUES ('2024-01-01', 0)");
+                    awaitUploaded(primary, "t");
+                    TestUtils.assertEventually(() -> Assert.assertEquals(1, lastTxn(readIndex(), "t")), 30);
+                    final long sequenceBefore = readIndex().getSequence();
+                    isSlow.set(true);
+                    isBlocking.set(true);
+                    primary.execute("INSERT INTO t VALUES ('2024-01-02', 1)");
+                    Assert.assertTrue("no upload started", blocked.await(30, TimeUnit.SECONDS));
+
+                    // The lease runs from when a write was sent, so the next renewal is due from then too.
+                    // Counted from when the slow write came back, it would start too late to land in time.
+                    final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(6_000);
+                    while (System.nanoTime() < deadline) {
+                        Assert.assertEquals(EngineRole.PRIMARY, role(primary));
+                        Os.sleep(10);
+                    }
+                    Assert.assertEquals("the upload ended", 1, release.getCount());
+                    Assert.assertTrue(readIndex().getSequence() >= sequenceBefore + 3);
+                } finally {
+                    isSlow.set(false);
+                    release.countDown();
+                }
+                awaitUploaded(primary, "t");
+            }
+        });
+    }
+
+    @Test
+    public void testLeaseLapsesWhenTheCoordinatorIsStuck() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            // an upload counts as alive for as long as its size and the request timeout allow: one second here
+            writeConfiguration(p, "primary", PropertyKey.REPLICATION_REQUESTS_BASE_TIMEOUT.getPropertyPath() + "=100");
             final AtomicBoolean isBlocking = new AtomicBoolean();
             final CountDownLatch blocked = new CountDownLatch(1);
             final CountDownLatch release = new CountDownLatch(1);

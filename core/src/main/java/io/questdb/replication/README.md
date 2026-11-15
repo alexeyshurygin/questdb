@@ -130,15 +130,17 @@ them.
    current: for 2.5 keepalive intervals from the moment it sent its last index
    write that the store accepted, on its own monotonic clock. After that it is
    read-only (`PRIMARY_CATCHUP`) and uploads and deletes nothing. Every index
-   write renews the lease; when a long upload or cleanup round leaves the index
-   unwritten for one and a half keepalive intervals, a separate thread renews
-   it with an index that carries nothing new, so a slow round on a reachable
-   store does not make the primary read-only. That thread renews only while
-   replication is alive: when the coordinator neither passes through its loop
-   nor gets an answer to any upload or cleanup request for a minute (20
-   keepalive intervals or three request timeouts, if longer), the lease is left
-   to lapse, so a node that replicates nothing does not stay the writable
-   primary. A lapsed primary becomes
+   write renews the lease; when a long upload or cleanup round, the drain of a
+   graceful stop included, leaves the index unwritten for one keepalive
+   interval, a separate thread renews it with an index that carries nothing
+   new, so a slow round on a reachable store does not make the primary
+   read-only or let a waiting node take the store mid-round. That thread renews
+   only while replication is alive: the coordinator passes through its loop,
+   requests return, listings deliver keys, or an upload is within the time its
+   size and the request settings allow. When none of that happens for a minute
+   (or 20 keepalive intervals, or the time a request may take with all its
+   retries, if longer), the lease is left to lapse, so a node that replicates
+   nothing does not stay the writable primary. A lapsed primary becomes
    writable again by itself, and only through an index write the store accepts:
    the store accepts it only if no other node wrote the index in between. If one
    did, the node fences itself and leaves the store as that node wrote it. A
@@ -156,7 +158,9 @@ them.
    deposed primary cannot overwrite what its successor wrote.
 5. **Catch-up before writes.** A starting primary applies everything the store
    holds, takes the lease, and catches up again before it opens writes. While
-   the store is unreachable it stays read-only and keeps trying.
+   the store is unreachable it stays read-only and keeps trying. A table the
+   node dropped before the drop reached the store is not created again: the
+   drop goes up with the rest of the node's local tail.
 6. **Promotion guard.** A node started as primary takes a store over by itself
    only when it is that store's own primary coming back: the index names it as
    the owner and holds nothing the node lacks. Any other node (a replica being
@@ -164,7 +168,8 @@ them.
    fences itself and changes nothing in the store, unless an empty
    `_migrate_primary` file is in its install root. The node removes the file
    before it takes the store over, so the file allows one promotion; a file it
-   cannot remove stops the promotion. A role set to `primary` by mistake
+   cannot remove stops the promotion, and deleting the file while the node
+   still waits for the lease cancels it. A role set to `primary` by mistake
    therefore does no harm.
 7. **Divergence check.** A node compares its history with the store's before
    it extends either. A node starting as primary that holds a different

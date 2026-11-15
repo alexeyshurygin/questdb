@@ -128,17 +128,23 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // the WAL cleaner changed index entries it could not commit yet; coordinator thread only
     private boolean isCleanerCommitPending;
     private volatile boolean isClosed;
-    // an operator allowed this node to take over a store it does not own or is behind; read once at start
+    // an operator allowed this node to take over a store it does not own or is behind; read at start
     private volatile boolean isMigrationAllowed;
+    // this run removed the marker, on its way to a takeover that has not succeeded yet
+    private boolean isMarkerRemoved;
     // when close() began waiting for the coordinator; 0 until then
     private volatile long closeStartedNanos;
     private volatile boolean isCrashed;
+    // set when the lease is released, the coordinator ends, or close() gives up waiting for it
+    private volatile boolean isLeaseKeeperStopped;
     // guarded by indexLock
     private boolean isIndexClientClosed;
     private volatile boolean isNonDataPending;
     private volatile boolean isRestoredAtBoot;
     private volatile boolean isRunning;
     private volatile boolean isStarted;
+    // prepareUploaders() decided which dropped tables still have a drop to upload
+    private volatile boolean isUploadersPrepared;
     private io.questdb.replication.codec.CheckpointHistory checkpointHistory;
     // the index the store accepted last from this node; guarded by indexLock
     private ReplicationIndex lastCommittedIndex;
@@ -160,7 +166,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     public ReplicationService(@NotNull ReplicatedCairoEngine engine, @NotNull ObjectStore store) {
         this.engine = engine;
         this.config = engine.getReplicationConfiguration();
-        this.store = new ActivityObjectStore(store);
+        this.store = new ActivityObjectStore(store, config.getRequestBaseTimeout(), config.getMinThroughput(), config.getRetryAttempts(), config.getRetryInterval());
         this.isPrimary = config.getRole() == ReplicationRole.PRIMARY;
         final CairoConfiguration cairoConfig = engine.getConfiguration();
         this.workDir = Paths.get(cairoConfig.getInstallRoot(), ".replication").toString();
@@ -168,7 +174,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // the index bypasses the activity record: the lease keeper's own writes must not count as progress
         this.indexClient = new IndexClient(store, isChecksum);
         this.cleaner = new WalCleaner(config, this.store);
-        this.stallLimitMillis = Math.max(60_000, Math.max(20 * config.getKeepaliveInterval(), 3 * config.getRequestBaseTimeout()));
+        // longer than any request that is not an upload may take with all its attempts
+        this.stallLimitMillis = Math.max(
+                60_000,
+                Math.max(20 * config.getKeepaliveInterval(), (config.getRetryAttempts() + 2) * config.getRequestBaseTimeout())
+        );
         this.configuredCheckpointListener = cairoConfig.getCheckpointListener();
         this.pins = isPrimary ? null : new ReplicaSegmentPins(10 * 60_000L);
         this.policy = new ReplicationWalDirectoryPolicy(cairoConfig.getFilesFacade(), isPrimary ? this : null, pins);
@@ -224,6 +234,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 t.interrupt();
             }
         }
+        isLeaseKeeperStopped = true;
         final Thread keeper = leaseKeeperThread;
         if (keeper != null) {
             keeper.interrupt();
@@ -370,7 +381,13 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
         // not tracked yet: keep it, unless the table is node-local or gone
         final TableToken token = engine.getTableTokenByDirName(tableDir);
-        return token != null && ReplicationWalDirectoryPolicy.isReplicated(token);
+        if (token != null) {
+            return ReplicationWalDirectoryPolicy.isReplicated(token);
+        }
+        // A table dropped before a restart: its log holds the drop record, which the store may still
+        // lack. It stays until startup has looked: prepareUploaders() gives the table an uploader then,
+        // or leaves it to the purge job.
+        return !isUploadersPrepared && droppedToken(tableDir) != null;
     }
 
     @Override
@@ -592,6 +609,23 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             final IndexTable t = tables.getQuick(i);
             final TableToken token = engine.getTableTokenByDirName(t.getDirName());
             final TableReplayer r = replayers.computeIfAbsent(t.getKey(), TableReplayer::new);
+            if (token == null && !t.isDropped() && droppedToken(t.getDirName()) != null) {
+                // This node dropped the table and stopped before the drop reached the store. The table is
+                // not to be created again from the store: its drop goes up as the local tail, provided the
+                // store holds none of what came after it here.
+                final long local = logLastTxn(t.getDirName());
+                try {
+                    if (local <= t.getLastTxn()) {
+                        throw ReplicationException.divergence("the object store holds transactions past the drop of this table [storeLastTxn="
+                                + t.getLastTxn() + ", dropTxn=" + local + ']');
+                    }
+                    r.checkCommonPrefix(engine, t, worker(), local);
+                } catch (ReplicationException e) {
+                    LOG.critical().$("dropped table diverged from the object store [dirName=").$safe(t.getDirName()).$(", error=").$safe(e.getMessage()).I$();
+                    isClean = false;
+                }
+                continue;
+            }
             if (token != null) {
                 final long local = engine.getTableSequencerAPI().lastTxn(token);
                 if (local > t.getLastTxn()) {
@@ -626,6 +660,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private boolean commitIndex(boolean isReleased) {
         indexLock.lock();
         try {
+            if (isReleased) {
+                // under the lock, so no renewal can follow the release
+                isLeaseKeeperStopped = true;
+            }
             return isIndexWritable() && writeIndex(buildIndex(isReleased), isReleased, true);
         } finally {
             indexLock.unlock();
@@ -642,9 +680,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private boolean renewLeaseOnly(long dueNanos) {
         indexLock.lock();
         try {
-            if (!isIndexWritable() || !isRunning || !engine.isPrimaryRole() || lastCommittedIndex == null
+            if (!isIndexWritable() || isLeaseKeeperStopped || isCrashed || !engine.isPrimaryRole() || lastCommittedIndex == null
                     || System.nanoTime() - lastIndexWriteNanos < dueNanos) {
-                // stopping, fenced, or the coordinator wrote the index meanwhile
+                // released, stopped, fenced, or the coordinator wrote the index meanwhile
                 return false;
             }
             final byte[] text = lastCommittedIndex.encode();
@@ -723,7 +761,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
         sequence = idx.getSequence();
         lastCommittedIndex = idx;
-        lastIndexWriteNanos = System.nanoTime();
+        // the lease counts from when the write was sent, so the next renewal is due from then too: a
+        // write that took long must not push the next one past the end of the lease
+        lastIndexWriteNanos = writeStartNanos;
         if (!isReleased) {
             engine.renewLease(writeStartNanos + TimeUnit.MILLISECONDS.toNanos(leaseMillis()));
         }
@@ -740,22 +780,26 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     /**
      * The coordinator renews the lease with every index it commits and, when idle, every keepalive
      * interval. A long upload or cleanup round keeps it from both, and the engine refuses writes once
-     * the lease lapses. This thread renews the lease for it when no index was written for one and a
-     * half keepalive intervals, so a reachable store never makes a healthy primary read-only. The
-     * store accepts its write, like any index write, only if no other node wrote the index.
+     * the lease lapses. This thread renews the lease for it one keepalive interval after the last
+     * accepted index write was sent, which leaves one and a half intervals for the renewal to land.
+     * So a reachable store never makes a healthy primary read-only. The store accepts its write, like
+     * any index write, only if no other node wrote the index.
      * <p>
-     * It renews only for a coordinator that is alive: one that passes through its loop, or whose
-     * upload and cleanup requests keep returning. When neither happens for the stall limit, the
-     * coordinator is stuck, nothing is being replicated, and the lease is left to lapse: the node
-     * turns read-only and another node can take the store over.
+     * It runs until the lease is released or the coordinator ends, the shutdown drain included: that
+     * is the longest round of all, and a node waiting for the lease must not take it mid-drain.
+     * <p>
+     * It renews only while replication is alive: the coordinator passes through its loop, requests
+     * return, listings deliver keys, or an upload is within the time its size allows. When none of
+     * that happens for the stall limit, the coordinator is stuck, nothing is being replicated, and the
+     * lease is left to lapse: the node turns read-only and another node can take the store over.
      */
     private void leaseKeeperMain() {
-        final long dueNanos = TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval()) * 3 / 2;
+        final long dueNanos = TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval());
         final long pauseMillis = Math.max(1, config.getKeepaliveInterval() / 4);
         boolean isStalled = false;
         try {
-            while (isRunning && engine.isPrimaryRole()) {
-                final long idleNanos = System.nanoTime() - store.getLastActivityNanos();
+            while (!isLeaseKeeperStopped && !isCrashed && engine.isPrimaryRole()) {
+                final long idleNanos = store.getIdleNanos();
                 if (idleNanos >= TimeUnit.MILLISECONDS.toNanos(stallLimitMillis)) {
                     if (!isStalled) {
                         isStalled = true;
@@ -918,13 +962,30 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             return engine.getTableSequencerAPI().lastTxn(token);
         } catch (CairoException e) {
             // a dropped table: read the log itself, which the drop leaves in place until it is uploaded
-            final TxnLogReader r = worker().getTxnLogReader();
-            try {
-                return r.of(engine.getConfiguration().getDbRoot(), token.getDirName()).getMaxTxn();
-            } finally {
-                r.closeFiles();
+            return logLastTxn(token.getDirName());
+        }
+    }
+
+    // the last transaction in the sequencer log of a table directory, read from the log files
+    private long logLastTxn(CharSequence dirName) {
+        final TxnLogReader r = worker().getTxnLogReader();
+        try {
+            return r.of(engine.getConfiguration().getDbRoot(), dirName).getMaxTxn();
+        } finally {
+            r.closeFiles();
+        }
+    }
+
+    // the token of a table this node dropped and whose directory the purge job has not removed yet
+    private @Nullable TableToken droppedToken(CharSequence dirName) {
+        final io.questdb.cairo.TableNameRegistry registry = engine.getTableNameRegistry();
+        if (registry.isWalTableDropped(dirName)) {
+            final TableToken token = registry.getTokenByDirName(dirName);
+            if (token != null && ReplicationWalDirectoryPolicy.isReplicated(token)) {
+                return token;
             }
         }
+        return null;
     }
 
     private void prepareUploaders(@Nullable ReplicationIndex idx) {
@@ -961,8 +1022,20 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // tables dropped or gone meanwhile stay listed until the cleaner removes them
         retainedEntries.clear();
         for (IndexTable t : stored.values()) {
+            final TableToken dropped = t.isDropped() ? null : droppedToken(t.getDirName());
+            if (dropped != null) {
+                // dropped here before the drop reached the store: the rest of its log goes up, the drop
+                // record last, so that replicas drop the table too
+                final TableUploader u = new TableUploader(dropped, t, true);
+                u.setStartupLastTxn(logLastTxn(t.getDirName()), path, engine.getConfiguration().getDbRoot(), engine.getConfiguration().getFilesFacade());
+                registerUploader(t.getDirName(), u);
+                dirtyTables.put(t.getDirName(), Boolean.TRUE);
+                LOG.advisory().$("table was dropped before its drop was uploaded, uploading it now [table=").$(dropped).I$();
+                continue;
+            }
             retainedEntries.put(t.getDirName(), t);
         }
+        isUploadersPrepared = true;
     }
 
     private TableUploader newUploader(TableToken token, long localLastTxn) {
@@ -1108,6 +1181,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 }
                 epoch = (idx != null ? idx.getEpoch() : 0) + 1;
                 sequence = idx != null ? idx.getSequence() : 0;
+                isUploadersPrepared = false;
                 uploaders.clear();
                 prepareUploaders(idx);
                 for (TableUploader u : uploaders.values()) {
@@ -1225,6 +1299,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final long closeStarted = closeStartedNanos;
         final long deadline = (closeStarted != 0 ? closeStarted : System.nanoTime()) + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() / 2);
         while (System.nanoTime() < deadline) {
+            store.touch();
             final long uploaded = primaryRound(true);
             if (uploaded == 0 || dirtyTables.isEmpty() || !engine.isPrimaryRole()) {
                 break;
@@ -1278,7 +1353,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      * restored copy started with the wrong role, therefore changes nothing in the store.
      */
     private void checkMayBecomePrimary(ReplicationIndex idx) {
-        if (isMigrationAllowed) {
+        // The marker counts while it is there: an operator who deletes it while the node still waits
+        // for the lease takes the permission back. Once this run removed it, on its way to a takeover
+        // that another node's write then foiled, the permission stays for this run.
+        if (isMigrationAllowed && (isMarkerRemoved || Files.exists(Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE)))) {
             return;
         }
         final String why;
@@ -1303,6 +1381,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final java.nio.file.Path marker = Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE);
         try {
             if (Files.deleteIfExists(marker)) {
+                isMarkerRemoved = true;
                 LOG.advisory().$("replication removed ").$(MIGRATE_PRIMARY_FILE).$(", this node becomes the primary").$();
             }
             return true;
@@ -1320,7 +1399,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             final IndexTable t = tables.getQuick(i);
             final TableToken token = engine.getTableTokenByDirName(t.getDirName());
             if (token == null) {
-                if (!t.isDropped()) {
+                // a table this node dropped itself is ahead of the store, not behind it
+                if (!t.isDropped() && droppedToken(t.getDirName()) == null) {
                     return t.getTableName();
                 }
             } else if (t.isDropped() || engine.getTableSequencerAPI().lastTxn(token) < t.getLastTxn()) {
@@ -1632,6 +1712,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 fence(th instanceof ReplicationException ? th.getMessage() : "replication coordinator failed: " + th.getMessage());
             }
         } finally {
+            // nobody is left to upload: the lease keeper must not hold the lease for this node
+            isLeaseKeeperStopped = true;
             releaseWorkerOfThisThread();
             Path.clearThreadLocals();
         }

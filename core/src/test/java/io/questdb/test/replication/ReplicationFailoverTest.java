@@ -93,6 +93,104 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testCrashedPrimaryCarriesItsUnuploadedDropToTheStore() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            writeConfiguration(a, "primary");
+            writeConfiguration(b, "replica");
+            final java.util.concurrent.atomic.AtomicBoolean isStoreDown = new java.util.concurrent.atomic.AtomicBoolean();
+            try (TestServerMain nodeB = start(b)) {
+                try (TestServerMain nodeA = start(a, new FaultyObjectStore.Hook() {
+                    @Override
+                    public void before(String op, String key) {
+                        if (isStoreDown.get()) {
+                            throw io.questdb.replication.store.ObjectStoreException.retryable("injected store outage", null);
+                        }
+                    }
+                })) {
+                    awaitRole(nodeA, EngineRole.PRIMARY);
+                    nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                    nodeA.execute("CREATE TABLE keep (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                    nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                    nodeA.execute("INSERT INTO keep VALUES ('2024-01-01', 1)");
+                    awaitSame(nodeA, nodeB, "t");
+                    awaitSame(nodeA, nodeB, "keep");
+                    // the store goes away, a client drops the table, and the node dies with the drop local
+                    isStoreDown.set(true);
+                    nodeA.execute("DROP TABLE t");
+                    nodeA.getReplicationService().crashForTesting();
+                }
+                final io.questdb.replication.codec.ReplicationIndex before = readIndex();
+                Assert.assertFalse(entryOf(before, "t").isDropped());
+                Assert.assertNotNull(nodeB.getEngine().getTableTokenIfExists("t"));
+
+                // It comes back as the store's own primary. It is ahead of the store, not behind it: it
+                // needs no marker, does not create the table again, and uploads the drop
+                writeConfiguration(a, "primary");
+                try (TestServerMain nodeA = start(a)) {
+                    awaitRole(nodeA, EngineRole.PRIMARY);
+                    Assert.assertNull(nodeA.getEngine().getTableTokenIfExists("t"));
+                    TestUtils.assertEventually(() -> Assert.assertTrue(entryOf(readIndex(), "t").isDropped()), 60);
+                    // the replica drops it too, and keeps following the other table
+                    TestUtils.assertEventually(() -> Assert.assertNull(nodeB.getEngine().getTableTokenIfExists("t")), 60);
+                    nodeA.execute("INSERT INTO keep VALUES ('2024-01-02', 2)");
+                    awaitSame(nodeA, nodeB, "keep");
+                    nodeB.assertSql("SELECT count() n FROM keep", "n\n2\n");
+                    // the name is free again on both nodes
+                    nodeA.execute("CREATE TABLE t (ts TIMESTAMP, s SYMBOL) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                    nodeA.execute("INSERT INTO t VALUES ('2024-02-01', 'again')");
+                    awaitSame(nodeA, nodeB, "t");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testMarkerWithdrawnWhileWaitingForTheLeaseCancelsThePromotion() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            writeConfiguration(a, "primary");
+            writeConfiguration(b, "replica");
+            final String ownerA;
+            try (TestServerMain nodeA = start(a); TestServerMain nodeB = start(b)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitSame(nodeA, nodeB, "t");
+                ownerA = nodeA.getReplicationService().getInstanceId();
+                nodeA.getReplicationService().crashForTesting();
+            }
+            final long sequenceA = readIndex().getSequence();
+
+            // b is told to take over and waits for a's lease. The operator changes their mind and deletes
+            // the marker before the lease runs out
+            writeConfiguration(b, "primary");
+            allowPromotion(b);
+            final java.nio.file.Path marker = java.nio.file.Paths.get(b, io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE);
+            final AtomicInteger decisions = new AtomicInteger();
+            try (TestServerMain nodeB = start(b)) {
+                nodeB.getReplicationService().setTakeoverHookForTesting(() -> {
+                    if (decisions.incrementAndGet() == 1) {
+                        try {
+                            java.nio.file.Files.delete(marker);
+                        } catch (java.io.IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
+                });
+                awaitRole(nodeB, EngineRole.FENCED);
+                final String reason = ((io.questdb.replication.ReplicatedCairoEngine) nodeB.getEngine()).getFenceReason();
+                TestUtils.assertContains(reason, "the object store belongs to another primary [owner=" + ownerA + ']');
+                Assert.assertEquals(1, decisions.get());
+            }
+            Assert.assertEquals(ownerA, readIndex().getOwnerInstanceId());
+            Assert.assertEquals(sequenceA, readIndex().getSequence());
+        });
+    }
+
+    @Test
     public void testCrashedPrimaryRestartsAndUploadsItsTail() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = nodeRoot("a");
@@ -744,5 +842,18 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
             idx.setOwner(owner, idx.getEpoch(), idx.getRenewedAt() + 1, idx.getSequence() + 1, false);
             client.write(idx, 1);
         }
+    }
+
+    private static io.questdb.replication.codec.IndexTable entryOf(io.questdb.replication.codec.ReplicationIndex index, String tableName) {
+        io.questdb.replication.codec.IndexTable found = null;
+        for (int i = 0, n = index.getTables().size(); i < n; i++) {
+            final io.questdb.replication.codec.IndexTable t = index.getTables().getQuick(i);
+            // a name can be listed twice: a dropped table and its successor; the oldest comes first
+            if (t.getTableName().equals(tableName) && found == null) {
+                found = t;
+            }
+        }
+        Assert.assertNotNull("the index does not list " + tableName, found);
+        return found;
     }
 }
