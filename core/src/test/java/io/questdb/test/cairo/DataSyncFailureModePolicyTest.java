@@ -256,6 +256,9 @@ public class DataSyncFailureModePolicyTest extends AbstractCairoTest {
         // (TableSequencerAPI) applies the V1/V2 open's own rule through the same resolution. Composite-partition
         // writes (O3PartitionJob's geometry and piece flushes) take the writer's flush grade, and the compaction
         // job (PartitionCompactionScanJob) the engine's resolved mode, so neither reads the configured mode.
+        // K, object-store replication: the uploader's durable target (ReplicationService), and the replay of
+        // shipped transactions, which flushes what it writes as a local writer would (TableReplayer,
+        // ReplicaTableApplier). A replica keeps flushing under the configured mode: it may be restarted as primary.
         // A new file reading the configured mode needs classification here before it can bypass the policy.
         Assert.assertEquals(
                 "[BitmapIndexWriter.java, CairoConfiguration.java, CairoConfigurationWrapper.java, CairoEngine.java, "
@@ -265,8 +268,8 @@ public class DataSyncFailureModePolicyTest extends AbstractCairoTest {
                         + "LiveViewCheckpointMetaSegmentWriter.java, LiveViewCheckpointRepairMarker.java, "
                         + "LiveViewCheckpointRepairState.java, LiveViewCheckpointSuperblock.java, LiveViewRefreshJob.java, "
                         + "MemoryPMARImpl.java, ParallelCsvFileImporter.java, PostingIndexWriter.java, PropServerConfiguration.java, "
-                        + "RecoveryCoordinator.java, SequencerMetadata.java, SettingsStore.java, SqlCompilerImpl.java, "
-                        + "TableConverter.java, TableSequencerAPI.java, TableSequencerImpl.java, TableSnapshotRestore.java, TableTransactionLog.java, "
+                        + "RecoveryCoordinator.java, ReplicaTableApplier.java, ReplicationService.java, SequencerMetadata.java, SettingsStore.java, "
+                        + "SqlCompilerImpl.java, TableConverter.java, TableReplayer.java, TableSequencerAPI.java, TableSequencerImpl.java, TableSnapshotRestore.java, TableTransactionLog.java, "
                         + "TableTransactionLogV1.java, TableTransactionLogV2.java, TableUtils.java, TableWriter.java, TxWriter.java, ViewWalWriter.java, "
                         + "WalEventWriter.java, WalPurgeJob.java, WalUtils.java, WalWriter.java, WalWriterBase.java]"
                         + (hasEnterpriseSources() ?

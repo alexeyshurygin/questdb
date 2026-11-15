@@ -33,7 +33,9 @@ public class PropertyKeyTest {
     @Test
     public void testSensitiveFlag() {
         for (PropertyKey propKey : PropertyKey.values()) {
-            Assert.assertEquals(propKey.getPropertyPath().contains(".password"), propKey.isSensitive());
+            // the object store string carries the store's secret access key
+            final boolean isSecret = propKey.getPropertyPath().contains(".password") || propKey == PropertyKey.REPLICATION_OBJECT_STORE;
+            Assert.assertEquals(propKey.getPropertyPath(), isSecret, propKey.isSensitive());
         }
     }
 }
