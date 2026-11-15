@@ -106,10 +106,14 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private final ObjectStore store;
     private final ConcurrentHashMap<String, TableUploader> uploaders = new ConcurrentHashMap<>();
     private final Condition wakeUp = lock.newCondition();
+    // objects the WAL cleaner could not delete, or did not get to; coordinator thread only
+    private final List<String> pendingDeletes = new ArrayList<>();
     private final ThreadLocal<ReplicationWorker> workerSlot = new ThreadLocal<>();
     private final String workDir;
     private volatile long epoch;
     private volatile String instanceId;
+    // the WAL cleaner changed index entries it could not commit yet; coordinator thread only
+    private boolean isCleanerCommitPending;
     private volatile boolean isClosed;
     private volatile boolean isCrashed;
     private volatile boolean isNonDataPending;
@@ -1056,9 +1060,19 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     private void runCleaner() {
+        if (isCleanerCommitPending) {
+            // an earlier run changed the entries in memory and could not commit them
+            if (!commitIndex(false)) {
+                return;
+            }
+            isCleanerCommitPending = false;
+        }
         final ReplicationWorker w = worker();
         final Map<String, Long> cutoffs = config.isCleanerCheckpointSource() ? cleaner.computeCutoffs(w) : null;
-        final List<String> keys = new ArrayList<>();
+        // what earlier runs could not delete goes first: no index names those objects any more, so no
+        // later plan would find them
+        final List<String> keys = new ArrayList<>(pendingDeletes);
+        pendingDeletes.clear();
         boolean isIndexChanged = false;
         if (cutoffs != null) {
             for (TableUploader u : uploaders.values()) {
@@ -1101,6 +1115,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
         // the index stops naming the objects before they go
         if (isIndexChanged && !commitIndex(false)) {
+            pendingDeletes.addAll(keys);
+            isCleanerCommitPending = true;
             return;
         }
         deleteObjects(keys);
@@ -1117,29 +1133,38 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final int concurrency = Math.max(1, config.getCleanerDeleteConcurrency());
         final long startNanos = System.nanoTime();
         int deleted = 0;
-        for (int i = 0, n = keys.size(); i < n && isRunning; i += concurrency) {
+        int next = 0;
+        for (int n = keys.size(); next < n && isRunning; next += concurrency) {
+            final int i = next;
             final List<Future<?>> futures = new ArrayList<>();
             for (int j = i; j < Math.min(n, i + concurrency); j++) {
                 final String key = keys.get(j);
                 futures.add(executor.submit(() -> store.delete(key)));
             }
-            for (Future<?> f : futures) {
+            for (int j = 0, m = futures.size(); j < m; j++) {
                 try {
-                    f.get();
+                    futures.get(j).get();
                     deleted++;
                 } catch (Exception e) {
-                    LOG.error().$("could not delete an object, the next run retries [error=").$(e.getCause() != null ? e.getCause() : e).I$();
+                    pendingDeletes.add(keys.get(i + j));
+                    LOG.error().$("could not delete an object, the next run retries [key=").$safe(keys.get(i + j))
+                            .$(", error=").$(e.getCause() != null ? e.getCause() : e).I$();
                 }
             }
             if (rps > 0) {
-                final long dueNanos = startNanos + TimeUnit.SECONDS.toNanos(Math.min(n, i + concurrency)) / rps;
+                final long dueNanos = startNanos + TimeUnit.SECONDS.toNanos(Math.min(keys.size(), i + concurrency)) / rps;
                 final long sleepNanos = dueNanos - System.nanoTime();
                 if (sleepNanos > 0) {
                     sleepQuietly(TimeUnit.NANOSECONDS.toMillis(sleepNanos) + 1);
                 }
             }
         }
-        LOG.info().$("WAL cleaner deleted objects [count=").$(deleted).$(", requested=").$(keys.size()).I$();
+        // a stop cut the run short: the rest waits for the next one
+        for (int n = keys.size(); next < n; next++) {
+            pendingDeletes.add(keys.get(next));
+        }
+        LOG.info().$("WAL cleaner deleted objects [count=").$(deleted).$(", requested=").$(keys.size())
+                .$(", left=").$(pendingDeletes.size()).I$();
     }
 
     private void uploadCheckpointHistory() {

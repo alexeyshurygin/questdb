@@ -156,6 +156,46 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testFailedCleanerDeletesAreRetried() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            writeConfiguration(
+                    p, "primary",
+                    PropertyKey.REPLICATION_PRIMARY_CLEANER_INTERVAL.getPropertyPath() + "=1s",
+                    PropertyKey.REPLICATION_PRIMARY_CLEANER_DROPPED_TABLE_COOLOFF.getPropertyPath() + "=0"
+            );
+            // the store refuses the first three deletes
+            final AtomicInteger deleteFailures = new AtomicInteger();
+            final java.util.Set<String> refused = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            try (TestServerMain primary = startFaulty(p, new FaultyObjectStore.Hook() {
+                @Override
+                public void before(String op, String key) {
+                    if (op.equals("delete") && key.startsWith("t/") && deleteFailures.getAndDecrement() > 0) {
+                        refused.add(key);
+                        throw ObjectStoreException.fatal("injected delete failure");
+                    }
+                }
+            })) {
+                awaitRole(primary, EngineRole.PRIMARY);
+                primary.execute("CREATE TABLE gone (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO gone VALUES ('2024-01-01', 1)");
+                awaitUploaded(primary, "gone");
+                final String key = primary.getEngine().getTableTokenIfExists("gone").getTableId() + "_";
+                Assert.assertTrue(tableObjects(key) >= 3);
+
+                deleteFailures.set(3);
+                primary.execute("DROP TABLE gone");
+                TestUtils.assertEventually(() -> Assert.assertTrue(deleteFailures.get() < 0), 30);
+                Assert.assertEquals(3, refused.size());
+                // by now no index names the table: only the cleaner's own memory of the refused keys
+                // brings a later run back to them
+                TestUtils.assertEventually(() -> Assert.assertEquals(0, tableObjects(key)), 30);
+                Assert.assertEquals(EngineRole.PRIMARY, role(primary));
+            }
+        });
+    }
+
+    @Test
     public void testFailedDrainAtShutdownIsUploadedAfterRestart() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String p = nodeRoot("p");
@@ -524,6 +564,18 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
             final byte[] text = new byte[(int) raw.size()];
             io.questdb.std.Unsafe.copyMemory(null, raw.ptr(), text, io.questdb.std.Unsafe.BYTE_OFFSET, text.length);
             return io.questdb.replication.codec.CheckpointHistory.decode(text, 0, text.length);
+        }
+    }
+
+    // the number of objects the store holds for a table
+    private long tableObjects(String tableKeyPrefix) throws Exception {
+        final java.nio.file.Path tablesDir = java.nio.file.Paths.get(storeRoot, "t");
+        if (!java.nio.file.Files.exists(tablesDir)) {
+            return 0;
+        }
+        try (java.util.stream.Stream<java.nio.file.Path> files = java.nio.file.Files.walk(tablesDir)) {
+            return files.filter(f -> java.nio.file.Files.isRegularFile(f)
+                    && tablesDir.relativize(f).toString().startsWith(tableKeyPrefix)).count();
         }
     }
 

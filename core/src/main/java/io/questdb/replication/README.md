@@ -113,12 +113,17 @@ them.
    `readonly=true` combined with a role stops the server at startup.
 9. **Asynchronous.** A transaction is acknowledged before it is uploaded. If the
    primary dies, the transactions of its last throttle window can be lost, as
-   in QuestDB Enterprise.
+   in QuestDB Enterprise. A primary that cannot reach the object store keeps
+   accepting writes and uploads them when the store is back; if another node
+   was promoted meanwhile, the old primary fences itself at its next index
+   write and what it accepted since its last upload is not replicated.
 
 ## Promotion
 
-1. Stop the primary (a graceful stop uploads what is committed and releases the
-   lease), or lose it.
+1. Stop the primary, or lose it. A graceful stop uploads everything that is
+   committed and then releases the lease. If it cannot upload all of it (the
+   store is unreachable, the stop times out), it leaves the lease to expire, so
+   a released lease always means a complete store.
 2. Restart the replica with `replication.role=primary`. It catches up, takes the
    lease (at once after a graceful stop, after three keepalive intervals
    otherwise) and opens writes.
@@ -152,7 +157,10 @@ point every instance's newest `replication.primary.cleaner.backup.window.count`
 checkpoints have passed, raising the table's first transaction in the index
 before it deletes anything, and deletes dropped tables after
 `replication.primary.cleaner.dropped.table.cooloff`. Until an instance records
-that many checkpoints, nothing is cleaned.
+that many checkpoints, nothing is cleaned. The cleaner retries a deletion that
+fails on its next run. It keeps that list in memory: a primary that restarts
+before the retry leaves those objects in the store, where no index names them
+any more.
 
 ## Not in this version
 
