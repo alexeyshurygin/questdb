@@ -120,6 +120,8 @@ them.
    the lease was released by a graceful stop, or the index has not changed for
    three keepalive intervals. The taking node counts those on its own monotonic
    clock with its own setting, so give every node the same keepalive interval.
+   A node that waited replaces only the index version it watched: if the owner
+   writes again before the takeover, the node starts waiting again.
    The object store enforces none of this: it only compares versions. A
    released index still names the primary that released it. A node that
    restarts with the instance id of the current owner takes over without
@@ -127,7 +129,11 @@ them.
 2. **Lease-bound writes.** A primary accepts writes only while its lease is
    current: for 2.5 keepalive intervals from the moment it sent its last index
    write that the store accepted, on its own monotonic clock. After that it is
-   read-only (`PRIMARY_CATCHUP`) and uploads and deletes nothing. It becomes
+   read-only (`PRIMARY_CATCHUP`) and uploads and deletes nothing. Every index
+   write renews the lease; when a long upload or cleanup round leaves the index
+   unwritten for one and a half keepalive intervals, a separate thread renews
+   it with an index that carries nothing new, so a slow round on a reachable
+   store does not make the primary read-only. A lapsed primary becomes
    writable again by itself, and only through an index write the store accepts:
    the store accepts it only if no other node wrote the index in between. If one
    did, the node fences itself and leaves the store as that node wrote it. A
@@ -152,8 +158,9 @@ them.
    promoted, a restored copy, a primary that lost transactions the store holds)
    fences itself and changes nothing in the store, unless an empty
    `_migrate_primary` file is in its install root. The node removes the file
-   once it is the primary, so the file allows one promotion. A role set to
-   `primary` by mistake therefore does no harm.
+   before it takes the store over, so the file allows one promotion; a file it
+   cannot remove stops the promotion. A role set to `primary` by mistake
+   therefore does no harm.
 7. **Divergence check.** A node compares its history with the store's before
    it extends either. A node starting as primary that holds a different
    transaction at the same number (a crashed primary with transactions it never
@@ -184,7 +191,7 @@ them.
 2. Create an empty `_migrate_primary` file in the replica's install root and
    restart the replica with `replication.role=primary`. It catches up, takes the
    lease (at once after a graceful stop, after three keepalive intervals
-   otherwise), opens writes and removes the file. Without the file it fences
+   otherwise), removes the file and opens writes. Without the file it fences
    itself, and its log names the file and the directory it expects it in.
 3. Restart the former primary with `replication.role=replica` to make it follow
    the new primary. If it had transactions it never uploaded, the tables they

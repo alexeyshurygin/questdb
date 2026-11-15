@@ -34,6 +34,10 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.File;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Restarts, promotion, lease takeover and divergence between two nodes.
@@ -356,6 +360,112 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testMarkerThatCannotBeRemovedStopsThePromotion() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            writeConfiguration(a, "primary");
+            writeConfiguration(b, "replica");
+            try (TestServerMain nodeA = start(a); TestServerMain nodeB = start(b)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitSame(nodeA, nodeB, "t");
+            }
+            final io.questdb.replication.codec.ReplicationIndex released = readIndex();
+
+            // a marker the server cannot delete: a directory that is not empty. It would allow every later
+            // promotion too, so the node refuses this one and leaves the store alone
+            final java.nio.file.Path marker = java.nio.file.Paths.get(b, io.questdb.replication.ReplicationService.MIGRATE_PRIMARY_FILE);
+            java.nio.file.Files.createDirectory(marker);
+            java.nio.file.Files.createFile(marker.resolve("keep"));
+            writeConfiguration(b, "primary");
+            try (TestServerMain nodeB = start(b)) {
+                awaitRole(nodeB, EngineRole.FENCED);
+                final String reason = ((io.questdb.replication.ReplicatedCairoEngine) nodeB.getEngine()).getFenceReason();
+                TestUtils.assertContains(reason, "could not remove " + marker);
+                TestUtils.assertContains(reason, "remove it and restart this node");
+                assertWriteRefused(nodeB, "INSERT INTO t VALUES ('2024-01-02', 2)");
+            }
+            Assert.assertTrue(java.nio.file.Files.exists(marker.resolve("keep")));
+            final io.questdb.replication.codec.ReplicationIndex untouched = readIndex();
+            Assert.assertEquals(released.getSequence(), untouched.getSequence());
+            Assert.assertEquals(released.getOwnerInstanceId(), untouched.getOwnerInstanceId());
+            Assert.assertEquals(released.getEpoch(), untouched.getEpoch());
+            Assert.assertTrue(untouched.isReleased());
+
+            // with a marker it can remove, the node is promoted
+            java.nio.file.Files.delete(marker.resolve("keep"));
+            java.nio.file.Files.delete(marker);
+            allowPromotion(b);
+            writeConfiguration(b, "primary");
+            try (TestServerMain nodeB = start(b)) {
+                awaitRole(nodeB, EngineRole.PRIMARY);
+                Assert.assertFalse(java.nio.file.Files.exists(marker));
+                Assert.assertEquals(nodeB.getReplicationService().getInstanceId(), readIndex().getOwnerInstanceId());
+            }
+        });
+    }
+
+    @Test
+    public void testTakeoverStartsOverWhenTheOwnerWritesAgain() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            writeConfiguration(a, "primary");
+            writeConfiguration(b, "replica");
+            final String ownerA;
+            try (TestServerMain nodeA = start(a); TestServerMain nodeB = start(b)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitSame(nodeA, nodeB, "t");
+                ownerA = nodeA.getReplicationService().getInstanceId();
+                // a dies: its lease stays held
+                nodeA.getReplicationService().crashForTesting();
+            }
+            final long sequenceA = readIndex().getSequence();
+            Assert.assertEquals(ownerA, readIndex().getOwnerInstanceId());
+            Assert.assertFalse(readIndex().isReleased());
+
+            writeConfiguration(b, "primary");
+            allowPromotion(b);
+            final AtomicInteger decisions = new AtomicInteger();
+            final AtomicLong firstDecisionNanos = new AtomicLong();
+            final AtomicLong secondDecisionNanos = new AtomicLong();
+            final AtomicReference<String> ownerAtSecondDecision = new AtomicReference<>();
+            final AtomicLong sequenceAtSecondDecision = new AtomicLong();
+            try (TestServerMain nodeB = start(b)) {
+                // b waits three keepalive intervals for a's lease, so the hook is in place in time
+                nodeB.getReplicationService().setTakeoverHookForTesting(() -> {
+                    final int decision = decisions.incrementAndGet();
+                    if (decision == 1) {
+                        // b saw the index unchanged for the whole wait and decided to take over. Right
+                        // then a turns out to be alive: it renews its lease
+                        firstDecisionNanos.set(System.nanoTime());
+                        renewIndexAs(ownerA);
+                    } else if (decision == 2) {
+                        secondDecisionNanos.set(System.nanoTime());
+                        final io.questdb.replication.codec.ReplicationIndex idx = readIndex();
+                        ownerAtSecondDecision.set(idx.getOwnerInstanceId());
+                        sequenceAtSecondDecision.set(idx.getSequence());
+                    }
+                });
+                awaitRole(nodeB, EngineRole.PRIMARY);
+                // b did not replace the renewed index: it waited for a's lease once more, in full
+                Assert.assertEquals(2, decisions.get());
+                Assert.assertEquals(ownerA, ownerAtSecondDecision.get());
+                Assert.assertEquals(sequenceA + 1, sequenceAtSecondDecision.get());
+                final long waitedMillis = TimeUnit.NANOSECONDS.toMillis(secondDecisionNanos.get() - firstDecisionNanos.get());
+                Assert.assertTrue("waited " + waitedMillis + " ms", waitedMillis >= 3_000);
+                Assert.assertEquals(nodeB.getReplicationService().getInstanceId(), readIndex().getOwnerInstanceId());
+                nodeB.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                awaitUploaded(nodeB, "t");
+            }
+        });
+    }
+
+    @Test
     public void testPromotionNeedsTheMigrationMarker() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = nodeRoot("a");
@@ -579,6 +689,20 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
                 throw e;
             }
             TestUtils.assertContains(e.getCause().getMessage(), CairoException.READ_ONLY_ACCESS_MESSAGE);
+        }
+    }
+
+    // what a live owner's keepalive does: the same index again, under the next sequence
+    private void renewIndexAs(String owner) {
+        try (io.questdb.replication.store.FsObjectStore store = new io.questdb.replication.store.FsObjectStore(
+                io.questdb.replication.store.ObjectStoreSettings.parse("fs::root=" + storeRoot + ';'),
+                new io.questdb.replication.ReplicationConfigurationImpl());
+             io.questdb.replication.IndexClient client = new io.questdb.replication.IndexClient(store, true)) {
+            final io.questdb.replication.codec.ReplicationIndex idx = client.read();
+            Assert.assertNotNull(idx);
+            Assert.assertEquals(owner, idx.getOwnerInstanceId());
+            idx.setOwner(owner, idx.getEpoch(), idx.getRenewedAt() + 1, idx.getSequence() + 1, false);
+            client.write(idx, 1);
         }
     }
 }

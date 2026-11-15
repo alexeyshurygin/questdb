@@ -36,11 +36,14 @@ import io.questdb.replication.store.FsObjectStore;
 import io.questdb.replication.store.ObjectStore;
 import io.questdb.replication.store.ObjectStoreException;
 import io.questdb.replication.store.ObjectStoreSettings;
+import io.questdb.std.Os;
 import io.questdb.test.TestServerMain;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -494,6 +497,104 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testLeaseKeeperFencesAPrimaryDeposedDuringALongRound() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            writeConfiguration(p, "primary");
+            final AtomicBoolean isBlocking = new AtomicBoolean();
+            final CountDownLatch blocked = new CountDownLatch(1);
+            final CountDownLatch release = new CountDownLatch(1);
+            final long foreignSequence;
+            try (TestServerMain primary = startFaulty(p, blockingUploads(isBlocking, blocked, release))) {
+                try {
+                    awaitRole(primary, EngineRole.PRIMARY);
+                    primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                    awaitUploaded(primary, "t");
+                    isBlocking.set(true);
+                    primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                    Assert.assertTrue("no upload started", blocked.await(30, TimeUnit.SECONDS));
+
+                    // another node takes the store over while this one is stuck in its upload
+                    writeForeignIndex();
+                    foreignSequence = readIndex().getSequence();
+                    // the coordinator cannot notice: it waits for the upload. The keeper's renewal does.
+                    awaitRole(primary, EngineRole.FENCED);
+                    Assert.assertEquals("the upload ended", 1, release.getCount());
+                    TestUtils.assertContains(((io.questdb.replication.ReplicatedCairoEngine) primary.getEngine()).getFenceReason(), "lost its lease");
+                    try {
+                        primary.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                        Assert.fail("a fenced primary must refuse writes");
+                    } catch (Throwable e) {
+                        TestUtils.assertContains(String.valueOf(e.getMessage()) + e.getCause(), io.questdb.cairo.CairoException.READ_ONLY_ACCESS_MESSAGE);
+                    }
+                } finally {
+                    release.countDown();
+                }
+            }
+            // the upload that was in flight ended after the takeover: the index is as the other node left it
+            final ReplicationIndex index = readIndex();
+            Assert.assertEquals("another-primary", index.getOwnerInstanceId());
+            Assert.assertEquals(foreignSequence, index.getSequence());
+        });
+    }
+
+    @Test
+    public void testLongRoundDoesNotMakeAHealthyPrimaryReadOnly() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String p = nodeRoot("p");
+            final String r = nodeRoot("r");
+            writeConfiguration(p, "primary");
+            writeConfiguration(r, "replica");
+            final AtomicBoolean isBlocking = new AtomicBoolean();
+            final CountDownLatch blocked = new CountDownLatch(1);
+            final CountDownLatch release = new CountDownLatch(1);
+            try (TestServerMain primary = startFaulty(p, blockingUploads(isBlocking, blocked, release))) {
+                try {
+                    awaitRole(primary, EngineRole.PRIMARY);
+                    primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                    primary.execute("INSERT INTO t VALUES ('2024-01-01', 0)");
+                    awaitUploaded(primary, "t");
+                    TestUtils.assertEventually(() -> Assert.assertEquals(1, lastTxn(readIndex(), "t")), 30);
+                    final ReplicationIndex before = readIndex();
+                    final long uploadedBefore = lastTxn(before, "t");
+
+                    // an upload that takes four keepalive intervals: longer than the lease of two and a half
+                    isBlocking.set(true);
+                    primary.execute("INSERT INTO t VALUES ('2024-01-02', 0)");
+                    Assert.assertTrue("no upload started", blocked.await(30, TimeUnit.SECONDS));
+                    final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(4_000);
+                    int inserted = 0;
+                    while (System.nanoTime() < deadline) {
+                        // the store answers, so the node never stops being the writable primary
+                        Assert.assertEquals(EngineRole.PRIMARY, role(primary));
+                        if (inserted < 8) {
+                            primary.execute("INSERT INTO t VALUES ('2024-01-02', " + ++inserted + ")");
+                        }
+                        Os.sleep(20);
+                    }
+                    Assert.assertEquals("the upload ended", 1, release.getCount());
+
+                    // the lease was renewed meanwhile, by index writes that carry nothing of the upload in flight
+                    final ReplicationIndex during = readIndex();
+                    Assert.assertTrue("sequence " + before.getSequence() + " -> " + during.getSequence(), during.getSequence() >= before.getSequence() + 2);
+                    Assert.assertEquals(before.getOwnerInstanceId(), during.getOwnerInstanceId());
+                    Assert.assertEquals(before.getEpoch(), during.getEpoch());
+                    Assert.assertFalse(during.isReleased());
+                    Assert.assertEquals(uploadedBefore, lastTxn(during, "t"));
+                } finally {
+                    release.countDown();
+                }
+                // the round ends and commits everything, and a replica reads the same rows
+                awaitUploaded(primary, "t");
+                try (TestServerMain replica = start(r)) {
+                    awaitSame(primary, replica, "t");
+                    replica.assertSql("SELECT count() n FROM t", "n\n10\n");
+                }
+            }
+        });
+    }
+
+    @Test
     public void testPrimaryWithLapsedLeaseTouchesNothingAfterATakeover() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String p = nodeRoot("p");
@@ -917,6 +1018,32 @@ public class ReplicationFaultTest extends AbstractReplicationTest {
     }
 
     // commits an index owned by another instance, as a second primary would
+    // a store whose WAL data uploads wait for the latch while isBlocking is set
+    private static FaultyObjectStore.Hook blockingUploads(AtomicBoolean isBlocking, CountDownLatch blocked, CountDownLatch release) {
+        return new FaultyObjectStore.Hook() {
+            @Override
+            public void before(String op, String key) {
+                if (isBlocking.get() && op.equals("put") && key.contains("/wal/")) {
+                    blocked.countDown();
+                    try {
+                        Assert.assertTrue("the test did not release the upload", release.await(120, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        };
+    }
+
+    private static long lastTxn(ReplicationIndex index, String tableName) {
+        for (int i = 0, n = index.getTables().size(); i < n; i++) {
+            if (index.getTables().getQuick(i).getTableName().equals(tableName)) {
+                return index.getTables().getQuick(i).getLastTxn();
+            }
+        }
+        return -1;
+    }
+
     private void writeForeignIndex() {
         try (FsObjectStore store = new FsObjectStore(ObjectStoreSettings.parse("fs::root=" + storeRoot + ';'), new ReplicationConfigurationImpl());
              IndexClient client = new IndexClient(store, true)) {

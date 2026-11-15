@@ -100,6 +100,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private final ReplicatedCairoEngine engine;
     private final ExecutorService executor;
     private final IndexClient indexClient;
+    // The coordinator and the lease keeper both write the index. The lock guards the index client and what
+    // an index write changes: sequence, lastCommittedIndex, lastIndexWriteNanos.
+    private final ReentrantLock indexLock = new ReentrantLock();
     private final boolean isChecksum;
     private final boolean isPrimary;
     private final ReentrantLock lock = new ReentrantLock();
@@ -128,18 +131,27 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // when close() began waiting for the coordinator; 0 until then
     private volatile long closeStartedNanos;
     private volatile boolean isCrashed;
+    // guarded by indexLock
+    private boolean isIndexClientClosed;
     private volatile boolean isNonDataPending;
     private volatile boolean isRestoredAtBoot;
     private volatile boolean isRunning;
     private volatile boolean isStarted;
     private io.questdb.replication.codec.CheckpointHistory checkpointHistory;
+    // the index the store accepted last from this node; guarded by indexLock
+    private ReplicationIndex lastCommittedIndex;
     private ReplicationIndex lastIndex;
-    private long lastIndexWriteNanos;
+    private volatile long lastIndexWriteNanos;
+    private volatile Thread leaseKeeperThread;
     private Thread mainThread;
     private long nextCheckpointUploadNanos;
     private long nextCleanerRunNanos;
     private volatile long sequence;
     private volatile String status = "starting";
+    private volatile Runnable takeoverHook;
+    // the index version acquireLease() saw unchanged for the whole wait; null when it did not have to wait
+    private String watchedEtag;
+    private long watchedSequence;
 
     public ReplicationService(@NotNull ReplicatedCairoEngine engine, @NotNull ObjectStore store) {
         this.engine = engine;
@@ -206,6 +218,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 t.interrupt();
             }
         }
+        final Thread keeper = leaseKeeperThread;
+        if (keeper != null) {
+            keeper.interrupt();
+            try {
+                keeper.join(shutdownTimeoutMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         executor.shutdownNow();
         try {
             executor.awaitTermination(10, TimeUnit.SECONDS);
@@ -216,7 +237,23 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         while ((w = allWorkers.poll()) != null) {
             Misc.free(w);
         }
-        indexClient.close();
+        // a thread that did not stop in time may still be inside an index write: its buffers stay allocated
+        boolean isIndexLocked = false;
+        try {
+            isIndexLocked = indexLock.tryLock(shutdownTimeoutMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (isIndexLocked) {
+            try {
+                isIndexClientClosed = true;
+                indexClient.close();
+            } finally {
+                indexLock.unlock();
+            }
+        } else {
+            LOG.critical().$("replication index write did not end in time; its buffers stay allocated").$();
+        }
         Misc.free(policy);
         Misc.free(pins);
         Misc.free(store);
@@ -249,6 +286,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     @org.jetbrains.annotations.TestOnly
     public int getWorkerContextCount() {
         return allWorkers.size();
+    }
+
+    /**
+     * Test seam: runs on the coordinator thread after this node decided it may take the lease and
+     * before it reads the index its takeover is based on.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setTakeoverHookForTesting(Runnable hook) {
+        this.takeoverHook = hook;
     }
 
     /**
@@ -408,9 +454,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         long observedSeq = Long.MIN_VALUE;
         String observedEtag = null;
         long observedSince = System.nanoTime();
+        watchedEtag = null;
         while (isRunning) {
             final ReplicationIndex idx = indexClient.read();
-            if (idx == null || idx.isReleased() || idx.getOwnerInstanceId() == null || instanceId.equals(idx.getOwnerInstanceId())) {
+            if (isFree(idx)) {
                 return true;
             }
             final String etag = indexClient.getEtag();
@@ -424,6 +471,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             if (waitedMs >= leaseMs) {
                 LOG.advisory().$("taking over the replication lease of an unresponsive primary [previousOwner=")
                         .$(idx.getOwnerInstanceId()).$(", epoch=").$(idx.getEpoch()).I$();
+                watchedEtag = observedEtag;
+                watchedSequence = observedSeq;
                 return true;
             }
             status = "waiting for lease, owner=" + idx.getOwnerInstanceId();
@@ -432,6 +481,23 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             awaitWake(Math.min(config.getKeepaliveInterval(), Math.max(100, leaseMs - waitedMs)));
         }
         return false;
+    }
+
+    // no index, a released one, or this node's own: nobody else holds the lease
+    private boolean isFree(ReplicationIndex idx) {
+        return idx == null || idx.isReleased() || idx.getOwnerInstanceId() == null || instanceId.equals(idx.getOwnerInstanceId());
+    }
+
+    /**
+     * Whether this node may replace the index it just read. acquireLease() decided on an earlier
+     * read: the owner may have written again since, which proves it alive, and a conditional write
+     * based on the newer version would succeed and leave two writable primaries until the old one's
+     * next index write. So the version to replace must be free, or the very one that stayed unchanged
+     * for the whole wait.
+     */
+    private boolean mayReplace(ReplicationIndex idx) {
+        return isFree(idx)
+                || watchedEtag != null && watchedEtag.equals(indexClient.getEtag()) && idx.getSequence() == watchedSequence;
     }
 
     private void adoptDataId(ReplicationIndex idx) {
@@ -543,7 +609,50 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      * lease, in which case a writable primary is fenced and a node still taking the lease keeps trying
      */
     private boolean commitIndex(boolean isReleased) {
-        final ReplicationIndex idx = buildIndex(isReleased);
+        indexLock.lock();
+        try {
+            return isIndexWritable() && writeIndex(buildIndex(isReleased), isReleased, true);
+        } finally {
+            indexLock.unlock();
+        }
+    }
+
+    /**
+     * Renews the lease without committing anything: writes the last committed index again under the
+     * next sequence. The lease keeper calls it while the coordinator is busy; nothing an upload in
+     * progress has changed goes out with it.
+     *
+     * @return true when the store accepted the renewal
+     */
+    private boolean renewLeaseOnly(long dueNanos) {
+        indexLock.lock();
+        try {
+            if (!isIndexWritable() || !isRunning || !engine.isPrimaryRole() || lastCommittedIndex == null
+                    || System.nanoTime() - lastIndexWriteNanos < dueNanos) {
+                // stopping, fenced, or the coordinator wrote the index meanwhile
+                return false;
+            }
+            final byte[] text = lastCommittedIndex.encode();
+            final ReplicationIndex idx = ReplicationIndex.decode(text, 0, text.length);
+            idx.setOwner(instanceId, epoch, engine.getConfiguration().getMicrosecondClock().getTicks(), sequence + 1, false);
+            return writeIndex(idx, false, false);
+        } finally {
+            indexLock.unlock();
+        }
+    }
+
+    /**
+     * A fenced node writes no index. Finding out that another node replaced the index reads that
+     * node's version, and the index client would base its next write on it: a write that the store
+     * would accept, over the new owner's index. The coordinator and the lease keeper share the client,
+     * so whichever of them fences the node, the other must stop here.
+     */
+    private boolean isIndexWritable() {
+        return !isIndexClientClosed && engine.getRole() != ReplicatedCairoEngine.EngineRole.FENCED;
+    }
+
+    // the caller holds indexLock; isCommit is false for a renewal that carries no upload
+    private boolean writeIndex(ReplicationIndex idx, boolean isReleased, boolean isCommit) {
         // the lease counts from before the request: the store accepted the write no earlier than this
         final long writeStartNanos = System.nanoTime();
         try {
@@ -582,6 +691,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 // an earlier write of this node landed without it noticing, and the store holds that one,
                 // not this one: build the next index on top of it
                 sequence = current.getSequence();
+                lastCommittedIndex = current;
                 LOG.info().$("an earlier replication index commit had landed, committing again [sequence=").$(sequence).I$();
                 return false;
             } else if (current == null ? sequence == 0 : current.getSequence() == sequence) {
@@ -597,16 +707,58 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             }
         }
         sequence = idx.getSequence();
+        lastCommittedIndex = idx;
         lastIndexWriteNanos = System.nanoTime();
         if (!isReleased) {
             engine.renewLease(writeStartNanos + TimeUnit.MILLISECONDS.toNanos(leaseMillis()));
         }
-        for (TableUploader u : uploaders.values()) {
-            synchronized (u) {
-                u.onCommitted();
+        if (isCommit) {
+            for (TableUploader u : uploaders.values()) {
+                synchronized (u) {
+                    u.onCommitted();
+                }
             }
         }
         return true;
+    }
+
+    /**
+     * The coordinator renews the lease with every index it commits and, when idle, every keepalive
+     * interval. A long upload or cleanup round keeps it from both, and the engine refuses writes once
+     * the lease lapses. This thread renews the lease for it when no index was written for one and a
+     * half keepalive intervals, so a reachable store never makes a healthy primary read-only. The
+     * store accepts its write, like any index write, only if no other node wrote the index.
+     */
+    private void leaseKeeperMain() {
+        final long dueNanos = TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval()) * 3 / 2;
+        final long pauseMillis = Math.max(1, config.getKeepaliveInterval() / 4);
+        try {
+            while (isRunning && engine.isPrimaryRole()) {
+                if (System.nanoTime() - lastIndexWriteNanos >= dueNanos) {
+                    try {
+                        if (renewLeaseOnly(dueNanos)) {
+                            LOG.info().$("replication lease renewed while the coordinator is busy [sequence=").$(sequence).I$();
+                        }
+                    } catch (Throwable th) {
+                        LOG.error().$("could not renew the replication lease, will retry [error=").$safe(String.valueOf(th.getMessage())).I$();
+                    }
+                }
+                try {
+                    Thread.sleep(pauseMillis);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        } finally {
+            Path.clearThreadLocals();
+        }
+    }
+
+    private void startLeaseKeeper() {
+        final Thread t = new Thread(this::leaseKeeperMain, "qdb-replication-lease");
+        t.setDaemon(true);
+        leaseKeeperThread = t;
+        t.start();
     }
 
     private void fence(String reason) {
@@ -912,9 +1064,18 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 if (!acquireLease()) {
                     return;
                 }
+                final Runnable hook = takeoverHook;
+                if (hook != null) {
+                    hook.run();
+                }
                 // the previous owner may have committed more while this node waited: catch up again; a
                 // commit that still slips in makes the index write below fail and the loop start over
                 idx = indexClient.read();
+                if (!mayReplace(idx)) {
+                    LOG.info().$("the replication lease owner wrote again, waiting for the lease again [owner=")
+                            .$(idx.getOwnerInstanceId()).I$();
+                    continue;
+                }
                 if (!catchUp(idx)) {
                     fence("tables could not catch up with the object store; see the log");
                     return;
@@ -927,6 +1088,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                     if (!u.isDropCommitted()) {
                         u.loadPart(worker());
                     }
+                }
+                // the marker allows one promotion: it goes before the store changes hands, and a marker
+                // that cannot be removed stops the promotion instead of allowing every later one
+                if (!removeMigrationMarker()) {
+                    return;
                 }
                 if (commitIndex(false)) {
                     break;
@@ -946,7 +1112,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         status = "primary, epoch " + epoch;
         LOG.advisory().$("replication primary is writable [epoch=").$(epoch).$(", instance=").$(instanceId)
                 .$(", store=").$(store.getDescription()).I$();
-        consumeMigrationMarker();
+        isMigrationAllowed = false;
+        startLeaseKeeper();
         long firstDirtyNanos = 0;
         boolean wasLeaseLapsed = false;
         while (isRunning) {
@@ -1089,16 +1256,21 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 + " file in " + engine.getConfiguration().getInstallRoot() + " and restart it");
     }
 
-    // the marker allows one promotion
-    private void consumeMigrationMarker() {
-        if (isMigrationAllowed) {
-            isMigrationAllowed = false;
-            try {
-                Files.deleteIfExists(Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE));
-                LOG.advisory().$("replication promoted this node and removed ").$(MIGRATE_PRIMARY_FILE).$();
-            } catch (java.io.IOException e) {
-                LOG.error().$("could not remove ").$(MIGRATE_PRIMARY_FILE).$(" [error=").$safe(e.getMessage()).I$();
+    // true when no marker is left in the install root; fences the node when it cannot remove one
+    private boolean removeMigrationMarker() {
+        if (!isMigrationAllowed) {
+            return true;
+        }
+        final java.nio.file.Path marker = Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE);
+        try {
+            if (Files.deleteIfExists(marker)) {
+                LOG.advisory().$("replication removed ").$(MIGRATE_PRIMARY_FILE).$(", this node becomes the primary").$();
             }
+            return true;
+        } catch (java.io.IOException e) {
+            LOG.critical().$("could not remove ").$(MIGRATE_PRIMARY_FILE).$(" [error=").$safe(String.valueOf(e.getMessage())).I$();
+            fence("could not remove " + marker + ", which allows one promotion; remove it and restart this node");
+            return false;
         }
     }
 
