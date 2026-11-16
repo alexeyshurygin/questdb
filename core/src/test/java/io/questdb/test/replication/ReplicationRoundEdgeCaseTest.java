@@ -359,6 +359,61 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testFailedSetupOfANewTableIsRetried() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final SequencerLogFacade ff = new SequencerLogFacade();
+            try (Node node = newNode("p", primaryConfig(), store, ff, false)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                // the round that picks the new table up cannot open its sequencer log, once
+                ff.failNextOpen("/late~");
+                node.engine.execute("CREATE TABLE late (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                node.engine.execute("INSERT INTO late VALUES ('2024-01-01', 1)");
+                // a later round sets the table up and uploads it
+                awaitUploaded(node, store, "late", 1);
+                Assert.assertEquals(1, ff.openFailures.get());
+                Assert.assertEquals(EngineRole.PRIMARY, node.engine.getRole());
+            }
+            final ReplicationIndex index = readIndex(store);
+            Assert.assertTrue(index.isReleased());
+            Assert.assertEquals(1, entry(index, "late").getLastTxn());
+        });
+    }
+
+    @Test
+    public void testFailedSetupOfANewTableKeepsTheLeaseAtTheStop() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final SequencerLogFacade ff = new SequencerLogFacade();
+            try (Node node = newNode("p", primaryConfig(), store, ff, false)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(node, store, "t", 0);
+                // the new table's sequencer log cannot be opened, round after round
+                ff.failOpens("/late~");
+                node.engine.execute("CREATE TABLE late (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                node.engine.execute("INSERT INTO late VALUES ('2024-01-01', 1)");
+                TestUtils.assertEventually(() -> Assert.assertTrue(ff.openFailures.get() > 0), 30);
+                node.service.close();
+                // the stop could not set the table up either: it leaves the lease to expire
+                final ReplicationIndex index = readIndex(store);
+                Assert.assertFalse(index.isReleased());
+                Assert.assertEquals(node.service.getInstanceId(), index.getOwnerInstanceId());
+                Assert.assertNull(entry(index, "late"));
+                Assert.assertEquals(0, entry(index, "t").getLastTxn());
+            }
+            // the next start uploads the table
+            try (Node node = newNode("p", primaryConfig(), store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                awaitUploaded(node, store, "late", 1);
+            }
+        });
+    }
+
+    @Test
     public void testForcedReplicaRoundBeforeTheStoreHasAnIndexAppliesNothing() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
@@ -966,6 +1021,65 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testStopThatGivesUpOnADrainUploadKeepsTheLease() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicReference<String> stuckPrefix = new AtomicReference<>();
+            final AtomicReference<Thread> coordinator = new AtomicReference<>();
+            final AtomicReference<String> uploadThread = new AtomicReference<>();
+            final CountDownLatch never = new CountDownLatch(1);
+            store.setFaultHook((op, key) -> {
+                if (COORDINATOR_THREAD.equals(Thread.currentThread().getName())) {
+                    coordinator.set(Thread.currentThread());
+                }
+                final String prefix = stuckPrefix.get();
+                if (op.equals("put") && prefix != null && key.startsWith(prefix) && stuckPrefix.compareAndSet(prefix, null)) {
+                    uploadThread.set(Thread.currentThread().getName());
+                    try {
+                        // a request that does not return by itself
+                        if (!never.await(60, TimeUnit.SECONDS)) {
+                            throw new AssertionError("the stop did not interrupt the upload");
+                        }
+                    } catch (InterruptedException e) {
+                        // The stop gave up and shut the pool down. The upload fails only once the
+                        // coordinator is gone, which decides on the lease while it still runs.
+                        try {
+                            coordinator.get().join(60_000);
+                        } catch (InterruptedException ignore) {
+                            Thread.currentThread().interrupt();
+                        }
+                        throw ObjectStoreException.retryable("injected request interrupted", e);
+                    }
+                }
+            });
+            // rows wait for a ten-minute window, so the stop drains them; it waits 5 s for the coordinator
+            try (Node node = newNode("p", primaryConfig().setThrottleWindowDuration(600_000), store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(node, store, "t", 0);
+                node.engine.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                stuckPrefix.set(StoreKeys.tablePrefix(entry(readIndex(store), "t").getKey()) + "wal/");
+                node.service.close();
+                // the row never reached the store: the stop left the lease to expire
+                final ReplicationIndex index = readIndex(store);
+                Assert.assertFalse(index.isReleased());
+                Assert.assertEquals(node.service.getInstanceId(), index.getOwnerInstanceId());
+                Assert.assertEquals(0, entry(index, "t").getLastTxn());
+                // the drain round uploaded on a pool thread, and the coordinator, which waited for it, is gone
+                Assert.assertEquals("qdb-replication-worker", uploadThread.get());
+                Assert.assertFalse(coordinator.get().isAlive());
+            }
+            // the node kept the row for its next start, which uploads it
+            try (Node node = newNode("p", primaryConfig(), store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                awaitUploaded(node, store, "t", 1);
+            }
+        });
+    }
+
+    @Test
     public void testStopThatGivesUpOnAStuckUploadKeepsTheLease() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
@@ -1548,11 +1662,12 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     // fails, or makes unreadable, the next sequencer log that the replication coordinator opens for
-    // reading in a table directory whose name holds the given text
+    // reading in a table directory whose name holds the given text; or fails every such open
     private static final class SequencerLogFacade extends TestFilesFacadeImpl {
         private final AtomicInteger openFailures = new AtomicInteger();
         private final AtomicInteger unreadableReads = new AtomicInteger();
         private volatile boolean isOpenFailing;
+        private volatile boolean isOpenFailingAlways;
         private volatile String tableDirPart;
         private volatile long unreadableFd = -1;
 
@@ -1571,7 +1686,9 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
                     || !Utf8s.containsAscii(name, part) || !Utf8s.endsWithAscii(name, SEQUENCER_LOG)) {
                 return super.openRO(name);
             }
-            tableDirPart = null;
+            if (!isOpenFailingAlways) {
+                tableDirPart = null;
+            }
             if (isOpenFailing) {
                 openFailures.incrementAndGet();
                 return -1;
@@ -1592,11 +1709,19 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
 
         private void failNextOpen(String tableDirPart) {
             isOpenFailing = true;
+            isOpenFailingAlways = false;
+            this.tableDirPart = tableDirPart;
+        }
+
+        private void failOpens(String tableDirPart) {
+            isOpenFailing = true;
+            isOpenFailingAlways = true;
             this.tableDirPart = tableDirPart;
         }
 
         private void makeNextUnreadable(String tableDirPart) {
             isOpenFailing = false;
+            isOpenFailingAlways = false;
             this.tableDirPart = tableDirPart;
         }
     }

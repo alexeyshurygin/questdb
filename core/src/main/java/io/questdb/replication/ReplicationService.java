@@ -1240,14 +1240,36 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             commitIndex(false);
             return 0;
         }
-        // pick up tables created since the last round
+        // Pick up tables created since the last round. A table whose uploader cannot be set up stays
+        // listed: a later round retries it, and a stop does not release the lease without it.
+        List<String> failedSetups = null;
         for (TableToken token : createdTables.values()) {
-            createdTables.remove(token.getDirName());
-            if (!uploaders.containsKey(token.getDirName()) && !token.isView() && !token.isMatView()) {
-                registerUploader(token.getDirName(), newUploader(token, 0));
-                dirtyTables.put(token.getDirName(), Boolean.TRUE);
+            final String dir = token.getDirName();
+            if (!uploaders.containsKey(dir) && !token.isView() && !token.isMatView()) {
+                try {
+                    registerUploader(dir, newUploader(token, 0));
+                } catch (Throwable th) {
+                    // the listener reports a table before the name registry lists it, so only the disk can
+                    // tell a table that is gone
+                    if (!engine.getConfiguration().getFilesFacade().exists(path.of(engine.getConfiguration().getDbRoot()).concat(dir).$())) {
+                        // dropped and purged before it was set up: the store never knew it, and nothing is left to upload
+                        createdTables.remove(dir);
+                        LOG.advisory().$("a new table is gone before its upload was set up [table=").$(token).I$();
+                    } else {
+                        LOG.error().$("could not set up the upload of a new table, will retry [table=").$(token)
+                                .$(", error=").$(th).I$();
+                        if (failedSetups == null) {
+                            failedSetups = new ArrayList<>();
+                        }
+                        failedSetups.add(dir);
+                    }
+                    continue;
+                }
+                dirtyTables.put(dir, Boolean.TRUE);
             }
+            createdTables.remove(dir);
         }
+        final List<String> dirs = new ArrayList<>();
         final List<Future<Long>> futures = new ArrayList<>();
         for (String dir : dirtyTables.keySet()) {
             dirtyTables.remove(dir);
@@ -1255,35 +1277,61 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             if (u == null || u.isDropCommitted()) {
                 continue;
             }
-            futures.add(executor.submit(() -> {
-                synchronized (u) {
-                    try {
-                        final TableToken current = engine.getTableTokenByDirName(dir);
-                        if (current != null) {
-                            u.setToken(current);
-                        }
-                        final long last = localLastTxn(u);
-                        final long n = u.upload(engine, worker(), epoch, durableTarget(u, last), UPLOAD_BATCH);
-                        if (u.getPendingTxn() < last) {
-                            // more to upload: a batch limit or a durable frontier still behind the log
+            final Future<Long> future;
+            try {
+                future = executor.submit(() -> {
+                    synchronized (u) {
+                        try {
+                            final TableToken current = engine.getTableTokenByDirName(dir);
+                            if (current != null) {
+                                u.setToken(current);
+                            }
+                            final long last = localLastTxn(u);
+                            final long n = u.upload(engine, worker(), epoch, durableTarget(u, last), UPLOAD_BATCH);
+                            if (u.getPendingTxn() < last) {
+                                // more to upload: a batch limit or a durable frontier still behind the log
+                                dirtyTables.put(dir, Boolean.TRUE);
+                            }
+                            return n;
+                        } catch (Throwable th) {
+                            // retried on the next round
                             dirtyTables.put(dir, Boolean.TRUE);
+                            LOG.error().$("table upload failed, will retry [table=").$(u.getToken()).$(", error=").$(th).I$();
+                            return 0L;
                         }
-                        return n;
-                    } catch (Throwable th) {
-                        // retried on the next round
-                        dirtyTables.put(dir, Boolean.TRUE);
-                        LOG.error().$("table upload failed, will retry [table=").$(u.getToken()).$(", error=").$(th).I$();
-                        return 0L;
                     }
-                }
-            }));
+                });
+            } catch (RejectedExecutionException e) {
+                // the stop shut the pool down: this table, and those not reached yet, are still to upload
+                dirtyTables.put(dir, Boolean.TRUE);
+                throw e;
+            }
+            dirs.add(dir);
+            futures.add(future);
+        }
+        if (failedSetups != null) {
+            // the throttle window brings the retry
+            for (int i = 0, n = failedSetups.size(); i < n; i++) {
+                dirtyTables.put(failedSetups.get(i), Boolean.TRUE);
+            }
         }
         long uploaded = 0;
         boolean hasPending = false;
-        for (Future<Long> f : futures) {
+        for (int i = 0, n = futures.size(); i < n; i++) {
             try {
-                uploaded += f.get();
+                uploaded += futures.get(i).get();
+            } catch (InterruptedException e) {
+                // The stop gave up waiting for this round, whose uploads may still be running. Nothing is
+                // committed, and the tables not waited for count as not uploaded, so the stop keeps the
+                // lease. The interrupt stays for the drain to see.
+                Thread.currentThread().interrupt();
+                for (int j = i; j < n; j++) {
+                    dirtyTables.put(dirs.get(j), Boolean.TRUE);
+                }
+                LOG.error().$("replication upload round interrupted [tablesLeft=").$(n - i).I$();
+                return uploaded;
             } catch (Exception e) {
+                dirtyTables.put(dirs.get(i), Boolean.TRUE);
                 final Throwable cause = e.getCause() != null ? e.getCause() : e;
                 LOG.error().$("table upload failed, will retry [error=").$safe(String.valueOf(cause.getMessage())).I$();
             }
@@ -1410,7 +1458,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             }
             final boolean isWindowDue = firstDirtyNanos != 0 && System.nanoTime() - firstDirtyNanos >= TimeUnit.MILLISECONDS.toNanos(window);
             final boolean isKeepaliveDue = isKeepaliveDue();
-            final boolean isUploadDue = isNonDataPending || isWindowDue || !createdTables.isEmpty() && !config.isThrottleNonData();
+            // a new table sets isNonDataPending unless structural changes wait for the window too
+            final boolean isUploadDue = isNonDataPending || isWindowDue;
             if (isUploadDue || isKeepaliveDue) {
                 if (isUploadDue) {
                     isNonDataPending = false;
