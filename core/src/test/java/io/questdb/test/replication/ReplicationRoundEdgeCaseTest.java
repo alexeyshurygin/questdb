@@ -191,6 +191,58 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testCleanerDeletesNothingUntilItsDeleteListIsStored() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicReference<String> watchedPrefix = new AtomicReference<>();
+            final AtomicInteger listWrites = new AtomicInteger();
+            final AtomicBoolean isListStored = new AtomicBoolean();
+            final List<String> deletedWithoutList = Collections.synchronizedList(new ArrayList<>());
+            store.setFaultHook((op, key) -> {
+                final String prefix = watchedPrefix.get();
+                if (prefix == null) {
+                    return;
+                }
+                if (op.equals("put") && key.startsWith(StoreKeys.DELETES_PREFIX)) {
+                    // the store refuses the first delete list
+                    if (listWrites.getAndIncrement() == 0) {
+                        throw ObjectStoreException.fatal("injected delete list refusal");
+                    }
+                    isListStored.set(true);
+                } else if (op.equals("delete") && key.startsWith(prefix) && !isListStored.get()) {
+                    deletedWithoutList.add(key);
+                }
+            });
+            final ReplicationConfigurationImpl config = primaryConfig()
+                    .setSequencerPartTxnCount(2)
+                    .setCleanerEnabled(true)
+                    .setCleanerInterval(20)
+                    .setCleanerDroppedTableCooloff(0);
+            try (Node node = newNode("p", config, store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE gone (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                node.engine.execute("INSERT INTO gone VALUES ('2024-01-01', 1)");
+                awaitUploaded(node, store, "gone", 1);
+                final String prefix = StoreKeys.tablePrefix(entry(readIndex(store), "gone").getKey());
+                Assert.assertTrue(countKeys(store, prefix) >= 3);
+                watchedPrefix.set(prefix);
+                node.engine.execute("DROP TABLE gone");
+                // the run whose list was refused deleted nothing; the next run stored the list, deleted the
+                // objects and then the list
+                TestUtils.assertEventually(() -> {
+                    Assert.assertEquals(0, countKeys(store, prefix));
+                    Assert.assertEquals(0, countKeys(store, StoreKeys.DELETES_PREFIX));
+                }, 30);
+                Assert.assertEquals(2, listWrites.get());
+                Assert.assertEquals("[]", deletedWithoutList.toString());
+                Assert.assertNull(entry(readIndex(store), "gone"));
+                Assert.assertEquals(EngineRole.PRIMARY, node.engine.getRole());
+            }
+        });
+    }
+
+    @Test
     public void testCleanerFreesOnlyTheHistoryAKeptCheckpointCovers() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
@@ -648,6 +700,7 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
                     .setCleanerDroppedTableCooloff(0)
                     .setCleanerDeleteConcurrency(4);
             final String prefix;
+            final String listOfA;
             try (Node a = newNode("a", config, store)) {
                 service.set(a.service);
                 a.service.start();
@@ -659,23 +712,30 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
                 }
                 prefix = StoreKeys.tablePrefix(entry(readIndex(store), "gone").getKey());
                 Assert.assertTrue(countKeys(store, prefix) > 8);
+                listOfA = StoreKeys.deleteList(a.service.getInstanceId());
                 watchedPrefix.set(prefix);
                 a.engine.execute("DROP TABLE gone");
                 TestUtils.assertEventually(() -> Assert.assertNotNull(closer.get()), 30);
                 closer.get().join(60_000);
                 Assert.assertFalse(closer.get().isAlive());
             }
-            // the stop cut the cleaner short: no index names the objects it had not deleted yet
+            // the stop cut the cleaner short: no index names the objects it had not deleted yet, the list of
+            // node a does
             watchedPrefix.set(null);
             Assert.assertTrue(countKeys(store, prefix) > 0);
             Assert.assertNull(entry(readIndex(store), "gone"));
+            Assert.assertTrue(store.contains(listOfA));
+            Assert.assertEquals(1, countKeys(store, StoreKeys.DELETES_PREFIX));
 
-            // the next primary, another node, deletes them
+            // the next primary, another node, deletes them, then the list of node a, then its own list
             try (Node b = newNode("b", config, store)) {
                 allowPromotion(b);
                 b.service.start();
                 awaitRole(b, EngineRole.PRIMARY);
-                TestUtils.assertEventually(() -> Assert.assertEquals(0, countKeys(store, prefix)), 30);
+                TestUtils.assertEventually(() -> {
+                    Assert.assertEquals(0, countKeys(store, prefix));
+                    Assert.assertEquals(0, countKeys(store, StoreKeys.DELETES_PREFIX));
+                }, 30);
                 Assert.assertEquals(EngineRole.PRIMARY, b.engine.getRole());
             }
         });

@@ -284,8 +284,14 @@ holding history back until its `_checkpoints/<instance id>` object is deleted
 by hand. Once the index no longer names the objects a run is about to delete,
 the cleaner lists them in `_deletes/<instance id>` and deletes that list when
 they are all gone. A deletion that fails, or that a stop cuts short, stays on
-the list: the next run retries it, and so does the first run of the next
-primary, whichever node that is.
+the list: the next run retries it, and so does the first cleaner run of the
+next primary, whichever node that is, provided its cleaner is enabled. That run
+also deletes the lists of earlier instances once its own list covers them. The
+list is written only after the index commit has landed, so it never names an
+object that an index still names. If that write fails, the run deletes nothing
+and keeps the objects in memory for the next run; a stop, a crash or a failover
+before that run leaves them in the store, named by no index and no list, and so
+does a crash between the index commit and the list write.
 
 ## Differences from QuestDB Enterprise
 
