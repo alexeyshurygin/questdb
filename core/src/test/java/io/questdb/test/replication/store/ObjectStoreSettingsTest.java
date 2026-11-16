@@ -32,6 +32,15 @@ import org.junit.Test;
 public class ObjectStoreSettingsTest {
 
     @Test
+    public void testEmptySettingsAreSkipped() {
+        // empty and blank settings between the separators carry nothing
+        final ObjectStoreSettings s = ObjectStoreSettings.parse("s3::;bucket=b;; ;region=eu-west-1;;");
+        Assert.assertEquals("b", s.get("bucket"));
+        Assert.assertEquals("eu-west-1", s.get("region"));
+        Assert.assertEquals("s3::bucket=b;region=eu-west-1;", s.toString());
+    }
+
+    @Test
     public void testFsSettings() {
         final ObjectStoreSettings s = ObjectStoreSettings.parse(" FS:: root = /nfs/final ; atomic_write_dir=/nfs/scratch; ");
         Assert.assertEquals("fs", s.getScheme());
@@ -41,6 +50,14 @@ public class ObjectStoreSettingsTest {
         Assert.assertFalse(s.has("bucket"));
         Assert.assertNull(s.get("bucket"));
         Assert.assertEquals("fs::root=/nfs/final;atomic_write_dir=/nfs/scratch;", s.toString());
+    }
+
+    @Test
+    public void testIncompletePlaceholderIsAValue() {
+        // only a value that both starts with ${ and ends with } reads as an unexpanded placeholder
+        final ObjectStoreSettings s = ObjectStoreSettings.parse("fs::root=${HOME;atomic_write_dir=/scratch}");
+        Assert.assertEquals("${HOME", s.get("root"));
+        Assert.assertEquals("/scratch}", s.get("atomic_write_dir"));
     }
 
     @Test

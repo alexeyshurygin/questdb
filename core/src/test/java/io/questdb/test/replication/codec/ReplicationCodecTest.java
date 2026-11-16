@@ -43,6 +43,19 @@ import org.junit.Test;
 import java.nio.charset.StandardCharsets;
 
 public class ReplicationCodecTest extends AbstractTest {
+    // int magic, byte version, then walId, segmentId, firstSegmentTxn, lastSegmentTxn and
+    // eventFormatVersion as ints: the range count follows at this offset
+    private static final int SEGMENT_DELTA_RANGE_COUNT_OFFSET = 4 + 1 + 5 * 4;
+
+    @Test
+    public void testCheckpointHistoryRejectsMalformedTableRecord() {
+        // a table record that a checkpoint expects, but with too few or too many fields
+        assertHistoryCorrupt("qdb-checkpoint-history 1\ncheckpoint 1 1\nt a\nend\n", "corrupt checkpoint history [line=3, error=unexpected table record]");
+        assertHistoryCorrupt("qdb-checkpoint-history 1\ncheckpoint 1 1\nt a 1 2\nend\n", "corrupt checkpoint history [line=3, error=unexpected table record]");
+        assertHistoryCorrupt("qdb-checkpoint-history 1\ncheckpoint 1 1\nt\nend\n", "corrupt checkpoint history [line=3, error=unexpected table record]");
+        final byte[] good = "qdb-checkpoint-history 1\ncheckpoint 1 1\nt a 1\nend\n".getBytes(StandardCharsets.UTF_8);
+        Assert.assertEquals(1, CheckpointHistory.decode(good, 0, good.length).getCheckpoints().get(0).getSeqTxn("a"));
+    }
 
     @Test
     public void testCheckpointHistoryRoundTripAndCorruption() {
@@ -120,6 +133,41 @@ public class ReplicationCodecTest extends AbstractTest {
     }
 
     @Test
+    public void testSegmentDeltaRejectsInvalidHeaderFields() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (NativeBuffer b = new NativeBuffer()) {
+                // the smallest valid values decode
+                SegmentDelta.begin(b, 1, 0, 0, 0, 0);
+                final SegmentDelta d = new SegmentDelta().of(b.ptr(), b.size());
+                Assert.assertEquals(0, d.getSegmentId());
+                Assert.assertEquals(0, d.getLastSegmentTxn());
+                Assert.assertFalse(d.nextRange());
+
+                SegmentDelta.begin(b, 1, -1, 5, 9, 0);
+                assertCorrupt(() -> new SegmentDelta().of(b.ptr(), b.size()),
+                        "invalid segment delta header [walId=1, segmentId=-1, firstSegmentTxn=5, lastSegmentTxn=9, rangeCount=0]");
+                SegmentDelta.begin(b, 1, 4, -1, 9, 0);
+                assertCorrupt(() -> new SegmentDelta().of(b.ptr(), b.size()),
+                        "invalid segment delta header [walId=1, segmentId=4, firstSegmentTxn=-1, lastSegmentTxn=9, rangeCount=0]");
+                SegmentDelta.begin(b, 1, 4, 5, 9, 0);
+                b.putInt(SEGMENT_DELTA_RANGE_COUNT_OFFSET, -1);
+                assertCorrupt(() -> new SegmentDelta().of(b.ptr(), b.size()),
+                        "invalid segment delta header [walId=1, segmentId=4, firstSegmentTxn=5, lastSegmentTxn=9, rangeCount=-1]");
+
+                // a range whose file name is a null string
+                SegmentDelta.begin(b, 1, 4, 5, 9, 0);
+                b.putStr(null);
+                b.putLong(0);
+                b.putLong(0);
+                b.putInt(SEGMENT_DELTA_RANGE_COUNT_OFFSET, 1);
+                final SegmentDelta nullName = new SegmentDelta().of(b.ptr(), b.size());
+                Assert.assertEquals(1, nullName.getRangeCount());
+                assertCorrupt(nullName::nextRange, "invalid file name in segment delta");
+            }
+        });
+    }
+
+    @Test
     public void testSegmentDeltaRoundTripAndCorruption() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (NativeBuffer b = new NativeBuffer()) {
@@ -176,6 +224,30 @@ public class ReplicationCodecTest extends AbstractTest {
     }
 
     @Test
+    public void testTableCreateManifestRejectsMissingFields() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (NativeBuffer b = new NativeBuffer()) {
+                // the writer produces what encode() writes, which decodes
+                writeManifest(b, IndexTable.KIND_VIEW, 1, "v~7", "v", new byte[]{4});
+                final TableCreateManifest view = TableCreateManifest.decode(b.ptr(), b.size());
+                Assert.assertEquals(IndexTable.KIND_VIEW, view.getKind());
+                Assert.assertEquals("v~7", view.getDirName());
+                Assert.assertArrayEquals(new byte[]{4}, view.getMeta0());
+
+                // null strings and a null meta0 where encode() always writes values, and a kind below KIND_TABLE
+                writeManifest(b, IndexTable.KIND_TABLE, 1, null, "t", new byte[]{4});
+                assertCorrupt(() -> TableCreateManifest.decode(b.ptr(), b.size()), "invalid table create manifest [table=t]");
+                writeManifest(b, IndexTable.KIND_TABLE, 1, "t~7", null, new byte[]{4});
+                assertCorrupt(() -> TableCreateManifest.decode(b.ptr(), b.size()), "invalid table create manifest [table=null]");
+                writeManifest(b, IndexTable.KIND_TABLE, 1, "t~7", "t", null);
+                assertCorrupt(() -> TableCreateManifest.decode(b.ptr(), b.size()), "invalid table create manifest [table=t]");
+                writeManifest(b, IndexTable.KIND_TABLE - 1, 1, "t~7", "t", new byte[]{4});
+                assertCorrupt(() -> TableCreateManifest.decode(b.ptr(), b.size()), "invalid table create manifest [table=t]");
+            }
+        });
+    }
+
+    @Test
     public void testTableCreateManifestRoundTripAndCorruption() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (NativeBuffer b = new NativeBuffer()) {
@@ -208,6 +280,31 @@ public class ReplicationCodecTest extends AbstractTest {
                 b.putInt(TableCreateManifest.MAGIC);
                 b.putByte((byte) 2);
                 assertCorrupt(() -> TableCreateManifest.decode(b.ptr(), b.size()), "unsupported table create manifest version [version=2]");
+            }
+        });
+    }
+
+    @Test
+    public void testTxnPartRejectsInvalidHeaderFields() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (NativeBuffer b = new NativeBuffer()) {
+                writePartHeader(b, 0, 0, 1, 0);
+                assertCorrupt(() -> TxnPart.decode(b.ptr(), b.size()), "invalid transaction log part header [part=0, partTxnCount=0, startTxn=1, count=0]");
+                writePartHeader(b, -1, 4, 1, 0);
+                assertCorrupt(() -> TxnPart.decode(b.ptr(), b.size()), "invalid transaction log part header [part=-1, partTxnCount=4, startTxn=1, count=0]");
+                writePartHeader(b, 2, 4, 9, -1);
+                assertCorrupt(() -> TxnPart.decode(b.ptr(), b.size()), "invalid transaction log part header [part=2, partTxnCount=4, startTxn=9, count=-1]");
+                // with 4 transactions per part, part 2 holds 9..12: an empty part may start right after
+                // them, at 13, but not later
+                final TxnPart empty = new TxnPart().of(3, 99, 2, 4, 13);
+                Assert.assertEquals(13, empty.getFirstTxn());
+                Assert.assertEquals(12, empty.getLastTxn());
+                try {
+                    new TxnPart().of(3, 99, 2, 4, 14);
+                    Assert.fail();
+                } catch (IllegalArgumentException e) {
+                    Assert.assertEquals("start transaction outside the part [part=2, startTxn=14]", e.getMessage());
+                }
             }
         });
     }
@@ -305,6 +402,35 @@ public class ReplicationCodecTest extends AbstractTest {
         });
     }
 
+    @Test
+    public void testTxnRecordIsSameTxn() {
+        final TxnRecord data = new TxnRecord().ofData(5, 2, 3, 4, 6, 1000, 10, 20, 7);
+        Assert.assertTrue(data.isSameTxn(new TxnRecord().ofData(5, 2, 3, 4, 6, 1000, 10, 20, 7)));
+        // each record differs from the first in one field of the transaction log record
+        final TxnRecord[] others = {
+                new TxnRecord().ofData(6, 2, 3, 4, 6, 1000, 10, 20, 7),
+                new TxnRecord().ofData(5, 9, 3, 4, 6, 1000, 10, 20, 7),
+                new TxnRecord().ofData(5, 2, 9, 4, 6, 1000, 10, 20, 7),
+                new TxnRecord().ofData(5, 2, 3, 9, 6, 1000, 10, 20, 7),
+                new TxnRecord().ofData(5, 2, 3, 4, 9, 1000, 10, 20, 7),
+                new TxnRecord().ofData(5, 2, 3, 4, 6, 1001, 10, 20, 7)
+        };
+        for (TxnRecord other : others) {
+            Assert.assertFalse(other.toString(), data.isSameTxn(other));
+            Assert.assertFalse(other.toString(), other.isSameTxn(data));
+        }
+        // a structural transaction also compares its serialized change
+        final TxnRecord alter = new TxnRecord().ofStructural(8, 3, 2000, new byte[]{1, 2});
+        Assert.assertTrue(alter.isSameTxn(new TxnRecord().ofStructural(8, 3, 2000, new byte[]{1, 2})));
+        Assert.assertFalse(alter.isSameTxn(new TxnRecord().ofStructural(8, 3, 2000, new byte[]{1, 3})));
+        Assert.assertFalse(alter.isSameTxn(new TxnRecord().ofStructural(8, 3, 2000, new byte[]{1})));
+        Assert.assertFalse(alter.isSameTxn(new TxnRecord().ofStructural(8, 3, 2000, null)));
+        Assert.assertFalse(new TxnRecord().ofStructural(8, 3, 2000, null).isSameTxn(alter));
+        // so does a drop, which has none, and differs from a structural transaction by its WAL id
+        Assert.assertTrue(new TxnRecord().ofDrop(8, 3, 2000).isSameTxn(new TxnRecord().ofDrop(8, 3, 2000)));
+        Assert.assertFalse(alter.isSameTxn(new TxnRecord().ofDrop(8, 3, 2000)));
+    }
+
     private static void assertCorrupt(ThrowingRunnable r, String message) {
         try {
             r.run();
@@ -326,6 +452,27 @@ public class ReplicationCodecTest extends AbstractTest {
 
     private static void assertTruncated(ThrowingRunnable r, String message) {
         assertCorrupt(r, message);
+    }
+
+    // writes a manifest field by field, so that a test can put nulls where encode() never does
+    private static void writeManifest(NativeBuffer b, int kind, int partTxnCount, String dirName, String tableName, byte[] meta0) {
+        b.clear();
+        b.putInt(TableCreateManifest.MAGIC);
+        b.putByte(TableCreateManifest.VERSION);
+        b.putInt(7);
+        b.putLong(123);
+        b.putInt(kind);
+        b.putInt(partTxnCount);
+        b.putStr(dirName);
+        b.putStr(tableName);
+        if (meta0 == null) {
+            b.putInt(-1);
+        } else {
+            b.putInt(meta0.length);
+            b.putBytes(meta0, 0, meta0.length);
+        }
+        // no definition
+        b.putInt(-1);
     }
 
     private static void writePartHeader(NativeBuffer b, long part, int partTxnCount, long startTxn, int count) {

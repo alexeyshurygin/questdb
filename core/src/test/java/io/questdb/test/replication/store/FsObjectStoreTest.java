@@ -38,6 +38,7 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AccessDeniedException;
@@ -52,6 +53,7 @@ import java.util.List;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 import java.util.stream.Stream;
 
 public class FsObjectStoreTest {
@@ -747,6 +749,152 @@ public class FsObjectStoreTest {
     }
 
     @Test
+    public void testPutReportsOriginalErrorWhenTempFileCannotBeDeleted() throws Exception {
+        configuration.setRetryAttempts(0);
+        final Path fifo = root.resolve("fifo");
+        boolean hasFifo;
+        try {
+            hasFifo = new ProcessBuilder("mkfifo", fifo.toString()).start().waitFor() == 0 && Files.exists(fifo);
+        } catch (IOException e) {
+            hasFifo = false;
+        }
+        Assume.assumeTrue("mkfifo is not available", hasFifo);
+        final Path scratch = Files.createDirectories(root.resolve(FsObjectStore.DEFAULT_ATOMIC_WRITE_DIR_NAME));
+        Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("r-xr-xr-x"));
+        final boolean isWritable = Files.isWritable(scratch);
+        Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("rwxr-xr-x"));
+        Assume.assumeFalse("running as a user that ignores permissions", isWritable);
+
+        try (FsObjectStore store = newStore()) {
+            // If-Match makes the store open the target to hash it, and opening a FIFO for reading
+            // blocks until a writer opens it too: the put holds its temporary file meanwhile
+            final AtomicReference<Throwable> putFailure = new AtomicReference<>();
+            final Thread putter = new Thread(() -> {
+                try {
+                    store.put("fifo", bytes("new"), 0, 3, "0123456789abcdef0123456789abcdef", false);
+                } catch (Throwable e) {
+                    putFailure.set(e);
+                }
+            });
+            putter.setDaemon(true);
+            putter.start();
+            try {
+                final Path tempFile = awaitSingleFile(scratch);
+                Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("r-xr-xr-x"));
+                // opening the FIFO for writing returns once the put has opened it for reading; the put
+                // then fails to read the FIFO and fails to delete its temporary file as well
+                final AtomicReference<Throwable> openFailure = new AtomicReference<>();
+                final Thread opener = new Thread(() -> {
+                    try {
+                        new FileOutputStream(fifo.toFile()).close();
+                    } catch (Throwable e) {
+                        openFailure.set(e);
+                    }
+                });
+                opener.setDaemon(true);
+                opener.start();
+                opener.join(30_000);
+                putter.join(30_000);
+                Assert.assertFalse("the put did not open the FIFO", opener.isAlive() || putter.isAlive());
+                Assert.assertNull(openFailure.get());
+
+                // the error is the read failure, not the failure to delete the temporary file
+                Assert.assertTrue(String.valueOf(putFailure.get()), putFailure.get() instanceof ObjectStoreException);
+                final ObjectStoreException e = (ObjectStoreException) putFailure.get();
+                Assert.assertEquals(ObjectStoreException.Kind.RETRYABLE, e.getKind());
+                Assert.assertEquals("object store I/O failed [op=PUT, key=fifo, attempts=1, error=java.io.IOException: Illegal seek]", e.getMessage());
+                Assert.assertEquals(IOException.class, e.getCause().getClass());
+                // the temporary file stays behind, and the target is untouched
+                Assert.assertEquals("new", Files.readString(tempFile));
+                Assert.assertTrue(Files.exists(fifo));
+                Assert.assertFalse(Files.isRegularFile(fifo));
+            } finally {
+                Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("rwxr-xr-x"));
+            }
+        }
+    }
+
+    @Test
+    public void testPutSucceedsWhenDirectorySyncFails() throws Exception {
+        try (FsObjectStore store = newStore()) {
+            store.put("d/x", bytes("x"), 0, 1, null, false);
+            final Path dir = root.resolve("d");
+            // write and search permission but no read: files can move into the directory, but the
+            // directory cannot be opened to sync it, which the store does as a best effort only
+            Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("-wx------"));
+            try {
+                Assume.assumeFalse("running as a user that ignores permissions", Files.isReadable(dir));
+                final String etag = store.put("d/k", bytes("v1"), 0, 2, null, false);
+                Assert.assertEquals(expectedETag(bytes("v1")), etag);
+                Assert.assertEquals(expectedETag(bytes("v2")), store.put("d/k", bytes("v2"), 0, 2, etag, false));
+                Assert.assertEquals(expectedETag(bytes("v3")), store.put("d/n", bytes("v3"), 0, 2, null, true));
+                Assert.assertEquals("v2", Files.readString(dir.resolve("k")));
+                Assert.assertEquals("v3", Files.readString(dir.resolve("n")));
+            } finally {
+                Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwxr-xr-x"));
+            }
+            Assert.assertEquals(List.of("d/k:2", "d/n:2", "d/x:1"), list(store, "", null));
+            try (Stream<Path> files = Files.list(root.resolve(FsObjectStore.DEFAULT_ATOMIC_WRITE_DIR_NAME))) {
+                Assert.assertEquals(0, files.count());
+            }
+        }
+    }
+
+    @Test
+    public void testTempFileNameTakenReportsOriginalError() throws Exception {
+        // A non-empty directory holds the name of the next temporary file: creating the file fails,
+        // and so does deleting what holds its name. The store reports the first failure and retries.
+        final Path scratch = Files.createDirectories(root.resolve(FsObjectStore.DEFAULT_ATOMIC_WRITE_DIR_NAME));
+        final List<String> retries = new ArrayList<>();
+        final List<Path> blockers = new ArrayList<>();
+        try (FsObjectStore store = new FsObjectStore(settings("fs::root=" + root + ';'), configuration) {
+            @Override
+            protected void onRetry(@NotNull String operation, @NotNull String subject, int attempt, @NotNull IOException error) {
+                retries.add(operation + ' ' + subject + ' ' + attempt + ' ' + error.getClass().getSimpleName());
+                try {
+                    final Path file = Path.of(((FileSystemException) error).getFile());
+                    if (attempt == 1) {
+                        // the failed attempt named its temporary file, put-<pid>-<n>.tmp; the next
+                        // attempts take the names after it
+                        Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("rwxr-xr-x"));
+                        final String name = file.getFileName().toString();
+                        final String prefix = name.substring(0, name.lastIndexOf('-') + 1);
+                        final long n = Long.parseLong(name.substring(prefix.length(), name.length() - ".tmp".length()));
+                        for (long i = n + 1; i <= n + 16; i++) {
+                            final Path blocker = Files.createDirectory(scratch.resolve(prefix + i + ".tmp"));
+                            Files.writeString(blocker.resolve("keep"), "k");
+                            blockers.add(blocker);
+                        }
+                    } else {
+                        // the error names a blocker, which is still there
+                        Assert.assertTrue(file.toString(), blockers.contains(file));
+                        Assert.assertEquals("k", Files.readString(file.resolve("keep")));
+                        for (Path blocker : blockers) {
+                            Files.delete(blocker.resolve("keep"));
+                            Files.delete(blocker);
+                        }
+                    }
+                } catch (IOException e) {
+                    throw new AssertionError(e);
+                }
+            }
+        }) {
+            Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("r-xr-xr-x"));
+            try {
+                Assume.assumeFalse("running as a user that ignores permissions", Files.isWritable(scratch));
+                Assert.assertEquals(expectedETag(bytes("v")), store.put("k", bytes("v"), 0, 1, null, false));
+            } finally {
+                Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("rwxr-xr-x"));
+            }
+            Assert.assertEquals(List.of("PUT key=k 1 AccessDeniedException", "PUT key=k 2 FileAlreadyExistsException"), retries);
+            Assert.assertEquals("v", Files.readString(root.resolve("k")));
+            try (Stream<Path> files = Files.list(scratch)) {
+                Assert.assertEquals(0, files.count());
+            }
+        }
+    }
+
+    @Test
     public void testWrongScheme() {
         assertFails(
                 ObjectStoreException.Kind.FATAL,
@@ -802,6 +950,23 @@ public class FsObjectStoreTest {
             thread.join();
         }
         return results;
+    }
+
+    // Waits until the directory holds exactly one entry, one that another thread creates and keeps
+    // while it is blocked; the wait ends on that state, whatever the thread scheduling.
+    private static Path awaitSingleFile(Path dir) throws IOException {
+        final long deadline = System.nanoTime() + 30_000_000_000L;
+        while (true) {
+            try (Stream<Path> files = Files.list(dir)) {
+                final List<Path> found = files.toList();
+                if (found.size() == 1) {
+                    return found.get(0);
+                }
+                Assert.assertTrue(found.toString(), found.isEmpty());
+            }
+            Assert.assertTrue("no file appeared in " + dir, System.nanoTime() < deadline);
+            LockSupport.parkNanos(1_000_000);
+        }
     }
 
     private static int indexOf(String[] keys, String key) {

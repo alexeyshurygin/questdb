@@ -24,6 +24,7 @@
 
 package io.questdb.test.replication.store;
 
+import io.questdb.replication.store.ByteSink;
 import io.questdb.replication.store.ObjectStoreException;
 import io.questdb.replication.store.ObjectStoreUtils;
 import org.junit.Assert;
@@ -31,8 +32,27 @@ import org.junit.Test;
 
 import static io.questdb.test.replication.store.FsObjectStoreTest.assertFails;
 import static io.questdb.test.replication.store.FsObjectStoreTest.bytes;
+import static io.questdb.test.replication.store.FsObjectStoreTest.utf8;
 
 public class ObjectStoreUtilsTest {
+
+    @Test
+    public void testByteSinkRejectsObjectsTooLargeToBuffer() {
+        final ByteSink sink = new ByteSink(16);
+        sink.put(bytes("abc"), 0, 3);
+        final byte[] data = sink.data();
+        // a byte array holds at most Integer.MAX_VALUE - 8 bytes: 3 + (MAX - 10) is one more
+        assertFails(ObjectStoreException.Kind.FATAL, 0, "object too large to buffer [size=" + (Integer.MAX_VALUE - 7L) + ']',
+                () -> sink.ensureCapacity(Integer.MAX_VALUE - 10));
+        // the size is computed in long arithmetic, so it does not wrap around past Integer.MAX_VALUE
+        assertFails(ObjectStoreException.Kind.FATAL, 0, "object too large to buffer [size=2147483650]",
+                () -> sink.ensureCapacity(Integer.MAX_VALUE));
+        // the sink neither grew nor lost its content, and still works
+        Assert.assertSame(data, sink.data());
+        Assert.assertEquals("abc", utf8(sink));
+        sink.put(bytes("def"), 0, 3);
+        Assert.assertEquals("abcdef", utf8(sink));
+    }
 
     @Test
     public void testHex() {

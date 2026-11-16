@@ -98,6 +98,48 @@ public class ReplicationIndexTest {
     }
 
     @Test
+    public void testCorruptHeaderAndEscapes() {
+        assertCorrupt("qdb-replication-index 1 x\nend\n", "corrupt replication index [line=1, error=missing header]");
+        assertCorrupt("qdb-replication-index\nend\n", "corrupt replication index [line=1, error=missing header]");
+        final String head = "qdb-replication-index 1\ndata_id a b\nowner - 0 0 0 0\n";
+        // a valid first hex digit followed by an invalid second one
+        assertCorrupt(head + "table 1 2 0 0 1 0 100 0 - d%4z n\nend\n", "corrupt replication index [line=4, error=invalid escape]");
+        assertCorrupt(head + "table 1 2 0 0 1 0 100 0 - d n%4-\nend\n", "corrupt replication index [line=4, error=invalid escape]");
+        Assert.assertEquals("dJ", decode(head + "table 1 2 0 0 1 0 100 0 - d%4a n\nend\n").getTables().getQuick(0).getDirName());
+    }
+
+    @Test
+    public void testEscapeKeepsOnlyUnreservedCharacters() {
+        // every ASCII character, then a 2-byte and a 3-byte UTF-8 character
+        final StringBuilder b = new StringBuilder();
+        for (char c = 0; c < 128; c++) {
+            b.append(c);
+        }
+        final String name = b.append("é表").toString();
+        final ReplicationIndex index = new ReplicationIndex();
+        index.setOwner("Node_1.eu-west~2", 1, 2, 3, false);
+        index.addTable(new IndexTable().of(1, 2, name, "T_1." + name, IndexTable.KIND_TABLE, 10));
+        final byte[] bytes = index.encode();
+        final String[] lines = new String(bytes, StandardCharsets.UTF_8).split("\n", -1);
+        Assert.assertEquals(6, lines.length);
+        // letters, digits and "-._~" stay as they are
+        Assert.assertEquals("owner Node_1.eu-west~2 1 2 3 0", lines[2]);
+        final String[] fields = lines[3].split(" ", -1);
+        Assert.assertEquals(12, fields.length);
+        Assert.assertEquals(percentEncode(name), fields[10]);
+        Assert.assertEquals("T_1." + percentEncode(name), fields[11]);
+        Assert.assertTrue(fields[10], fields[10].startsWith("%00%01%02"));
+        Assert.assertTrue(fields[10], fields[10].endsWith("~%7f%c3%a9%e8%a1%a8"));
+
+        final ReplicationIndex decoded = ReplicationIndex.decode(bytes, 0, bytes.length);
+        Assert.assertEquals("Node_1.eu-west~2", decoded.getOwnerInstanceId());
+        final IndexTable table = decoded.findTable(1, 2);
+        Assert.assertNotNull(table);
+        Assert.assertEquals(name, table.getDirName());
+        Assert.assertEquals("T_1." + name, table.getTableName());
+    }
+
+    @Test
     public void testRoundTrip() {
         final ReplicationIndex index = new ReplicationIndex();
         index.setDataId(0xfedcba9876543210L, 0x0123456789abcdefL);
@@ -209,5 +251,20 @@ public class ReplicationIndexTest {
     private static ReplicationIndex decode(String text) {
         final byte[] b = text.getBytes(StandardCharsets.UTF_8);
         return ReplicationIndex.decode(b, 0, b.length);
+    }
+
+    // RFC 3986 percent-encoding of the UTF-8 bytes: unreserved characters stay, the rest become %hh
+    private static String percentEncode(String s) {
+        final String unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+        final StringBuilder b = new StringBuilder();
+        for (byte value : s.getBytes(StandardCharsets.UTF_8)) {
+            final int c = value & 0xff;
+            if (unreserved.indexOf(c) >= 0) {
+                b.append((char) c);
+            } else {
+                b.append(String.format("%%%02x", c));
+            }
+        }
+        return b.toString();
     }
 }

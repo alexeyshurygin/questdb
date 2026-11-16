@@ -149,6 +149,58 @@ public class ObjectEnvelopeTest extends AbstractTest {
     }
 
     @Test
+    public void testEncodeRejectsPayloadTooLarge() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (ObjectEnvelope envelope = new ObjectEnvelope()) {
+                final ByteSink sink = new ByteSink();
+                sink.put(new byte[]{1, 2, 3}, 0, 3);
+                // the envelope must fit a byte array with room to spare; the check comes before the
+                // payload is read, so the pointer is never dereferenced
+                final long limit = Integer.MAX_VALUE - ObjectEnvelope.HEADER_SIZE - 1024;
+                for (long length : new long[]{limit + 1, Integer.MAX_VALUE, Long.MAX_VALUE}) {
+                    try {
+                        envelope.encode(0, length, 1, true, sink);
+                        Assert.fail("expected a failure for length " + length);
+                    } catch (ObjectEnvelope.EnvelopeException e) {
+                        Assert.assertEquals("payload too large [length=" + length + ']', e.getMessage());
+                    }
+                    // the sink keeps what it held
+                    Assert.assertEquals(3, sink.size());
+                    Assert.assertEquals(2, sink.data()[1]);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testEncodeReportsCompressionFailure() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (ObjectEnvelope envelope = new ObjectEnvelope(); NativeBuffer raw = new NativeBuffer(); NativeBuffer out = new NativeBuffer()) {
+                final ByteSink sink = new ByteSink();
+                sink.put(new byte[]{1, 2, 3}, 0, 3);
+                // Zstd.compress() answers a null source with a non-zero length with -1; the payload
+                // is large enough to go to compression, so encode() never copies from the pointer
+                try {
+                    envelope.encode(0, 100, 1, true, sink);
+                    Assert.fail("expected a compression failure");
+                } catch (ObjectEnvelope.EnvelopeException e) {
+                    Assert.assertEquals("zstd compression failed [result=-1]", e.getMessage());
+                }
+                // no partial envelope is left behind
+                Assert.assertEquals(0, sink.size());
+
+                // the envelope still works, with the same compression level
+                fillRepetitive(raw, 10_000);
+                envelope.encode(raw.ptr(), raw.size(), 1, true, sink);
+                Assert.assertEquals(ObjectEnvelope.FLAG_ZSTD | ObjectEnvelope.FLAG_CHECKSUM, sink.data()[5]);
+                envelope.decode(sink.data(), sink.size(), out);
+                Assert.assertEquals(raw.size(), out.size());
+                assertSameBytes(raw.ptr(), out.ptr(), raw.size());
+            }
+        });
+    }
+
+    @Test
     public void testIncompressibleAndSmallPayloadsStoredAsIs() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (ObjectEnvelope envelope = new ObjectEnvelope(); NativeBuffer raw = new NativeBuffer(); NativeBuffer out = new NativeBuffer()) {

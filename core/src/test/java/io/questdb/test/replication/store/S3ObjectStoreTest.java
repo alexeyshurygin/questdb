@@ -31,19 +31,46 @@ import io.questdb.replication.store.ObjectStoreSettings;
 import io.questdb.replication.store.s3.S3CredentialsProvider;
 import io.questdb.replication.store.s3.S3ObjectStore;
 import io.questdb.replication.store.s3.S3RequestSigner;
+import io.questdb.std.Os;
 import org.junit.After;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSession;
 import java.io.IOException;
+import java.net.Authenticator;
+import java.net.CookieHandler;
 import java.net.InetSocketAddress;
 import java.net.ProxySelector;
+import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Flow;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -82,6 +109,61 @@ public class S3ObjectStoreTest {
         }
         if (imds != null) {
             imds.close();
+        }
+    }
+
+    @Test
+    public void testBodyAfterFailedSubscribeIsIgnored() throws Exception {
+        // The response announces more than a byte array holds, so the body subscriber cancels in
+        // onSubscribe. A buffer the client delivers after the cancel must not reach the sink.
+        configuration.setRetryAttempts(0);
+        final ScriptedHttpClient client = new ScriptedHttpClient();
+        final AtomicInteger cancels = new AtomicInteger();
+        client.add(exchange -> {
+            exchange.respond(200, Map.of("Content-Length", "3000000000", "ETag", "\"e1\""));
+            exchange.subscribe(cancels);
+            exchange.next(ByteBuffer.wrap(bytes("late")));
+            exchange.finish();
+        });
+        try (S3ObjectStore store = newScriptedStore(client)) {
+            final ByteSink sink = new ByteSink();
+            sink.put(bytes("old"), 0, 3);
+            assertFails(ObjectStoreException.Kind.FATAL, 0, "object too large to buffer [key=k, size=3000000000]", () -> store.get("k", null, sink));
+            client.awaitScripts();
+            Assert.assertEquals("old", utf8(sink));
+            // once in onSubscribe, and again for the buffer that came after it
+            Assert.assertEquals(2, cancels.get());
+        }
+    }
+
+    @Test
+    public void testBodyTooLargeWithoutContentLength() throws Exception {
+        Assume.assumeFalse("Windows cannot delete a file while it is mapped", Os.isWindows());
+        configuration.setRetryAttempts(0);
+        final Path file = Files.createTempFile("s3-body", ".bin");
+        try {
+            final MappedByteBuffer huge;
+            try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                // a sparse file maps to a buffer of Integer.MAX_VALUE bytes that takes neither memory nor disk
+                channel.write(ByteBuffer.wrap(new byte[]{1}), Integer.MAX_VALUE - 1L);
+                huge = channel.map(FileChannel.MapMode.READ_ONLY, 0, Integer.MAX_VALUE);
+            }
+            final ScriptedHttpClient client = new ScriptedHttpClient();
+            final AtomicInteger cancels = new AtomicInteger();
+            client.add(exchange -> {
+                // without a Content-Length the size shows only as the body arrives, here in one buffer
+                exchange.respond(200, Map.of("ETag", "\"e1\""));
+                exchange.subscribe(cancels);
+                exchange.next(huge);
+                exchange.finish();
+            });
+            try (S3ObjectStore store = newScriptedStore(client)) {
+                assertFails(ObjectStoreException.Kind.FATAL, 0, "object too large to buffer [size=2147483647]", () -> store.get("k", null, new ByteSink()));
+                client.awaitScripts();
+                Assert.assertEquals(1, cancels.get());
+            }
+        } finally {
+            Files.delete(file);
         }
     }
 
@@ -568,6 +650,52 @@ public class S3ObjectStoreTest {
     }
 
     @Test
+    public void testLateResponseLeavesSinkAlone() throws Exception {
+        // An interrupted request leaves its exchange behind. Its body arrives only after a later
+        // request has filled the sink, and must neither clear nor overwrite it.
+        configuration.setRetryAttempts(0);
+        final ScriptedHttpClient client = new ScriptedHttpClient();
+        final CountDownLatch release = new CountDownLatch(1);
+        final AtomicInteger lateCancels = new AtomicInteger();
+        client.add(exchange -> {
+            exchange.respond(200, Map.of("Content-Length", "4", "ETag", "\"e1\""));
+            // the headers are in, and the caller gives up before the body starts
+            exchange.interruptCaller();
+            Assert.assertTrue(release.await(30, TimeUnit.SECONDS));
+            exchange.subscribe(lateCancels);
+            exchange.next(ByteBuffer.wrap(bytes("late")));
+            exchange.complete();
+        });
+        client.add(exchange -> {
+            exchange.respond(200, Map.of("Content-Length", "5", "ETag", "\"e2\""));
+            exchange.subscribe(new AtomicInteger());
+            exchange.next(ByteBuffer.wrap(bytes("fresh")));
+            exchange.complete();
+            exchange.finish();
+        });
+        try (S3ObjectStore store = newScriptedStore(client)) {
+            final ByteSink sink = new ByteSink();
+            sink.put(bytes("old"), 0, 3);
+            try {
+                try {
+                    assertFails(ObjectStoreException.Kind.RETRYABLE, 0, "object store request failed [op=GET, key=k, attempts=1, reason=request interrupted]",
+                            () -> store.get("k", null, sink));
+                    Assert.assertTrue(Thread.currentThread().isInterrupted());
+                } finally {
+                    Thread.interrupted();
+                }
+                Assert.assertEquals("e2", store.get("k", null, sink));
+                Assert.assertEquals("fresh", utf8(sink));
+            } finally {
+                release.countDown();
+            }
+            client.awaitScripts();
+            Assert.assertEquals("fresh", utf8(sink));
+            Assert.assertEquals(1, lateCancels.get());
+        }
+    }
+
+    @Test
     public void testList() throws Exception {
         s3.setPageSize(2);
         final String[] keys = {"a&b<c>\"'", "b", "c/d", "c/e", "\u00e9", "\ufffd", "\uD83D\uDE00"};
@@ -1026,6 +1154,16 @@ public class S3ObjectStoreTest {
         );
     }
 
+    private S3ObjectStore newScriptedStore(HttpClient client) {
+        // the scripted client answers every request itself and never connects to the endpoint
+        return new S3ObjectStore(
+                ObjectStoreSettings.parse("s3::bucket=" + BUCKET + ";endpoint=http://s3.scripted.test" + KEYS),
+                configuration,
+                Map.of(),
+                client
+        );
+    }
+
     private S3ObjectStore newStore(String extraSettings) {
         return new S3ObjectStore(settings(extraSettings), configuration, Map.of());
     }
@@ -1036,5 +1174,228 @@ public class S3ObjectStoreTest {
 
     private ObjectStoreSettings settings(String extraSettings) {
         return ObjectStoreSettings.parse("s3::bucket=" + BUCKET + ";endpoint=" + s3.getEndpoint() + KEYS + extraSettings);
+    }
+
+    @FunctionalInterface
+    private interface ExchangeScript {
+        void run(ScriptedExchange<?> exchange) throws Exception;
+    }
+
+    /**
+     * One request sent through {@link ScriptedHttpClient}. Its script plays the HTTP client with these
+     * methods, signalling the store's body subscriber in whatever order the test needs.
+     */
+    private static final class ScriptedExchange<T> {
+        private final Thread caller;
+        private final HttpResponse.BodyHandler<T> handler;
+        private final HttpRequest request;
+        private final CompletableFuture<HttpResponse<T>> response = new CompletableFuture<>();
+        private HttpHeaders headers;
+        private int status;
+        private HttpResponse.BodySubscriber<T> subscriber;
+
+        ScriptedExchange(HttpRequest request, HttpResponse.BodyHandler<T> handler, Thread caller) {
+            this.request = request;
+            this.handler = handler;
+            this.caller = caller;
+        }
+
+        void complete() {
+            subscriber.onComplete();
+        }
+
+        // completes the response once the body subscriber has its body, or has failed
+        void finish() {
+            subscriber.getBody().whenComplete((body, error) -> {
+                if (error != null) {
+                    response.completeExceptionally(error);
+                } else {
+                    response.complete(new ScriptedResponse<>(request, status, headers, body));
+                }
+            });
+        }
+
+        void interruptCaller() {
+            caller.interrupt();
+        }
+
+        void next(ByteBuffer buffer) {
+            subscriber.onNext(List.of(buffer));
+        }
+
+        // delivers the status and headers, for which the store's body handler picks a subscriber
+        void respond(int status, Map<String, String> headers) {
+            final Map<String, List<String>> values = new HashMap<>();
+            headers.forEach((name, value) -> values.put(name, List.of(value)));
+            final HttpHeaders responseHeaders = HttpHeaders.of(values, (name, value) -> true);
+            this.status = status;
+            this.headers = responseHeaders;
+            subscriber = handler.apply(new HttpResponse.ResponseInfo() {
+                @Override
+                public HttpHeaders headers() {
+                    return responseHeaders;
+                }
+
+                @Override
+                public int statusCode() {
+                    return status;
+                }
+
+                @Override
+                public HttpClient.Version version() {
+                    return HttpClient.Version.HTTP_1_1;
+                }
+            });
+        }
+
+        void subscribe(AtomicInteger cancels) {
+            subscriber.onSubscribe(new Flow.Subscription() {
+                @Override
+                public void cancel() {
+                    cancels.incrementAndGet();
+                }
+
+                @Override
+                public void request(long n) {
+                }
+            });
+        }
+    }
+
+    /**
+     * HTTP client that answers each request with the next script a test added, run on a thread of its
+     * own, so a test decides when the store's body subscriber hears about the response, which a real
+     * client gives no control over. It never opens a connection.
+     */
+    private static final class ScriptedHttpClient extends HttpClient {
+        private final List<Throwable> failures = new CopyOnWriteArrayList<>();
+        private final ArrayDeque<ExchangeScript> scripts = new ArrayDeque<>();
+        private final List<Thread> threads = new CopyOnWriteArrayList<>();
+
+        @Override
+        public Optional<Authenticator> authenticator() {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<Duration> connectTimeout() {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<CookieHandler> cookieHandler() {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<Executor> executor() {
+            return Optional.empty();
+        }
+
+        @Override
+        public Redirect followRedirects() {
+            return Redirect.NEVER;
+        }
+
+        @Override
+        public Optional<ProxySelector> proxy() {
+            return Optional.empty();
+        }
+
+        @Override
+        public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public <T> CompletableFuture<HttpResponse<T>> sendAsync(HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+            final ScriptedExchange<T> exchange = new ScriptedExchange<>(request, handler, Thread.currentThread());
+            final ExchangeScript script;
+            synchronized (this) {
+                script = scripts.poll();
+            }
+            if (script == null) {
+                final AssertionError error = new AssertionError("no script for " + request.method() + ' ' + request.uri());
+                failures.add(error);
+                exchange.response.completeExceptionally(error);
+                return exchange.response;
+            }
+            final Thread thread = new Thread(() -> {
+                try {
+                    script.run(exchange);
+                } catch (Throwable e) {
+                    failures.add(e);
+                    exchange.response.completeExceptionally(e);
+                }
+            }, "scripted-http-exchange");
+            thread.setDaemon(true);
+            threads.add(thread);
+            thread.start();
+            return exchange.response;
+        }
+
+        @Override
+        public <T> CompletableFuture<HttpResponse<T>> sendAsync(
+                HttpRequest request,
+                HttpResponse.BodyHandler<T> handler,
+                HttpResponse.PushPromiseHandler<T> pushPromiseHandler
+        ) {
+            return sendAsync(request, handler);
+        }
+
+        @Override
+        public SSLContext sslContext() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public SSLParameters sslParameters() {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Version version() {
+            return Version.HTTP_1_1;
+        }
+
+        synchronized void add(ExchangeScript script) {
+            scripts.add(script);
+        }
+
+        // waits for the scripts to end, and fails when one threw or one was never used
+        void awaitScripts() throws InterruptedException {
+            for (Thread thread : threads) {
+                thread.join(30_000);
+                Assert.assertFalse("a script is still running", thread.isAlive());
+            }
+            if (!failures.isEmpty()) {
+                throw new AssertionError("a script failed", failures.get(0));
+            }
+            synchronized (this) {
+                Assert.assertTrue("scripts left unused", scripts.isEmpty());
+            }
+        }
+    }
+
+    private record ScriptedResponse<T>(HttpRequest request, int statusCode, HttpHeaders headers, T body) implements HttpResponse<T> {
+        @Override
+        public Optional<HttpResponse<T>> previousResponse() {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<SSLSession> sslSession() {
+            return Optional.empty();
+        }
+
+        @Override
+        public URI uri() {
+            return request.uri();
+        }
+
+        @Override
+        public HttpClient.Version version() {
+            return HttpClient.Version.HTTP_1_1;
+        }
     }
 }
