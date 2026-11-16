@@ -138,7 +138,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private boolean isDeleteListsLoaded;
     // the store holds this instance's delete list; coordinator thread only
     private boolean isDeleteListStored;
-    private volatile boolean isClosed;
+    // guarded by this: close() gives its use back once, and a start() that runs at the same time either
+    // starts the coordinator before close() looks for it or does not start it at all
+    private boolean isClosed;
     // close() gave its use back; guarded by useLock
     private boolean isCloseUseReleased;
     // an operator allowed this node to take over a store it does not own or is behind; read at start
@@ -241,10 +243,12 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
 
     @Override
     public void close() {
-        if (isClosed) {
-            return;
+        synchronized (this) {
+            if (isClosed) {
+                return;
+            }
+            isClosed = true;
         }
-        isClosed = true;
         closeStartedNanos = nanoTime();
         isRunning = false;
         wake();
