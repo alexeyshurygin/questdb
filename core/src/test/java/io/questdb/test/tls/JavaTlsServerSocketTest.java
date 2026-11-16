@@ -50,6 +50,7 @@ import org.junit.rules.Timeout;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
@@ -75,9 +76,22 @@ import static org.junit.Assert.*;
 public class JavaTlsServerSocketTest {
     @ClassRule
     public static final TemporaryFolder temp = new TemporaryFolder();
+    // the authentication tag of every TLS 1.3 cipher suite
+    private static final int AEAD_TAG_SIZE = 16;
     private static final String BUFFER_SIZE_PROPERTY = "questdb.experimental.tls.buffersize";
+    // The answers to this many TLS 1.3 key updates, 27 bytes each, overflow the default 256 KiB output buffer.
+    private static final int KEY_UPDATE_FLOOD = 10_000;
+    // The socket ends a connection whose peer sends more than 32 records without data in a row.
+    private static final int KEY_UPDATES_PER_DATA_RECORD = 16;
     private static final Log LOG = LogFactory.getLog(JavaTlsServerSocketTest.class);
+    private static final int MEMORY_BUF_SIZE = 64 * 1024;
+    // A made-up fd: only a MemoryTransport ever sees it.
+    private static final long MEMORY_FD = 1_000_000;
+    // A close_notify alert record before any cipher change: warning level, description 0 (RFC 5246, 7.2).
+    private static final byte[] PLAINTEXT_CLOSE_NOTIFY = {0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 0x00};
     private static final long TIMEOUT_NANOS = 20_000_000_000L;
+    private static final String TLS_12 = "TLSv1.2";
+    private static final String TLS_13 = "TLSv1.3";
     private static int boundPort;
     private static String certPath;
     private static String keyPath;
@@ -175,6 +189,43 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testClientCancelDuringTls12HandshakeFailsHandshake() throws Exception {
+        // A TLS 1.2 client that gives up mid-handshake sends user_canceled and close_notify. The server must fail
+        // the handshake at once rather than wait for a Finished that never comes, and close() answers with a
+        // close_notify of its own, in plaintext, as the handshake never got as far as changing ciphers.
+        TestUtils.assertMemoryLeak(() -> {
+            final var transport = new MemoryTransport();
+            final var server = new JavaTlsServerSocket(transport, LOG, TlsFuzzSupport.newServerContext());
+            final var client = new MemoryClient(TlsFuzzSupport.newTrustAllContext(), transport, TLS_12);
+            final var tlsMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            final var buf = Unsafe.malloc(MEMORY_BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+            final long sentBeforeClose;
+            try {
+                server.of(MEMORY_FD);
+                server.startTlsSession(null);
+                client.pump(); // the ClientHello
+                assertEquals(0, server.recv(buf, MEMORY_BUF_SIZE));
+                assertTrue("the server answers the ClientHello", transport.toClient.available() > 0);
+                // the client cancels before it reads the server's flight
+                client.cancel();
+                sentBeforeClose = transport.toClient.totalWritten;
+                assertEquals(-1, server.recv(buf, MEMORY_BUF_SIZE));
+                // a failed handshake stays failed
+                assertEquals(-1, server.recv(buf, MEMORY_BUF_SIZE));
+                assertEquals(-1, server.send(buf, 1));
+                assertEquals("the failed handshake sends nothing before close()", sentBeforeClose, transport.toClient.totalWritten);
+            } finally {
+                Unsafe.free(buf, MEMORY_BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+                server.close();
+            }
+            final var wire = transport.toClient.takeAll();
+            assertArrayEquals(PLAINTEXT_CLOSE_NOTIFY, Arrays.copyOfRange(wire, (int) sentBeforeClose, wire.length));
+            assertEquals("close() must close the fd exactly once", 1, transport.closeCalls);
+            assertEquals("close() must free every TLS buffer", tlsMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS));
+        });
+    }
+
+    @Test
     public void testCloseDuringHandshakeReleasesResources() throws Exception {
         Assume.assumeTrue("openssl not available", opensslAvailable);
         TestUtils.assertMemoryLeak(() -> {
@@ -203,6 +254,30 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testCloseNotifyBehindOwedAnswerGrowsBufferConfiguredSmall() throws Exception {
+        // The output buffer holds the answer to a key update, and close_notify does not fit behind it in a buffer
+        // configured to one packet. When the socket takes nothing at that moment, the buffer grows: close_notify
+        // goes out behind the answer instead of being dropped.
+        final var packetSize = packetBufferSize();
+        assertWithMemoryHandshake(packetSize, TLS_13, (client, server, transport, buf) -> {
+            final var wireBefore = client.wireSize();
+            client.keyUpdate();
+            assertEquals("a key update carries no data", 0, server.recv(buf, MEMORY_BUF_SIZE));
+            assertTrue("the answer waits in the output buffer", server.wantsTlsWrite());
+            final var tlsMem = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            transport.blockedSends = 1;
+            assertEquals(0, server.shutdown(Net.SHUT_WR));
+            assertEquals("the output buffer doubles to make room for close_notify", packetSize, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS) - tlsMem);
+            assertFalse("shutdown() sends the answer and close_notify once the socket takes them", server.wantsTlsWrite());
+            assertEquals(1, transport.shutdownWriteCalls);
+            client.pump();
+            client.assertHealthy();
+            assertEquals("the answer, then close_notify", 2, countRecords(client.wire(), wireBefore));
+            assertTrue(client.isCloseNotifySeen);
+        });
+    }
+
+    @Test
     public void testCloseNotifyDoesNotSpinOnEagain() throws Exception {
         final var isSocketFull = new AtomicBoolean();
         final var facade = new NetworkFacadeImpl() {
@@ -222,12 +297,51 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testCloseUnderMemoryLimitStillFreesEverything() throws Exception {
+        // A record the socket did not take leaves no room for close_notify in a buffer configured to one packet,
+        // and the RSS limit forbids growing it: close() must still close the fd and free every buffer.
+        assertWithMemoryHandshake(packetBufferSize(), TLS_13, (client, server, transport, buf) -> {
+            transport.sendBudget = 0;
+            putBytes(buf, pattern(100, 0));
+            assertEquals(0, server.send(buf, 100));
+            assertTrue(server.wantsTlsWrite());
+            Unsafe.setRssMemLimit(Unsafe.getRssMemUsed());
+            try {
+                server.close();
+            } finally {
+                Unsafe.setRssMemLimit(0);
+            }
+            assertTrue(server.isClosed());
+            assertFalse(server.isTlsSessionStarted());
+            assertFalse(server.wantsTlsWrite());
+            assertEquals(1, transport.closeCalls);
+        });
+    }
+
+    @Test
     public void testCorruptRecordFailsRecv() throws Exception {
         assertWithHandshake(NetworkFacadeImpl.INSTANCE, null, (client, server, buf) -> {
             final var record = client.encrypt("tampered".getBytes(StandardCharsets.UTF_8));
             record[record.length - 1] ^= 1; // breaks the record's authentication tag
             client.writeRaw(record);
             assertEquals(-1, recvUntilNonZero(server, buf, 4096));
+        });
+    }
+
+    @Test
+    public void testEofInsideRecordAfterDataDeliversDataFirst() throws Exception {
+        // One recv() reads a whole record, half of the next and the end of the stream: it returns the data of the
+        // whole record, and the next call reports the disconnect.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            final var whole = "delivered".getBytes(StandardCharsets.UTF_8);
+            client.write(whole);
+            final var cut = client.encrypt("cut short".getBytes(StandardCharsets.UTF_8));
+            transport.toServer.append(cut, 0, cut.length / 2);
+            transport.isPeerClosed = true;
+            assertEquals(whole.length, server.recv(buf, MEMORY_BUF_SIZE));
+            assertNativeBytes(whole, buf);
+            // the transport's own disconnect code passes through
+            assertEquals(Net.EOTHERDISCONNECT, server.recv(buf, MEMORY_BUF_SIZE));
         });
     }
 
@@ -629,6 +743,133 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testKeyUpdateAnswersGrowBufferConfiguredSmall() throws Exception {
+        // In a buffer configured to one packet the second answer to a key update no longer fits behind the first.
+        // With the socket taking nothing, the buffer grows rather than giving the connection up, and the answers go
+        // out once the socket drains.
+        final var packetSize = packetBufferSize();
+        final var updates = 10;
+        assertWithMemoryHandshake(packetSize, TLS_13, (client, server, transport, buf) -> {
+            transport.sendBudget = 0;
+            final var wireBefore = client.wireSize();
+            final var sentBefore = transport.toClient.totalWritten;
+            final var tlsMem = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            final var data = client.floodKeyUpdates(updates);
+            assertEquals(data.length, server.recv(buf, MEMORY_BUF_SIZE));
+            assertNativeBytes(data, buf);
+            assertEquals("the output buffer doubles to keep the answers", packetSize, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS) - tlsMem);
+            assertTrue(server.wantsTlsWrite());
+            assertEquals("a socket that takes nothing gets nothing", sentBefore, transport.toClient.totalWritten);
+            transport.sendBudget = Long.MAX_VALUE;
+            assertEquals(0, server.tlsIO(Socket.WRITE_FLAG));
+            assertFalse(server.wantsTlsWrite());
+            client.pump();
+            client.assertHealthy();
+            assertEquals("one answer per key update", updates, countRecords(client.wire(), wireBefore));
+            // each answer changes the key the client reads with: data sent next decrypts only behind all of them
+            final var next = "next".getBytes(StandardCharsets.UTF_8);
+            putBytes(buf, next);
+            assertEquals(next.length, server.send(buf, next.length));
+            client.pump();
+            client.assertHealthy();
+            assertArrayEquals(next, client.plaintext());
+        });
+    }
+
+    @Test
+    public void testKeyUpdateFloodAnswersGoOutBeforeCloseNotify() throws Exception {
+        // recv() gives up a key update flood that fills the default output buffer while the peer reads nothing (see
+        // testKeyUpdateFloodAtDefaultBufferSizeFailsRecv). When the peer reads again by the time the server closes,
+        // close() sends the answers, the one it still owes included, and close_notify last.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            transport.sendBudget = 0;
+            final var wireBefore = client.wireSize();
+            client.floodKeyUpdates(KEY_UPDATE_FLOOD);
+            assertEquals(-1, server.recv(buf, MEMORY_BUF_SIZE));
+            transport.sendBudget = Long.MAX_VALUE;
+            server.close();
+            client.pump();
+            // Each answer changes the key the client reads with, so close_notify decrypts only behind every
+            // answer the server produced.
+            client.assertHealthy();
+            assertTrue("close_notify must follow the answers", client.isCloseNotifySeen);
+            final var answers = countRecords(client.wire(), wireBefore) - 1;
+            assertTrue("answers: " + answers, answers > 0 && answers < KEY_UPDATE_FLOOD);
+        });
+    }
+
+    @Test
+    public void testKeyUpdateFloodAtDefaultBufferSizeFailsRecv() throws Exception {
+        // A peer that asks for key updates and reads none of the answers fills the output buffer with them. At the
+        // default size the buffer does not grow: recv() gives the connection up, and close() frees it without the
+        // answer and the close_notify it still owes.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            transport.sendBudget = 0;
+            final var sentBefore = transport.toClient.totalWritten;
+            final var tlsMem = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            client.floodKeyUpdates(KEY_UPDATE_FLOOD);
+            assertEquals(-1, server.recv(buf, MEMORY_BUF_SIZE));
+            assertEquals("the output buffer must not grow past the default size", tlsMem, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS));
+            assertEquals("a socket that takes nothing gets nothing", sentBefore, transport.toClient.totalWritten);
+            assertTrue(server.wantsTlsWrite());
+            // the socket still takes nothing when the harness closes the connection
+        });
+    }
+
+    @Test
+    public void testKeyUpdateFloodIsAnsweredWhilePeerReads() throws Exception {
+        // A peer that reads its answers may ask for key updates as often as it likes: when the answers fill the
+        // output buffer, recv() writes them to the socket itself instead of giving the connection up.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            final var wireBefore = client.wireSize();
+            final var sentBefore = transport.toClient.totalWritten;
+            final var data = client.floodKeyUpdates(KEY_UPDATE_FLOOD);
+            assertEquals(data.length, server.recv(buf, MEMORY_BUF_SIZE));
+            assertNativeBytes(data, buf);
+            assertTrue("recv() writes out the answers that fill the output buffer", transport.toClient.totalWritten > sentBefore);
+            while (server.wantsTlsWrite()) {
+                assertEquals(0, server.tlsIO(Socket.WRITE_FLAG));
+            }
+            client.pump();
+            client.assertHealthy();
+            assertEquals("one answer per key update", KEY_UPDATE_FLOOD, countRecords(client.wire(), wireBefore));
+            final var after = "after".getBytes(StandardCharsets.UTF_8);
+            putBytes(buf, after);
+            assertEquals(after.length, server.send(buf, after.length));
+            client.pump();
+            client.assertHealthy();
+            assertArrayEquals(after, client.plaintext());
+        });
+    }
+
+    @Test
+    public void testOversizedRecordGrowsPlaintextBufferBeforeFailing() throws Exception {
+        // A record as long as the session's packet size carries more ciphertext than TLS 1.3 allows. SSLEngine
+        // estimates its plaintext from its length before it authenticates it, finds the estimate larger than the
+        // plaintext buffer and asks for a larger one: recv() grows the buffer instead of spinning, and fails when
+        // the record does not authenticate. The bytes behind the record fill the input buffer, which recv() must
+        // not then read into.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            final var session = client.engine.getSession();
+            final var stagingCapacity = session.getApplicationBufferSize();
+            final var length = session.getPacketBufferSize() - 5;
+            assertTrue(
+                    "the plaintext SSLEngine estimates for the record must exceed the plaintext buffer",
+                    length - AEAD_TAG_SIZE > stagingCapacity
+            );
+            final var tlsMem = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            final var record = oversizedRecord(length);
+            transport.toServer.append(record, 0, record.length);
+            final var filler = new byte[256 * 1024];
+            transport.toServer.append(filler, 0, filler.length);
+            // a caller buffer smaller than a record gets the record through the plaintext buffer
+            assertEquals(-1, server.recv(buf, 4096));
+            assertEquals("the plaintext buffer doubles", stagingCapacity, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS) - tlsMem);
+            assertEquals("recv() must not read into a full input buffer", 0, transport.zeroLengthReads);
+        });
+    }
+
+    @Test
     public void testPartialClientHelloWaitsForMore() throws Exception {
         Assume.assumeTrue("openssl not available", opensslAvailable);
         TestUtils.assertMemoryLeak(() -> {
@@ -786,12 +1027,82 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testSendAfterFailedRecordSendsAlert() throws Exception {
+        // A record that fails authentication leaves the engine closed with a fatal alert to send. send() wraps the
+        // alert instead of the caller's data and reports the closed engine, and close() delivers the alert, so the
+        // client learns why the connection ended.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            final var record = client.encrypt("tampered".getBytes(StandardCharsets.UTF_8));
+            record[record.length - 1] ^= 1; // breaks the record's authentication tag
+            transport.toServer.append(record, 0, record.length);
+            assertEquals(-1, server.recv(buf, MEMORY_BUF_SIZE));
+            putBytes(buf, pattern(16, 0));
+            assertEquals(-1, server.send(buf, 16));
+            server.close();
+            client.pump();
+            assertNotNull("the client must learn why the connection ended", client.failure);
+            TestUtils.assertContains(client.failure.getMessage(), "Received fatal alert: bad_record_mac");
+            assertEquals("the caller's data never reaches the client", 0, client.plaintext().length);
+        });
+    }
+
+    @Test
     public void testSendAfterPeerCloseNotifyFails() throws Exception {
         // TLS 1.2 closes the outbound side when the peer's close_notify arrives
         assertWithHandshake(NetworkFacadeImpl.INSTANCE, "TLSv1.2", (client, server, buf) -> {
             client.writeRaw(client.closeNotify());
             assertEquals(-1, recvUntilNonZero(server, buf, 4096));
             assertEquals(-1, server.send(buf, 16));
+        });
+    }
+
+    @Test
+    public void testSendAfterShortWriteMustPresentTheSameBytes() throws Exception {
+        // After a short write the record is encrypted and partly on the wire: the caller must present the same
+        // bytes again. Different bytes would land behind what the peer already has, so send() fails instead.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            final var first = pattern(100, 0);
+            putBytes(buf, first);
+            transport.sendBudget = 10;
+            assertEquals("a record the socket took in part reports no plaintext", 0, server.send(buf, first.length));
+            assertTrue(server.wantsTlsWrite());
+            transport.sendBudget = Long.MAX_VALUE;
+            final var other = first.clone();
+            other[other.length - 1] ^= 1;
+            putBytes(buf, other);
+            assertEquals(-1, server.send(buf, other.length));
+            client.pump();
+            client.assertHealthy();
+            assertArrayEquals("the peer gets the bytes that were encrypted", first, client.plaintext());
+        });
+    }
+
+    @Test
+    public void testSendAfterShortWriteWithTheSameBytesSendsThemOnce() throws Exception {
+        // The caller presents the bytes of a short write again, alone or followed by new ones: send() reports them
+        // once the socket has their whole record, and encrypts only the new ones.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            final var wireBefore = client.wireSize();
+            final var first = pattern(100, 0);
+            final var second = pattern(50, 100);
+            final var third = pattern(30, 150);
+            putBytes(buf, first);
+            transport.sendBudget = 10;
+            assertEquals(0, server.send(buf, first.length));
+            transport.sendBudget = Long.MAX_VALUE;
+            final var firstAndSecond = concat(first, second);
+            putBytes(buf, firstAndSecond);
+            assertEquals(firstAndSecond.length, server.send(buf, firstAndSecond.length));
+            putBytes(buf, third);
+            transport.sendBudget = 1;
+            assertEquals(0, server.send(buf, third.length));
+            transport.sendBudget = Long.MAX_VALUE;
+            assertEquals(third.length, server.send(buf, third.length));
+            assertFalse(server.wantsTlsWrite());
+            client.pump();
+            client.assertHealthy();
+            assertArrayEquals(concat(firstAndSecond, third), client.plaintext());
+            assertEquals("one record per send() that encrypted", 3, countRecords(client.wire(), wireBefore));
         });
     }
 
@@ -812,6 +1123,24 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testSendUnderMemoryLimitFailsWhenShortWriteCannotBeKept() throws Exception {
+        // After a short write send() keeps a copy of the plaintext it encrypted. When the RSS limit forbids the
+        // copy, send() fails the connection instead of throwing at the caller.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            putBytes(buf, pattern(100, 0));
+            transport.sendBudget = 10;
+            final int n;
+            Unsafe.setRssMemLimit(Unsafe.getRssMemUsed());
+            try {
+                n = server.send(buf, 100);
+            } finally {
+                Unsafe.setRssMemLimit(0);
+            }
+            assertEquals(-1, n);
+        });
+    }
+
+    @Test
     public void testShutdownSendsQueuedBytesAndCloseNotifyBeforeFin() throws Exception {
         assertWithHandshake(NetworkFacadeImpl.INSTANCE, null, (client, server, buf) -> {
             final var plain = "last words".getBytes(StandardCharsets.UTF_8);
@@ -825,6 +1154,43 @@ public class JavaTlsServerSocketTest {
             assertTrue("expected the server's close_notify", client.readUntilClosed());
             // after the shutdown nothing more can be sent
             assertEquals(-1, server.send(buf, plain.length));
+        });
+    }
+
+    @Test
+    public void testShutdownUnderMemoryLimitStillShutsDown() throws Exception {
+        // A record the socket did not take leaves no room for close_notify in a buffer configured to one packet,
+        // and the RSS limit forbids growing it: shutdown() still shuts the socket down.
+        assertWithMemoryHandshake(packetBufferSize(), TLS_13, (client, server, transport, buf) -> {
+            transport.sendBudget = 0;
+            putBytes(buf, pattern(100, 0));
+            assertEquals(0, server.send(buf, 100));
+            final var tlsMem = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            final int result;
+            Unsafe.setRssMemLimit(Unsafe.getRssMemUsed());
+            try {
+                result = server.shutdown(Net.SHUT_WR);
+            } finally {
+                Unsafe.setRssMemLimit(0);
+            }
+            assertEquals(0, result);
+            assertEquals("shutdown() must shut the socket down without close_notify", 1, transport.shutdownWriteCalls);
+            assertEquals("no buffer grew", tlsMem, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS));
+            assertTrue("the record the socket did not take stays queued", server.wantsTlsWrite());
+        });
+    }
+
+    @Test
+    public void testShutdownWithFailingTransportStillShutsDown() throws Exception {
+        // The socket fails to write close_notify: shutdown() still shuts it down, and a later send() reports the
+        // transport's own error.
+        assertWithMemoryHandshake(-1, TLS_13, (client, server, transport, buf) -> {
+            transport.sendErrorCode = Net.EOTHERDISCONNECT;
+            assertEquals(0, server.shutdown(Net.SHUT_WR));
+            assertEquals(1, transport.shutdownWriteCalls);
+            assertTrue("close_notify stays queued", server.wantsTlsWrite());
+            putBytes(buf, pattern(1, 0));
+            assertEquals(Net.EOTHERDISCONNECT, server.send(buf, 1));
         });
     }
 
@@ -1060,6 +1426,12 @@ public class JavaTlsServerSocketTest {
         });
     }
 
+    private static void assertNativeBytes(byte[] expected, long address) {
+        for (var i = 0; i < expected.length; i++) {
+            assertEquals("byte " + i, expected[i], Unsafe.getUnsafe().getByte(address + i));
+        }
+    }
+
     private static void assertWithHandshake(NetworkFacade nf, String clientProtocol, HandshakeScenario scenario) throws Exception {
         Assume.assumeTrue("openssl not available", opensslAvailable);
         TestUtils.assertMemoryLeak(() -> {
@@ -1087,6 +1459,47 @@ public class JavaTlsServerSocketTest {
             } finally {
                 Net.close(serverFd);
             }
+        });
+    }
+
+    /**
+     * Runs {@code scenario} on a TLS connection that lives in the test: the socket reads and writes through a
+     * {@link MemoryTransport}, and a JDK {@link SSLEngine} client sits on its other end, so every byte that moves is
+     * the test's decision and nothing depends on timing. The handshake is complete when the scenario starts. The
+     * connection is closed after it, and close() must close the fd once and free every TLS buffer.
+     *
+     * @param bufferSize the size the socket starts its buffers at, or -1 for the default
+     */
+    private static void assertWithMemoryHandshake(int bufferSize, String clientProtocol, MemoryScenario scenario) throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final var transport = new MemoryTransport();
+            final var server = new JavaTlsServerSocket(transport, LOG, TlsFuzzSupport.newServerContext());
+            final var client = new MemoryClient(TlsFuzzSupport.newTrustAllContext(), transport, clientProtocol);
+            final var tlsMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            final var buf = Unsafe.malloc(MEMORY_BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+            try {
+                server.of(MEMORY_FD);
+                startTls(server, bufferSize);
+                for (var steps = 0; !client.isHandshakeDone() || server.isHandshakeInProgress(); steps++) {
+                    assertTrue("the handshake did not complete", steps < 1_000);
+                    client.pump();
+                    client.assertHealthy();
+                    assertEquals("no application data during the handshake", 0, server.recv(buf, MEMORY_BUF_SIZE));
+                    if (server.wantsTlsWrite()) {
+                        assertEquals(0, server.tlsIO(Socket.WRITE_FLAG));
+                    }
+                }
+                // the client takes what the server sends when its side of the handshake ends: the TLS 1.3 session
+                // ticket
+                client.pump();
+                client.assertHealthy();
+                scenario.run(client, server, transport, buf);
+            } finally {
+                Unsafe.free(buf, MEMORY_BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
+                server.close();
+            }
+            assertEquals("close() must close the fd exactly once", 1, transport.closeCalls);
+            assertEquals("close() must free every TLS buffer", tlsMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS));
         });
     }
 
@@ -1131,6 +1544,12 @@ public class JavaTlsServerSocketTest {
         return record.toByteArray();
     }
 
+    private static byte[] concat(byte[] head, byte[] tail) {
+        final var joined = Arrays.copyOf(head, head.length + tail.length);
+        System.arraycopy(tail, 0, joined, head.length, tail.length);
+        return joined;
+    }
+
     private static long connectRaw() {
         final var clientFd = Net.socketTcp(true);
         assertTrue(clientFd > 0);
@@ -1141,6 +1560,19 @@ public class JavaTlsServerSocketTest {
             Net.freeSockAddr(addr);
         }
         return clientFd;
+    }
+
+    /**
+     * @return the number of TLS records in {@code wire} from {@code offset} on, which must be a run of whole records
+     */
+    private static int countRecords(byte[] wire, int offset) {
+        var count = 0;
+        for (var at = offset; at < wire.length; count++) {
+            assertTrue("a record cut short on the wire", at + 5 <= wire.length);
+            at += 5 + (((wire[at + 3] & 0xff) << 8) | (wire[at + 4] & 0xff));
+            assertTrue("a record cut short on the wire", at <= wire.length);
+        }
+        return count;
     }
 
     private static boolean isOpensslAvailable() {
@@ -1179,6 +1611,45 @@ public class JavaTlsServerSocketTest {
         throw new AssertionError("could not find a free port");
     }
 
+    /**
+     * @return an application data record with {@code length} bytes of noise as its ciphertext, which fails
+     * authentication
+     */
+    private static byte[] oversizedRecord(int length) {
+        final var record = new byte[5 + length];
+        record[0] = 0x17; // application_data
+        record[1] = 0x03;
+        record[2] = 0x03; // the version every TLS 1.2 and 1.3 record carries
+        record[3] = (byte) (length >> 8);
+        record[4] = (byte) length;
+        for (var i = 5; i < record.length; i++) {
+            record[i] = (byte) (i * 31);
+        }
+        return record;
+    }
+
+    /**
+     * @return the room SSLEngine wants free in the output buffer before it wraps a record, for a session that has
+     * received nothing larger than TLS allows
+     */
+    private static int packetBufferSize() throws Exception {
+        return TlsFuzzSupport.newTrustAllContext().createSSLEngine().getSession().getPacketBufferSize();
+    }
+
+    private static byte[] pattern(int length, int seed) {
+        final var bytes = new byte[length];
+        for (var i = 0; i < length; i++) {
+            bytes[i] = (byte) ('a' + (seed + i) % 26);
+        }
+        return bytes;
+    }
+
+    private static void putBytes(long address, byte[] bytes) {
+        for (var i = 0; i < bytes.length; i++) {
+            Unsafe.getUnsafe().putByte(address + i, bytes[i]);
+        }
+    }
+
     private static int recvUntilNonZero(JavaTlsServerSocket socket, long buf, int len) {
         final var deadline = System.nanoTime() + TIMEOUT_NANOS;
         while (System.nanoTime() < deadline) {
@@ -1200,6 +1671,23 @@ public class JavaTlsServerSocketTest {
             assertEquals(bytes.length, Net.send(fd, buf, bytes.length));
         } finally {
             Unsafe.free(buf, bytes.length, MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    /**
+     * Starts TLS with the socket's buffers at {@code bufferSize}, or at the default size when it is -1. The size is
+     * a JVM-wide property the socket reads when the session starts, so it is set for this call only.
+     */
+    private static void startTls(JavaTlsServerSocket server, int bufferSize) throws TlsSessionInitFailedException {
+        if (bufferSize < 0) {
+            server.startTlsSession(null);
+            return;
+        }
+        System.setProperty(BUFFER_SIZE_PROPERTY, Integer.toString(bufferSize));
+        try {
+            server.startTlsSession(null);
+        } finally {
+            System.clearProperty(BUFFER_SIZE_PROPERTY);
         }
     }
 
@@ -1225,6 +1713,61 @@ public class JavaTlsServerSocketTest {
     @FunctionalInterface
     private interface HandshakeScenario {
         void run(EngineClient client, JavaTlsServerSocket server, long buf) throws Exception;
+    }
+
+    @FunctionalInterface
+    private interface MemoryScenario {
+        void run(MemoryClient client, JavaTlsServerSocket server, MemoryTransport transport, long buf) throws Exception;
+    }
+
+    /**
+     * Bytes in flight in one direction of a {@link MemoryTransport}.
+     */
+    private static final class ByteQueue {
+        long totalWritten;
+        private byte[] bytes = new byte[4096];
+        private int readPos;
+        private int writePos;
+
+        void append(byte[] source, int offset, int length) {
+            ensureRoom(length);
+            System.arraycopy(source, offset, bytes, writePos, length);
+            writePos += length;
+            totalWritten += length;
+        }
+
+        void appendFromNative(long address, int length) {
+            ensureRoom(length);
+            Unsafe.copyMemory(null, address, bytes, Unsafe.BYTE_OFFSET + writePos, length);
+            writePos += length;
+            totalWritten += length;
+        }
+
+        int available() {
+            return writePos - readPos;
+        }
+
+        void readToNative(long address, int length) {
+            Unsafe.copyMemory(bytes, Unsafe.BYTE_OFFSET + readPos, null, address, length);
+            readPos += length;
+        }
+
+        byte[] takeAll() {
+            final var taken = Arrays.copyOfRange(bytes, readPos, writePos);
+            readPos = writePos;
+            return taken;
+        }
+
+        private void ensureRoom(int length) {
+            if (writePos + length > bytes.length) {
+                final var live = writePos - readPos;
+                final var grown = new byte[Math.max(2 * bytes.length, live + length)];
+                System.arraycopy(bytes, readPos, grown, 0, live);
+                bytes = grown;
+                readPos = 0;
+                writePos = live;
+            }
+        }
     }
 
     /**
@@ -1393,6 +1936,282 @@ public class JavaTlsServerSocketTest {
             while (buf.hasRemaining()) {
                 channel.write(buf);
             }
+        }
+    }
+
+    /**
+     * A JDK TLS client on the far end of a {@link MemoryTransport}, stepped from the test thread. It keeps every
+     * byte the server sent, so a test can count the records on the wire, and every byte of plaintext it decrypted.
+     */
+    private static final class MemoryClient {
+        private static final ByteBuffer NOTHING = ByteBuffer.allocate(0);
+        final SSLEngine engine;
+        SSLException failure;
+        boolean isCloseNotifySeen;
+        private final ByteBuffer netOut = ByteBuffer.allocate(64 * 1024);
+        private final ByteArrayOutputStream plaintext = new ByteArrayOutputStream();
+        private final MemoryTransport transport;
+        private final ByteArrayOutputStream wire = new ByteArrayOutputStream();
+        private ByteBuffer appIn = ByteBuffer.allocate(64 * 1024);
+        private boolean isHandshakeDone;
+        private ByteBuffer netIn = ByteBuffer.allocate(64 * 1024);
+
+        MemoryClient(SSLContext context, MemoryTransport transport, String protocol) throws SSLException {
+            this.transport = transport;
+            // host and port only name the entry in the context's session cache
+            engine = context.createSSLEngine("localhost", 1);
+            engine.setUseClientMode(true);
+            engine.setEnabledProtocols(new String[]{protocol});
+            engine.beginHandshake();
+        }
+
+        void assertHealthy() {
+            if (failure != null) {
+                throw new AssertionError("the client engine failed: " + failure, failure);
+            }
+        }
+
+        /**
+         * Gives the handshake up: closing the outbound side of an unfinished handshake sends user_canceled and
+         * close_notify.
+         */
+        void cancel() throws SSLException {
+            engine.closeOutbound();
+            //noinspection StatementWithEmptyBody
+            while (wrapControl() > 0) {
+                // until the engine has wrapped everything it closes with
+            }
+        }
+
+        byte[] encrypt(byte[] plain) throws SSLException {
+            final var out = new ByteArrayOutputStream();
+            final var src = ByteBuffer.wrap(plain);
+            while (src.hasRemaining()) {
+                netOut.clear();
+                assertEquals(SSLEngineResult.Status.OK, engine.wrap(src, netOut).getStatus());
+                netOut.flip();
+                out.write(netOut.array(), 0, netOut.limit());
+            }
+            return out.toByteArray();
+        }
+
+        /**
+         * Asks for {@code updates} key updates, each of which obliges the server to answer, with a data record of
+         * one byte behind every {@value #KEY_UPDATES_PER_DATA_RECORD} of them and behind the last.
+         *
+         * @return the data sent along
+         */
+        byte[] floodKeyUpdates(int updates) throws SSLException {
+            final var data = new ByteArrayOutputStream();
+            for (var i = 1; i <= updates; i++) {
+                keyUpdate();
+                if (i % KEY_UPDATES_PER_DATA_RECORD == 0 || i == updates) {
+                    final var b = (byte) ('a' + data.size() % 26);
+                    write(new byte[]{b});
+                    data.write(b);
+                }
+            }
+            return data.toByteArray();
+        }
+
+        boolean isHandshakeDone() {
+            return isHandshakeDone;
+        }
+
+        /**
+         * Asks for a TLS 1.3 key update, which obliges the server to answer with one of its own.
+         */
+        void keyUpdate() throws SSLException {
+            engine.beginHandshake();
+            assertTrue("a key update takes a record", wrapControl() > 0);
+        }
+
+        byte[] plaintext() {
+            return plaintext.toByteArray();
+        }
+
+        /**
+         * Feeds the engine everything the server has written and does all the work that needs no more bytes from
+         * the server.
+         */
+        void pump() {
+            final var bytes = transport.toClient.takeAll();
+            wire.writeBytes(bytes);
+            if (netIn.remaining() < bytes.length) {
+                final var bigger = ByteBuffer.allocate(Math.max(2 * netIn.capacity(), netIn.position() + bytes.length));
+                netIn.flip();
+                bigger.put(netIn);
+                netIn = bigger;
+            }
+            netIn.put(bytes);
+            if (failure != null) {
+                // a failed engine reads nothing more
+                return;
+            }
+            try {
+                for (var steps = 0; ; steps++) {
+                    assertTrue("the client engine spins", steps < 10_000_000);
+                    switch (engine.getHandshakeStatus()) {
+                        case NEED_TASK -> {
+                            Runnable task;
+                            while ((task = engine.getDelegatedTask()) != null) {
+                                task.run();
+                            }
+                        }
+                        case NEED_WRAP -> {
+                            if (wrapControl() == 0) {
+                                return;
+                            }
+                        }
+                        default -> {
+                            if (!unwrapRecord()) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            } catch (SSLException e) {
+                failure = e;
+            }
+        }
+
+        byte[] wire() {
+            return wire.toByteArray();
+        }
+
+        int wireSize() {
+            return wire.size();
+        }
+
+        void write(byte[] plain) throws SSLException {
+            final var bytes = encrypt(plain);
+            transport.toServer.append(bytes, 0, bytes.length);
+        }
+
+        /**
+         * @return false when the engine needs more bytes from the server to go on
+         */
+        private boolean unwrapRecord() throws SSLException {
+            netIn.flip();
+            try {
+                if (!netIn.hasRemaining()) {
+                    return false;
+                }
+                appIn.clear();
+                final var result = engine.unwrap(netIn, appIn);
+                if (result.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.FINISHED) {
+                    isHandshakeDone = true;
+                }
+                plaintext.write(appIn.array(), 0, appIn.position());
+                return switch (result.getStatus()) {
+                    case BUFFER_OVERFLOW -> {
+                        appIn = ByteBuffer.allocate(2 * appIn.capacity());
+                        yield true;
+                    }
+                    case BUFFER_UNDERFLOW -> false;
+                    case CLOSED -> {
+                        // the server's close_notify; whatever follows it stays unread
+                        isCloseNotifySeen |= result.bytesConsumed() > 0;
+                        yield false;
+                    }
+                    default -> result.bytesConsumed() > 0
+                            || engine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_TASK
+                            || engine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_WRAP;
+                };
+            } finally {
+                netIn.compact();
+            }
+        }
+
+        /**
+         * Wraps one record of handshake, alert or key update output and puts it on the wire.
+         *
+         * @return the bytes wrapped
+         */
+        private int wrapControl() throws SSLException {
+            netOut.clear();
+            final var result = engine.wrap(NOTHING, netOut);
+            if (result.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.FINISHED) {
+                isHandshakeDone = true;
+            }
+            netOut.flip();
+            transport.toServer.append(netOut.array(), 0, netOut.limit());
+            return netOut.limit();
+        }
+    }
+
+    /**
+     * A transport that lives in the test. The plain socket under the TLS socket reaches the network only through
+     * these methods, keyed by a made-up fd, so its bytes go to two queues, and the test decides how many bytes each
+     * write takes and when the peer hangs up.
+     */
+    private static final class MemoryTransport extends NetworkFacadeImpl {
+        final ByteQueue toClient = new ByteQueue();
+        final ByteQueue toServer = new ByteQueue();
+        // the next writes take nothing, as when the peer's window is full
+        int blockedSends;
+        int closeCalls;
+        // once the bytes for the server run out, reads report the end of the stream
+        boolean isPeerClosed;
+        // what writes return instead of taking bytes, such as a disconnect code; 0 lets them through
+        int sendErrorCode;
+        // how many bytes the writes take in all before they take nothing
+        long sendBudget = Long.MAX_VALUE;
+        int shutdownWriteCalls;
+        // reads that asked for no bytes: recv(2) returns 0 for them, which the socket would take for a disconnect
+        int zeroLengthReads;
+
+        @Override
+        public int close(long fd) {
+            closeCalls++;
+            return 0;
+        }
+
+        @Override
+        public void close(long fd, Log logger) {
+            closeCalls++;
+        }
+
+        @Override
+        public int recvRaw(long fd, long buffer, int bufferLen) {
+            if (bufferLen <= 0) {
+                zeroLengthReads++;
+                return Net.EOTHERDISCONNECT;
+            }
+            final var available = toServer.available();
+            if (available == 0) {
+                return isPeerClosed ? Net.EOTHERDISCONNECT : 0;
+            }
+            final var n = Math.min(bufferLen, available);
+            toServer.readToNative(buffer, n);
+            return n;
+        }
+
+        @Override
+        public int sendRaw(long fd, long buffer, int bufferLen) {
+            if (sendErrorCode != 0) {
+                return sendErrorCode;
+            }
+            if (shutdownWriteCalls > 0) {
+                // as on a kernel socket, nothing goes out after shutdown(SHUT_WR)
+                return Net.EPEERDISCONNECT;
+            }
+            if (blockedSends > 0) {
+                blockedSends--;
+                return 0;
+            }
+            final var n = (int) Math.min(bufferLen, sendBudget);
+            sendBudget -= n;
+            toClient.appendFromNative(buffer, n);
+            return n;
+        }
+
+        @Override
+        public int shutdown(long fd, int how) {
+            if (how == Net.SHUT_WR) {
+                shutdownWriteCalls++;
+            }
+            return 0;
         }
     }
 }
