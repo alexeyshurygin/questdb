@@ -34,6 +34,7 @@ import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.replication.codec.IndexTable;
 import io.questdb.replication.codec.NativeBuffer;
+import io.questdb.replication.codec.NativeReader;
 import io.questdb.replication.codec.SegmentDelta;
 import io.questdb.replication.codec.TableCreateManifest;
 import io.questdb.replication.codec.TxnPart;
@@ -153,13 +154,23 @@ public class TableReplayer {
         if (!worker.getIo().get(key, buf)) {
             throw ReplicationException.missing("WAL delta is missing from the object store [key=" + key + ']');
         }
-        final SegmentDelta delta = worker.getDelta().of(buf.ptr(), buf.size());
+        final SegmentDelta delta;
+        try {
+            delta = worker.getDelta().of(buf.ptr(), buf.size());
+        } catch (NativeReader.CorruptObjectException e) {
+            throw corruptDelta(key, e);
+        }
         if (delta.getWalId() != record.getWalId() || delta.getSegmentId() != record.getSegmentId()
                 || delta.getFirstSegmentTxn() != record.getDeltaFirstSegmentTxn()
                 || delta.getLastSegmentTxn() != record.getDeltaLastSegmentTxn()) {
             throw ReplicationException.corrupt("WAL delta does not match its key [key=" + key + ']');
         }
-        worker.getDeltaWriter().apply(engine.getConfiguration().getDbRoot(), token.getDirName(), delta, isDurable);
+        try {
+            // the ranges decode while they are written
+            worker.getDeltaWriter().apply(engine.getConfiguration().getDbRoot(), token.getDirName(), delta, isDurable);
+        } catch (NativeReader.CorruptObjectException e) {
+            throw corruptDelta(key, e);
+        }
         segmentHighWater.put(segKey, delta.getLastSegmentTxn());
         if (pins != null) {
             pins.onDownloaded(token.getDirName(), record.getWalId(), record.getSegmentId(), System.currentTimeMillis());
@@ -192,6 +203,10 @@ public class TableReplayer {
         }
     }
 
+    private static ReplicationException corruptDelta(String key, NativeReader.CorruptObjectException e) {
+        return ReplicationException.corrupt("corrupt WAL delta [key=" + key + ", error=" + e.getMessage() + ']');
+    }
+
     private String entry(TableToken t) {
         return t != null ? t.getTableName() : tableKey;
     }
@@ -212,7 +227,7 @@ public class TableReplayer {
         final TxnPart p;
         try {
             p = TxnPart.decode(buf.ptr(), buf.size());
-        } catch (io.questdb.replication.codec.NativeReader.CorruptObjectException e) {
+        } catch (NativeReader.CorruptObjectException e) {
             throw ReplicationException.corrupt("corrupt transaction log part [key=" + key + ", error=" + e.getMessage() + ']');
         }
         if (p.getTableId() != entry.getTableId() || p.getCreateTimestamp() != entry.getCreateTimestamp()
@@ -258,7 +273,7 @@ public class TableReplayer {
                 final TableCreateManifest manifest;
                 try {
                     manifest = TableCreateManifest.decode(buf.ptr(), buf.size());
-                } catch (io.questdb.replication.codec.NativeReader.CorruptObjectException e) {
+                } catch (NativeReader.CorruptObjectException e) {
                     throw ReplicationException.corrupt("corrupt table create manifest [key=" + key + ", error=" + e.getMessage() + ']');
                 }
                 if (manifest.getTableId() != entry.getTableId() || manifest.getCreateTimestamp() != entry.getCreateTimestamp()

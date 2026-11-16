@@ -194,6 +194,54 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testCorruptDeltaMakesTheTableStale() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = newDir("corrupt-delta-a");
+            final String b = newDir("corrupt-delta-b");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
+                 ReplicatedCairoEngine replica = newEngine(b, ReplicationRole.REPLICA);
+                 ReplicationWorker pw = worker(store, primary, a);
+                 ReplicationWorker rw = worker(store, replica, b)) {
+                final IndexTable entry = uploadSample(primary, pw);
+                final String key = entry.getKey();
+                final TxnRecord first = decodePart(store.getBytes(StoreKeys.seqPart(key, 0, EPOCH))).getRecord(1);
+                final int walId = first.getWalId();
+                final int segmentId = first.getSegmentId();
+                final int lo = first.getDeltaFirstSegmentTxn();
+                final int hi = first.getDeltaLastSegmentTxn();
+                final String deltaKey = StoreKeys.segmentDelta(key, walId, segmentId, lo, hi, first.getDeltaEpoch());
+                final byte[] goodDelta = store.getBytes(deltaKey);
+                final String corrupt = "corrupt WAL delta [key=" + deltaKey + ", error=";
+
+                // a header that does not decode
+                store.putRaw(deltaKey, envelope(raw -> raw.putInt(0)));
+                assertStale(replica, entry, rw, corrupt + "not a segment delta");
+                // a header that matches the record, then bytes that no range accounts for
+                store.putRaw(deltaKey, envelope(raw -> {
+                    SegmentDelta.begin(raw, walId, segmentId, lo, hi, 0);
+                    raw.putByte((byte) 0);
+                }));
+                assertStale(replica, entry, rw, corrupt + "trailing bytes in segment delta");
+                // a range whose file name leaves the segment directory
+                store.putRaw(deltaKey, envelope(raw -> {
+                    SegmentDelta.begin(raw, walId, segmentId, lo, hi, 0);
+                    SegmentDelta.appendRange(raw, "../" + WalUtils.EVENT_FILE_NAME, 0, 0);
+                }));
+                assertStale(replica, entry, rw, corrupt + "invalid file name in segment delta");
+                store.putRaw(deltaKey, goodDelta);
+
+                // none of them left anything behind: a replay of the intact store brings the whole table
+                final TableReplayer ok = new TableReplayer(key);
+                Assert.assertEquals(3, ok.replay(replica, entry, rw, null, 100));
+                Assert.assertNull(ok.getStaleReason());
+                TestUtils.drainWalQueue(replica);
+                Assert.assertEquals(SAMPLE_ROWS, rows(replica, "t", "ts"));
+            }
+        });
+    }
+
+    @Test
     public void testCreateTableWaitsForTheTableCreateLock() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = newDir("create-lock-a");
