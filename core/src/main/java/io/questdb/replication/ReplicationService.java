@@ -147,7 +147,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private volatile boolean isMigrationAllowed;
     // this run removed the marker, on its way to a takeover that has not succeeded yet
     private boolean isMarkerRemoved;
-    // when close() began waiting for the coordinator; 0 until then
+    // when close() began waiting for the coordinator, on System.nanoTime(); 0 until then
     private volatile long closeStartedNanos;
     private volatile Runnable closeHook;
     private volatile boolean isCrashed;
@@ -249,7 +249,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             }
             isClosed = true;
         }
-        closeStartedNanos = nanoTime();
+        closeStartedNanos = System.nanoTime();
         isRunning = false;
         wake();
         final Runnable hook = closeHook;
@@ -547,11 +547,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
 
     // waits until close() holds the only use left
     private void awaitLastUse(long timeoutMillis) {
-        final long deadline = nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         synchronized (useLock) {
             try {
                 while (useCount > 1) {
-                    final long remaining = deadline - nanoTime();
+                    final long remaining = deadline - System.nanoTime();
                     if (remaining <= 0) {
                         LOG.critical().$("a replication thread did not end in time; it frees what replication holds as it ends").$();
                         return;
@@ -1186,7 +1186,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
     }
 
-    // the clock of the lease: every timing of the service reads it, so that they agree with the engine's
+    // The clock of the lease. The timings that the lease depends on or that pace the rounds read it: the
+    // lease wait and its renewals, keepalives, the throttle window, housekeeping and the cleaner's pace.
+    // What waits for threads (close(), the joins, the waits for uses) and the sleeps keep to the system
+    // clock: a test clock that jumps or stands still must not cut those waits short or stretch them.
     private long nanoTime() {
         return engine.getNanoTime();
     }
@@ -1560,10 +1563,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
         // close() interrupts the coordinator once it has waited shutdownTimeoutMillis() for it: no
         // round starts in the second half of that wait, which is left to the round in progress and to
-        // the release
+        // the release. Measured on the clock of close(), the system's.
         final long closeStarted = closeStartedNanos;
-        final long deadline = (closeStarted != 0 ? closeStarted : nanoTime()) + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() / 2);
-        while (nanoTime() < deadline) {
+        final long deadline = (closeStarted != 0 ? closeStarted : System.nanoTime()) + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() / 2);
+        while (deadline - System.nanoTime() > 0) {
             store.touch();
             final long uploaded = primaryRound(true);
             if (uploaded == 0 || dirtyTables.isEmpty() || !engine.isPrimaryRole()) {

@@ -945,6 +945,50 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testStopDrainsWhenTheNodesClockJumpsAhead() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            // the node's clock, which the lease reads, runs this far ahead of System.nanoTime()
+            final AtomicLong clockOffset = new AtomicLong();
+            final AtomicBoolean isArmed = new AtomicBoolean();
+            final CountDownLatch uploading = new CountDownLatch(1);
+            final CountDownLatch stopping = new CountDownLatch(1);
+            store.setFaultHook((op, key) -> {
+                // the upload of the row waits until the stop has begun
+                if (op.equals("put") && key.contains("/wal/") && isArmed.compareAndSet(true, false)) {
+                    uploading.countDown();
+                    try {
+                        Assert.assertTrue(stopping.await(60, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        throw new AssertionError("interrupted before the stop began");
+                    }
+                }
+            });
+            try (Node node = newNode("p", primaryConfig(), store)) {
+                node.engine.setNanoClockForTesting(() -> System.nanoTime() + clockOffset.get());
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(node, store, "t", 0);
+                isArmed.set(true);
+                node.engine.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                Assert.assertTrue(uploading.await(60, TimeUnit.SECONDS));
+                // as the stop begins, the node's clock jumps an hour ahead: the lease lapses, but the time
+                // the stop gives the drain is measured on the system clock
+                node.service.setCloseHookForTesting(() -> {
+                    clockOffset.addAndGet(TimeUnit.HOURS.toNanos(1));
+                    stopping.countDown();
+                });
+                node.service.close();
+                // the stop renewed the lease, drained and released it
+                final ReplicationIndex index = readIndex(store);
+                Assert.assertTrue(index.isReleased());
+                Assert.assertEquals(1, entry(index, "t").getLastTxn());
+            }
+        });
+    }
+
+    @Test
     public void testStopDuringTheCleanersDeletesEndsThemAfterTheBatchInFlight() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();

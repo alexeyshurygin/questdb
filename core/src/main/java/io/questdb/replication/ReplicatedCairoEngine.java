@@ -85,7 +85,7 @@ public class ReplicatedCairoEngine extends CairoEngine {
     // a primary acknowledges writes until this moment; the replication service moves it with every
     // index write that the object store accepted
     private volatile long leaseValidUntilNanos = System.nanoTime();
-    // the clock of the lease and of every replication timing; System.nanoTime() outside tests
+    // the clock of the lease and of the replication timings that depend on it; System.nanoTime() outside tests
     private volatile LongSupplier nanoClock = System::nanoTime;
     // the threads of the replication service; close() frees nothing while one of them may still run
     private volatile @Nullable ReplicationThreads replicationThreads;
@@ -241,8 +241,9 @@ public class ReplicatedCairoEngine extends CairoEngine {
     }
 
     /**
-     * The time on the scale of {@link System#nanoTime()} by which the lease and the replication
-     * service's timings are measured.
+     * The time on the scale of {@link System#nanoTime()} by which the lease, and the replication
+     * service's timings that depend on it, are measured. The service's waits for its own threads run
+     * on the system clock.
      */
     public long getNanoTime() {
         return nanoClock.getAsLong();
