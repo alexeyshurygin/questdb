@@ -63,6 +63,9 @@ public final class ReplicationIndex {
     public static @NotNull ReplicationIndex decode(byte @NotNull [] data, int offset, int length) {
         final ReplicationIndex index = new ReplicationIndex();
         final String text = new String(data, offset, length, StandardCharsets.UTF_8);
+        if (text.isEmpty()) {
+            throw new IndexFormatException("replication index is incomplete");
+        }
         final String[] lines = text.split("\n", -1);
         int lineNo = 0;
         boolean isEnd = false;
@@ -70,14 +73,9 @@ public final class ReplicationIndex {
         boolean hasOwner = false;
         for (String line : lines) {
             lineNo++;
-            if (line.isEmpty()) {
-                continue;
-            }
-            if (isEnd) {
-                throw corrupt(lineNo, "content after end");
-            }
-            final String[] f = line.split(" ", -1);
             if (lineNo == 1) {
+                // the header must be the first line, so an empty first line is not skipped
+                final String[] f = line.split(" ", -1);
                 if (f.length != 2 || !HEADER.equals(f[0])) {
                     throw corrupt(lineNo, "missing header");
                 }
@@ -87,6 +85,13 @@ public final class ReplicationIndex {
                 }
                 continue;
             }
+            if (line.isEmpty()) {
+                continue;
+            }
+            if (isEnd) {
+                throw corrupt(lineNo, "content after end");
+            }
+            final String[] f = line.split(" ", -1);
             switch (f[0]) {
                 case "data_id" -> {
                     expectFields(f, 3, lineNo);
@@ -149,7 +154,7 @@ public final class ReplicationIndex {
                 default -> throw corrupt(lineNo, "unknown record");
             }
         }
-        if (lines.length == 0 || lineNo == 0 || !isEnd) {
+        if (!isEnd) {
             throw new IndexFormatException("replication index is incomplete");
         }
         if (!hasDataId || !hasOwner) {

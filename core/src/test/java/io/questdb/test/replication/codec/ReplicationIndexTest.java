@@ -140,6 +140,19 @@ public class ReplicationIndexTest {
     }
 
     @Test
+    public void testHeaderMustBeFirstLine() {
+        final String body = "data_id a b\nowner - 0 0 0 0\nend\n";
+        // a document without the header is not an index, even when it starts with empty lines
+        assertCorrupt("\n" + body, "corrupt replication index [line=1, error=missing header]");
+        assertCorrupt("\n\n" + body, "corrupt replication index [line=1, error=missing header]");
+        // the header on a later line does not count either
+        assertCorrupt("\nqdb-replication-index 1\n" + body, "corrupt replication index [line=1, error=missing header]");
+        assertCorrupt("\n", "corrupt replication index [line=1, error=missing header]");
+        // empty lines after the header stay allowed
+        Assert.assertEquals(0, decode("qdb-replication-index 1\n\n" + body + "\n").getTables().size());
+    }
+
+    @Test
     public void testRoundTrip() {
         final ReplicationIndex index = new ReplicationIndex();
         index.setDataId(0xfedcba9876543210L, 0x0123456789abcdefL);
