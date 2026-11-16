@@ -841,9 +841,54 @@ public class FsObjectStoreTest {
     }
 
     @Test
+    public void testTempFileNameTakenByAnotherWriterIsKept() throws Exception {
+        // Another writer sharing atomic_write_dir holds the name of the next temporary file. The put
+        // fails to create its file under that name, must leave the other writer's file alone, and
+        // succeeds on the next attempt under a new name.
+        final Path scratch = Files.createDirectories(root.resolve(FsObjectStore.DEFAULT_ATOMIC_WRITE_DIR_NAME));
+        final List<String> retries = new ArrayList<>();
+        final AtomicReference<Path> foreign = new AtomicReference<>();
+        try (FsObjectStore store = new FsObjectStore(settings("fs::root=" + root + ';'), configuration) {
+            @Override
+            protected void onRetry(@NotNull String operation, @NotNull String subject, int attempt, @NotNull IOException error) {
+                retries.add(operation + ' ' + subject + ' ' + attempt + ' ' + error.getClass().getSimpleName());
+                if (attempt == 1) {
+                    try {
+                        // the failed attempt named its temporary file; the next attempt takes the
+                        // name after it, which the other writer now holds
+                        Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("rwxr-xr-x"));
+                        final String name = Path.of(((FileSystemException) error).getFile()).getFileName().toString();
+                        final String prefix = name.substring(0, name.lastIndexOf('-') + 1);
+                        final long n = Long.parseLong(name.substring(prefix.length(), name.length() - ".tmp".length()));
+                        foreign.set(Files.writeString(scratch.resolve(prefix + (n + 1) + ".tmp"), "foreign"));
+                    } catch (IOException e) {
+                        throw new AssertionError(e);
+                    }
+                }
+            }
+        }) {
+            Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("r-xr-xr-x"));
+            try {
+                Assume.assumeFalse("running as a user that ignores permissions", Files.isWritable(scratch));
+                Assert.assertEquals(expectedETag(bytes("v")), store.put("k", bytes("v"), 0, 1, null, false));
+            } finally {
+                Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("rwxr-xr-x"));
+            }
+            Assert.assertEquals(List.of("PUT key=k 1 AccessDeniedException", "PUT key=k 2 FileAlreadyExistsException"), retries);
+            Assert.assertEquals("v", Files.readString(root.resolve("k")));
+            // the other writer's file is intact, and it is the only file left
+            Assert.assertTrue("another writer's temporary file was deleted: " + foreign.get(), Files.exists(foreign.get()));
+            Assert.assertEquals("foreign", Files.readString(foreign.get()));
+            try (Stream<Path> files = Files.list(scratch)) {
+                Assert.assertEquals(List.of(foreign.get()), files.toList());
+            }
+        }
+    }
+
+    @Test
     public void testTempFileNameTakenReportsOriginalError() throws Exception {
-        // A non-empty directory holds the name of the next temporary file: creating the file fails,
-        // and so does deleting what holds its name. The store reports the first failure and retries.
+        // A non-empty directory holds the name of the next temporary file: creating the file fails.
+        // The store reports that failure, leaves what holds the name alone, and retries.
         final Path scratch = Files.createDirectories(root.resolve(FsObjectStore.DEFAULT_ATOMIC_WRITE_DIR_NAME));
         final List<String> retries = new ArrayList<>();
         final List<Path> blockers = new ArrayList<>();
@@ -854,7 +899,7 @@ public class FsObjectStoreTest {
                 try {
                     final Path file = Path.of(((FileSystemException) error).getFile());
                     if (attempt == 1) {
-                        // the failed attempt named its temporary file, put-<pid>-<n>.tmp; the next
+                        // the failed attempt named its temporary file, put-<pid>-<nonce>-<n>.tmp; the next
                         // attempts take the names after it
                         Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("rwxr-xr-x"));
                         final String name = file.getFileName().toString();
@@ -890,6 +935,54 @@ public class FsObjectStoreTest {
             Assert.assertEquals("v", Files.readString(root.resolve("k")));
             try (Stream<Path> files = Files.list(scratch)) {
                 Assert.assertEquals(0, files.count());
+            }
+        }
+    }
+
+    @Test
+    public void testTempFileNameUniqueAcrossProcesses() throws Exception {
+        // Two nodes sharing atomic_write_dir, or a restarted process, can have the same pid and the
+        // same temporary file counter. A name made of the pid and the counter alone collides with the
+        // other process's temporary file; the name must carry a part of its own.
+        final Path scratch = Files.createDirectories(root.resolve(FsObjectStore.DEFAULT_ATOMIC_WRITE_DIR_NAME));
+        final long pid = ProcessHandle.current().pid();
+        final List<String> retries = new ArrayList<>();
+        final List<String> names = new ArrayList<>();
+        final AtomicReference<Path> foreign = new AtomicReference<>();
+        try (FsObjectStore store = new FsObjectStore(settings("fs::root=" + root + ';'), configuration) {
+            @Override
+            protected void onRetry(@NotNull String operation, @NotNull String subject, int attempt, @NotNull IOException error) {
+                retries.add(operation + ' ' + subject + ' ' + attempt + ' ' + error.getClass().getSimpleName());
+                final String name = Path.of(((FileSystemException) error).getFile()).getFileName().toString();
+                names.add(name);
+                if (attempt == 1) {
+                    try {
+                        // the other process, with this pid, holds the temporary file whose counter is
+                        // the one this process uses next
+                        Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("rwxr-xr-x"));
+                        final long n = Long.parseLong(name.substring(name.lastIndexOf('-') + 1, name.length() - ".tmp".length()));
+                        foreign.set(Files.writeString(scratch.resolve("put-" + pid + '-' + (n + 1) + ".tmp"), "foreign"));
+                    } catch (IOException e) {
+                        throw new AssertionError(e);
+                    }
+                }
+            }
+        }) {
+            Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("r-xr-xr-x"));
+            try {
+                Assume.assumeFalse("running as a user that ignores permissions", Files.isWritable(scratch));
+                Assert.assertEquals(expectedETag(bytes("v")), store.put("k", bytes("v"), 0, 1, null, false));
+            } finally {
+                Files.setPosixFilePermissions(scratch, PosixFilePermissions.fromString("rwxr-xr-x"));
+            }
+            // the second attempt does not collide with the other process's file
+            Assert.assertEquals(List.of("PUT key=k 1 AccessDeniedException"), retries);
+            Assert.assertTrue(names.get(0), names.get(0).matches("put-" + pid + "-[0-9a-f]{16}-[0-9]+\\.tmp"));
+            Assert.assertEquals("v", Files.readString(root.resolve("k")));
+            Assert.assertTrue("another process's temporary file was deleted: " + foreign.get(), Files.exists(foreign.get()));
+            Assert.assertEquals("foreign", Files.readString(foreign.get()));
+            try (Stream<Path> files = Files.list(scratch)) {
+                Assert.assertEquals(List.of(foreign.get()), files.toList());
             }
         }
     }

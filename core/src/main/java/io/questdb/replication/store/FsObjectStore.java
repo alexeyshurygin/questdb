@@ -47,6 +47,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -93,6 +94,11 @@ public class FsObjectStore implements ObjectStore {
     // exclude each other in memory, or the second lock() throws OverlappingFileLockException.
     private static final ConcurrentHashMap<Path, ReentrantLock> ROOT_LOCKS = new ConcurrentHashMap<>();
     private static final AtomicLong TEMP_FILE_COUNTER = new AtomicLong();
+    // Temporary file names are put-<pid>-<nonce>-<counter>.tmp. The pid and the counter are unique
+    // only within one process: another node sharing atomic_write_dir, or a restarted process that
+    // got the same pid, starts its counter over. The random nonce tells such processes apart.
+    private static final String TEMP_FILE_PREFIX = "put-" + ProcessHandle.current().pid() + '-'
+            + String.format("%016x", new SecureRandom().nextLong()) + '-';
     private final Path atomicWriteDir;
     private final ReentrantLock conditionalWriteLock;
     private final String description;
@@ -466,8 +472,11 @@ public class FsObjectStore implements ObjectStore {
 
     private Path writeTempFile(byte[] data, int offset, int length) throws IOException {
         Files.createDirectories(atomicWriteDir);
-        final Path temp = atomicWriteDir.resolve("put-" + ProcessHandle.current().pid() + '-' + TEMP_FILE_COUNTER.incrementAndGet() + ".tmp");
-        try (FileChannel channel = FileChannel.open(temp, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
+        final Path temp = atomicWriteDir.resolve(TEMP_FILE_PREFIX + TEMP_FILE_COUNTER.incrementAndGet() + ".tmp");
+        // When the open fails, the file is not this call's to delete: CREATE_NEW fails on a name that
+        // another writer holds.
+        final FileChannel channel = FileChannel.open(temp, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        try (channel) {
             final ByteBuffer buffer = ByteBuffer.wrap(data, offset, length);
             while (buffer.hasRemaining()) {
                 channel.write(buffer);
