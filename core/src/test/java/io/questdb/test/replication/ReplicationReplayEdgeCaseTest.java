@@ -468,6 +468,51 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testFailedUploadMarkerAtPromotionFencesTheNode() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("marker-promotion");
+            final NodeConfiguration configuration = new NodeConfiguration(dir);
+            // a table from before replication: its sequencer has no marker yet
+            try (CairoEngine engine = new CairoEngine(configuration)) {
+                engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                engine.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                TestUtils.drainWalQueue(engine);
+            }
+            final AtomicInteger markerFailures = new AtomicInteger();
+            configuration.ff = new TestFilesFacadeImpl() {
+                @Override
+                public long openRW(LPSZ name, int opts) {
+                    if (Utf8s.endsWithAscii(name, ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER)) {
+                        markerFailures.incrementAndGet();
+                        return -1;
+                    }
+                    return super.openRW(name, opts);
+                }
+            };
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (ReplicatedCairoEngine primary = new ReplicatedCairoEngine(configuration, new QdbrWalLocker(), failure -> {
+            }, serviceConfiguration(dir));
+                 ReplicationService service = installService(primary, store)) {
+                service.start();
+                // the promotion gives the table an uploader and its sequencer a marker; a marker it cannot
+                // create is a local failure at the takeover, which fences the node as any other does
+                TestUtils.assertEventually(() -> Assert.assertEquals(EngineRole.FENCED, primary.getRole()), 60);
+                final String reason = primary.getFenceReason();
+                TestUtils.assertContains(reason, "replication coordinator failed: ");
+                TestUtils.assertContains(reason, "could not create upload marker [path=");
+                TestUtils.assertContains(reason, WalUtils.SEQ_DIR);
+                Assert.assertEquals(1, markerFailures.get());
+                Assert.assertTrue(primary.isReadOnlyMode());
+            }
+            // the store never listed the table
+            try (IndexClient client = new IndexClient(store, true)) {
+                final ReplicationIndex index = client.read();
+                Assert.assertTrue(index == null || index.getTables().size() == 0);
+            }
+        });
+    }
+
+    @Test
     public void testFailedUploadMarkerFailsTheDirectory() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = newDir("marker-failure");
