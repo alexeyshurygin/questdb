@@ -233,6 +233,14 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
                     SegmentDelta.appendRange(raw, "../" + WalUtils.EVENT_FILE_NAME, 0, 0);
                 }));
                 assertStale(replica, entry, rw, corrupt + "invalid file name in segment delta");
+                // a delta that brings no event records at all, and one whose event range is empty
+                store.putRaw(deltaKey, envelope(raw -> SegmentDelta.begin(raw, walId, segmentId, lo, hi, 0)));
+                assertStale(replica, entry, rw, corrupt + "segment delta carries no event records");
+                store.putRaw(deltaKey, envelope(raw -> {
+                    SegmentDelta.begin(raw, walId, segmentId, lo, hi, 0);
+                    SegmentDelta.appendRange(raw, WalUtils.EVENT_FILE_NAME, 0, 0);
+                }));
+                assertStale(replica, entry, rw, corrupt + "segment delta carries no event records");
                 store.putRaw(deltaKey, goodDelta);
 
                 // none of them left anything behind: a replay of the intact store brings the whole table

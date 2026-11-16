@@ -166,7 +166,7 @@ public class TableReplayer {
             throw ReplicationException.corrupt("WAL delta does not match its key [key=" + key + ']');
         }
         try {
-            // the ranges decode while they are written
+            // the ranges decode while they are written, and the writer refuses a delta without event records
             worker.getDeltaWriter().apply(engine.getConfiguration().getDbRoot(), token.getDirName(), delta, isDurable);
         } catch (NativeReader.CorruptObjectException e) {
             throw corruptDelta(key, e);

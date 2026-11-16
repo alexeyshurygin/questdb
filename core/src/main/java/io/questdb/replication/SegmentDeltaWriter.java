@@ -28,6 +28,7 @@ package io.questdb.replication;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.wal.WalUtils;
+import io.questdb.replication.codec.NativeReader;
 import io.questdb.replication.codec.SegmentDelta;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.LongList;
@@ -90,7 +91,9 @@ public class SegmentDeltaWriter implements QuietCloseable {
                 }
             }
             if (eventEnd < WalUtils.WALE_HEADER_SIZE) {
-                throw CairoException.critical(0).put("segment delta carries no event records [path=").put(path.trimTo(segLen)).put(']');
+                // a malformed object, as any other the decoder refuses: the table goes stale instead of
+                // retrying it forever
+                throw new NativeReader.CorruptObjectException("segment delta carries no event records [path=" + path.trimTo(segLen) + ']');
             }
             final long eventFd = fd(segLen, WalUtils.EVENT_FILE_NAME);
             writeInt(eventFd, eventEnd, -1);

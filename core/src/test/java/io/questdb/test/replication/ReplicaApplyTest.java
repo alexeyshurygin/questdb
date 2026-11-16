@@ -42,6 +42,7 @@ import io.questdb.replication.WalCleaner;
 import io.questdb.replication.codec.CheckpointHistory;
 import io.questdb.replication.codec.IndexTable;
 import io.questdb.replication.codec.NativeBuffer;
+import io.questdb.replication.codec.NativeReader;
 import io.questdb.replication.codec.ObjectEnvelope;
 import io.questdb.replication.codec.TableCreateManifest;
 import io.questdb.replication.codec.TxnPart;
@@ -251,7 +252,13 @@ public class ReplicaApplyTest extends AbstractTest {
                 ff.failWriteLength = 8;
                 assertCairo(() -> writer.apply(dbRoot, token.getDirName(), delta(80, false), false), "could not write WAL file");
                 ff.failWriteLength = -1;
-                assertCairo(() -> writer.apply(dbRoot, token.getDirName(), delta(81, false), false), "segment delta carries no event records");
+                // a delta without event records is malformed, and refused as the decoder refuses one
+                try {
+                    writer.apply(dbRoot, token.getDirName(), delta(81, false), false);
+                    Assert.fail("expected a corrupt delta");
+                } catch (NativeReader.CorruptObjectException e) {
+                    TestUtils.assertContains(e.getMessage(), "segment delta carries no event records");
+                }
                 ff.failWriteLength = 4;
                 assertCairo(() -> writer.apply(dbRoot, token.getDirName(), delta(82, true), false), "could not write WAL event file");
                 ff.failWriteLength = -1;
