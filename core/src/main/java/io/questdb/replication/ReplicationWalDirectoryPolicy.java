@@ -50,21 +50,48 @@ import org.jetbrains.annotations.Nullable;
  * On a replica, the newest downloaded segment of each WAL is pinned through
  * {@link ReplicaSegmentPins}: the primary may still append to it.
  * <p>
- * Live views and system tables are node-local and never pinned.
+ * Live views and system tables are node-local and never pinned; under an empty system table prefix no
+ * table is a system table.
  */
 public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietCloseable {
     public static final String UPLOAD_PENDING_MARKER = "upload.pending";
     private final FilesFacade ff;
-    // guarded by markerPath
-    private boolean isClosed;
     private final Path markerPath = new Path();
     private final @Nullable Pins primaryPins;
     private final @Nullable ReplicaSegmentPins replicaPins;
+    private final String systemTablePrefix;
+    // guarded by markerPath
+    private boolean isClosed;
 
-    public ReplicationWalDirectoryPolicy(@NotNull FilesFacade ff, @Nullable Pins primaryPins, @Nullable ReplicaSegmentPins replicaPins) {
+    /**
+     * @param systemTablePrefix the engine's {@code cairo.system.table.prefix}, which tells node-local
+     *                          system tables from replicated ones
+     */
+    public ReplicationWalDirectoryPolicy(
+            @NotNull FilesFacade ff,
+            @NotNull CharSequence systemTablePrefix,
+            @Nullable Pins primaryPins,
+            @Nullable ReplicaSegmentPins replicaPins
+    ) {
         this.ff = ff;
+        this.systemTablePrefix = systemTablePrefix.toString();
         this.primaryPins = primaryPins;
         this.replicaPins = replicaPins;
+    }
+
+    /**
+     * Whether the token is one of the node's own system tables, which replication leaves alone. An empty
+     * prefix makes none: every name starts with it, so every token reads as a system table.
+     */
+    public static boolean isNodeLocalSystemTable(@NotNull TableToken token, @NotNull CharSequence systemTablePrefix) {
+        return token.isSystem() && systemTablePrefix.length() > 0;
+    }
+
+    public static boolean isReplicated(@NotNull TableToken token, @NotNull CharSequence systemTablePrefix) {
+        // views and materialized views are not uploaded: marking their WAL as pending would keep the
+        // purge job off it for good
+        return token.isWal() && !token.isLiveView() && !token.isView() && !token.isMatView()
+                && !isNodeLocalSystemTable(token, systemTablePrefix);
     }
 
     /**
@@ -79,12 +106,6 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
             isClosed = true;
             markerPath.close();
         }
-    }
-
-    public static boolean isReplicated(@NotNull TableToken token) {
-        // views and materialized views are not uploaded: marking their WAL as pending would keep the
-        // purge job off it for good
-        return token.isWal() && !token.isLiveView() && !token.isSystem() && !token.isView() && !token.isMatView();
     }
 
     @Override
@@ -131,6 +152,10 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
         return false;
     }
 
+    public boolean isReplicated(@NotNull TableToken token) {
+        return isReplicated(token, systemTablePrefix);
+    }
+
     @Override
     public boolean isSeqPartInUse(Path seqDirPath, long partId) {
         if (primaryPins == null) {
@@ -138,12 +163,6 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
         }
         final String tableDir = parentName(seqDirPath);
         return tableDir != null && primaryPins.isSeqPartPinned(tableDir, partId);
-    }
-
-    @Override
-    public void rollbackDirectory(Path path) {
-        // a segment closed without a single event record holds nothing to upload
-        removeMarker(path);
     }
 
     /**
@@ -163,23 +182,29 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
     }
 
     @Override
+    public void rollbackDirectory(Path path) {
+        // a segment closed without a single event record holds nothing to upload
+        removeMarker(path);
+    }
+
+    @Override
     public boolean truncateFilesOnClose() {
         return DefaultWalDirectoryPolicy.INSTANCE.truncateFilesOnClose();
     }
 
-    // the marker file of a directory, in markerPath; the caller holds its lock
-    private LPSZ markerOf(Path dirPath) {
-        markerPath.of(dirPath);
-        if (markerPath.size() > 0 && markerPath.byteAt(markerPath.size() - 1) != '/') {
-            markerPath.slash();
+    // name of the directory that holds <path>, e.g. "t~3" for <root>/t~3/txn_seq
+    private static @Nullable String parentName(Utf8Sequence path) {
+        final String s = path.toString();
+        int end = s.length();
+        while (end > 0 && s.charAt(end - 1) == '/') {
+            end--;
         }
-        return markerPath.put(UPLOAD_PENDING_MARKER).$();
-    }
-
-    private void releaseMarkerPath() {
-        if (isClosed) {
-            markerPath.close();
+        final int last = s.lastIndexOf('/', end - 1);
+        if (last < 1) {
+            return null;
         }
+        final int prev = s.lastIndexOf('/', last - 1);
+        return s.substring(prev + 1, last);
     }
 
     // <root>/<tableDir>/wal<N>/<segment>
@@ -212,19 +237,19 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
         }
     }
 
-    // name of the directory that holds <path>, e.g. "t~3" for <root>/t~3/txn_seq
-    private static @Nullable String parentName(Utf8Sequence path) {
-        final String s = path.toString();
-        int end = s.length();
-        while (end > 0 && s.charAt(end - 1) == '/') {
-            end--;
+    // the marker file of a directory, in markerPath; the caller holds its lock
+    private LPSZ markerOf(Path dirPath) {
+        markerPath.of(dirPath);
+        if (markerPath.size() > 0 && markerPath.byteAt(markerPath.size() - 1) != '/') {
+            markerPath.slash();
         }
-        final int last = s.lastIndexOf('/', end - 1);
-        if (last < 1) {
-            return null;
+        return markerPath.put(UPLOAD_PENDING_MARKER).$();
+    }
+
+    private void releaseMarkerPath() {
+        if (isClosed) {
+            markerPath.close();
         }
-        final int prev = s.lastIndexOf('/', last - 1);
-        return s.substring(prev + 1, last);
     }
 
     /**

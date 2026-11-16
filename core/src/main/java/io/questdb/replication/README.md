@@ -105,7 +105,8 @@ uses for every read-only refusal. QWP clients see the primary-catch-up role on
 a starting primary and the replica role on replicas and fenced nodes. Queries
 work in every role, from the node's local tables. Live views, system tables and
 non-WAL tables stay writable at the engine on every node; SQL still refuses an
-INSERT on a read-only node.
+INSERT on a read-only node. With an empty `cairo.system.table.prefix` no table
+is a system table: every WAL table replicates.
 
 ## Object store layout
 

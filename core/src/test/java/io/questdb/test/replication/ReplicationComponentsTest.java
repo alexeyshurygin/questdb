@@ -166,11 +166,11 @@ public class ReplicationComponentsTest extends AbstractTest {
             new File(dir, "t~1/txn_seq").mkdirs();
             final TableToken table = new TableToken("t", "t~1", null, 1, TableToken.Type.TABLE, true, false, false, false);
             final TableToken liveView = new TableToken("lv", "lv~2", null, 2, TableToken.Type.LIVE_VIEW, true, false, false, false);
-            Assert.assertTrue(ReplicationWalDirectoryPolicy.isReplicated(table));
-            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(liveView));
+            Assert.assertTrue(ReplicationWalDirectoryPolicy.isReplicated(table, "sys."));
+            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(liveView, "sys."));
             final boolean[] pinned = {true};
             try (Path path = new Path();
-                 ReplicationWalDirectoryPolicy primary = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, (tableDir, partId) -> pinned[0] && "t~1".equals(tableDir) && partId > 1, null)) {
+                 ReplicationWalDirectoryPolicy primary = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, "sys.", (tableDir, partId) -> pinned[0] && "t~1".equals(tableDir) && partId > 1, null)) {
                 path.of(dir).concat("t~1").concat("wal3").concat("2").slash();
                 Assert.assertFalse(primary.isInUse(path));
                 primary.initDirectory(path); // no token: no marker
@@ -200,7 +200,7 @@ public class ReplicationComponentsTest extends AbstractTest {
                 // the engine still consults the policy after the replication service closed it, and nobody
                 // closes it a second time: the answers stay right, and the leak check proves that each
                 // call frees what it allocates
-                final ReplicationWalDirectoryPolicy closed = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, (tableDir, partId) -> false, null);
+                final ReplicationWalDirectoryPolicy closed = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, "sys.", (tableDir, partId) -> false, null);
                 closed.close();
                 path.of(dir).concat("t~1").concat("wal3").concat("2");
                 Assert.assertFalse(closed.isInUse(path));
@@ -215,7 +215,7 @@ public class ReplicationComponentsTest extends AbstractTest {
             }
             final ReplicaSegmentPins pins = new ReplicaSegmentPins(1_000);
             try (Path path = new Path();
-                 ReplicationWalDirectoryPolicy replica = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, null, pins)) {
+                 ReplicationWalDirectoryPolicy replica = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, "sys.", null, pins)) {
                 pins.onDownloaded("t~1", 3, 2, 1_000);
                 pins.onDownloaded("t~1", 3, 1, 1_001); // older segment does not replace the newer pin
                 Assert.assertEquals(1, pins.size());
@@ -249,7 +249,7 @@ public class ReplicationComponentsTest extends AbstractTest {
             } finally {
                 pins.close();
             }
-            try (Path path = new Path(); ReplicationWalDirectoryPolicy none = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, null, null)) {
+            try (Path path = new Path(); ReplicationWalDirectoryPolicy none = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, "sys.", null, null)) {
                 path.of(dir).concat("t~1").concat("wal3").concat("2");
                 Assert.assertFalse(none.isInUse(path));
             }

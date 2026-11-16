@@ -25,6 +25,7 @@
 
 package io.questdb.test.replication;
 
+import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.CommitMode;
@@ -46,6 +47,7 @@ import io.questdb.cairo.wal.seq.TableSequencerImpl;
 import io.questdb.cairo.wal.seq.TableTransactionLogFile;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.replication.IndexClient;
 import io.questdb.replication.ReplicaSegmentPins;
 import io.questdb.replication.ReplicaTableApplier;
 import io.questdb.replication.ReplicatedCairoEngine;
@@ -53,6 +55,7 @@ import io.questdb.replication.ReplicatedCairoEngine.EngineRole;
 import io.questdb.replication.ReplicationConfigurationImpl;
 import io.questdb.replication.ReplicationException;
 import io.questdb.replication.ReplicationRole;
+import io.questdb.replication.ReplicationService;
 import io.questdb.replication.ReplicationWalDirectoryPolicy;
 import io.questdb.replication.ReplicationWalListener;
 import io.questdb.replication.ReplicationWorker;
@@ -66,6 +69,7 @@ import io.questdb.replication.WalCleaner;
 import io.questdb.replication.codec.IndexTable;
 import io.questdb.replication.codec.NativeBuffer;
 import io.questdb.replication.codec.ObjectEnvelope;
+import io.questdb.replication.codec.ReplicationIndex;
 import io.questdb.replication.codec.SegmentDelta;
 import io.questdb.replication.codec.TableCreateManifest;
 import io.questdb.replication.codec.TxnPart;
@@ -295,16 +299,22 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
         TestUtils.assertMemoryLeak(() -> {
             final String dir = newDir("policy");
             // only WAL tables replicate: never a non-WAL, system, view, materialized view or live view table
-            Assert.assertTrue(ReplicationWalDirectoryPolicy.isReplicated(token("t", "t~1", 1, TableToken.Type.TABLE, true, false)));
-            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("nw", "nw~2", 2, TableToken.Type.TABLE, false, false)));
-            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("sys.t", "sys.t~3", 3, TableToken.Type.TABLE, true, true)));
-            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("v", "v~4", 4, TableToken.Type.VIEW, true, false)));
-            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("mv", "mv~5", 5, TableToken.Type.MAT_VIEW, true, false)));
-            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("lv", "lv~6", 6, TableToken.Type.LIVE_VIEW, true, false)));
+            Assert.assertTrue(ReplicationWalDirectoryPolicy.isReplicated(token("t", "t~1", 1, TableToken.Type.TABLE, true, false), "sys."));
+            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("nw", "nw~2", 2, TableToken.Type.TABLE, false, false), "sys."));
+            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("sys.t", "sys.t~3", 3, TableToken.Type.TABLE, true, true), "sys."));
+            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("v", "v~4", 4, TableToken.Type.VIEW, true, false), "sys."));
+            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("mv", "mv~5", 5, TableToken.Type.MAT_VIEW, true, false), "sys."));
+            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("lv", "lv~6", 6, TableToken.Type.LIVE_VIEW, true, false), "sys."));
+            // under an empty prefix every token reads as a system table, and none is one: the write fence agrees
+            final TableToken everySystem = token("t", "t~7", 7, TableToken.Type.TABLE, true, true);
+            Assert.assertTrue(ReplicationWalDirectoryPolicy.isReplicated(everySystem, ""));
+            Assert.assertFalse(ReplicationWalDirectoryPolicy.isNodeLocalSystemTable(everySystem, ""));
+            Assert.assertTrue(ReplicationWalDirectoryPolicy.isNodeLocalSystemTable(everySystem, "sys."));
+            Assert.assertFalse(ReplicationWalDirectoryPolicy.isReplicated(token("lv", "lv~8", 8, TableToken.Type.LIVE_VIEW, true, true), ""));
 
             Assert.assertTrue(new File(dir, "t~1/wal1/0").mkdirs());
             try (Path path = new Path();
-                 ReplicationWalDirectoryPolicy primary = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, (tableDir, partId) -> true, null)) {
+                 ReplicationWalDirectoryPolicy primary = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, "sys.", (tableDir, partId) -> true, null)) {
                 // a directory created without its table's token gets no marker
                 path.of(dir).concat("t~1").concat("wal1").concat("0");
                 primary.initDirectory(path, null);
@@ -315,7 +325,7 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
             }
             final ReplicaSegmentPins pins = new ReplicaSegmentPins(60_000);
             try (Path path = new Path();
-                 ReplicationWalDirectoryPolicy replica = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, null, pins)) {
+                 ReplicationWalDirectoryPolicy replica = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, "sys.", null, pins)) {
                 final long now = System.currentTimeMillis();
                 pins.onDownloaded("t~1", 3, 2, now);
                 // the empty table directory name that a path without one would resolve to
@@ -366,6 +376,44 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
                 // every name starts with an empty prefix: the engine takes none of them for a system table
                 assertReadOnly(() -> replica.createTable(AllowAllSecurityContext.INSTANCE, mem, path, false, walModel(replica, "sys.local"), false));
                 Assert.assertNull(replica.getTableTokenIfExists("sys.local"));
+            }
+        });
+    }
+
+    @Test
+    public void testEmptySystemPrefixPrimaryUploadsItsTables() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("empty-prefix-primary");
+            final NodeConfiguration configuration = new NodeConfiguration(dir);
+            configuration.systemTableNamePrefix = "";
+            final MemoryObjectStore store = new MemoryObjectStore();
+            // nothing goes up before the stop drains the node
+            final ReplicationConfigurationImpl replicationConfiguration = serviceConfiguration(dir)
+                    .setThrottleWindowDuration(600_000)
+                    .setThrottleNonData(true);
+            try (ReplicatedCairoEngine primary = new ReplicatedCairoEngine(configuration, new QdbrWalLocker(), failure -> {
+            }, replicationConfiguration);
+                 ReplicationService service = installService(primary, store)) {
+                service.start();
+                awaitPromotion(primary);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                final TableToken t = primary.verifyTableName("t");
+                // every name starts with an empty prefix, so the token reads as a system table
+                Assert.assertTrue(t.isSystem());
+                // and yet the purge job keeps all of its WAL until it is uploaded
+                final java.nio.file.Path tableDir = Paths.get(primary.getConfiguration().getDbRoot().toString(), t.getDirName());
+                Assert.assertTrue(Files.exists(tableDir.resolve(WalUtils.SEQ_DIR).resolve(ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER)));
+                Assert.assertTrue(Files.exists(onlySegment(tableDir).resolve(ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER)));
+                Assert.assertTrue(service.isSeqPartPinned(t.getDirName(), 0));
+            }
+            // the stop drained the table into the store
+            try (IndexClient client = new IndexClient(store, true)) {
+                final ReplicationIndex index = client.read();
+                Assert.assertNotNull(index);
+                Assert.assertEquals(1, index.getTables().size());
+                Assert.assertEquals("t", index.getTables().getQuick(0).getTableName());
+                Assert.assertEquals(1, index.getTables().getQuick(0).getLastTxn());
             }
         });
     }
@@ -427,7 +475,7 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
             };
             final String failure = "could not create upload marker [path=";
             try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
-                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(ff, (tableDir, partId) -> false, null)) {
+                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(ff, "sys.", (tableDir, partId) -> false, null)) {
                 primary.setWalDirectoryPolicy(policy);
                 primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
                 final TableToken t = primary.verifyTableName("t");
@@ -986,7 +1034,7 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
             configuration.seqPartTxnCount = 2;
             try (ReplicatedCairoEngine primary = newEngine(configuration, ReplicationRole.PRIMARY);
                  ReplicationWorker pw = worker(store, primary, a);
-                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, (tableDir, partId) -> false, null);
+                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(FilesFacadeImpl.INSTANCE, "sys.", (tableDir, partId) -> false, null);
                  Path path = new Path()) {
                 primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
                 final TableToken token = primary.verifyTableName("t");
@@ -1131,7 +1179,7 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
     @Test
     public void testWalListenerForwardsReplicatedTablesOnly() {
         final List<String> events = new ArrayList<>();
-        final ReplicationWalListener listener = new ReplicationWalListener(new ReplicationWalListener.Sink() {
+        final ReplicationWalListener.Sink sink = new ReplicationWalListener.Sink() {
             @Override
             public void onCommit(TableToken token, long txn, boolean isNonData) {
                 events.add("commit " + token.getTableName() + ' ' + txn + ' ' + isNonData);
@@ -1151,23 +1199,15 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
             public void onWalClosed(TableToken token, int walId, long lastTxn) {
                 events.add("wal " + token.getTableName() + ' ' + walId + ' ' + lastTxn);
             }
-        });
+        };
         final TableToken[] tokens = {
                 token("nw", "nw~1", 1, TableToken.Type.TABLE, false, false),
                 token("v", "v~2", 2, TableToken.Type.VIEW, true, false),
                 token("mv", "mv~3", 3, TableToken.Type.MAT_VIEW, true, false),
+                token("sys.s", "sys.s~5", 5, TableToken.Type.TABLE, true, true),
                 token("t", "t~4", 4, TableToken.Type.TABLE, true, false)
         };
-        for (TableToken token : tokens) {
-            listener.tableCreated(token, 0);
-            listener.dataTxnCommitted(token, 1, 0, 1, 0, 0);
-            listener.segmentClosed(token, 1, 1, 0);
-            listener.nonDataTxnCommitted(token, 2, 0);
-            listener.tableRenamed(token, 3, 0, token);
-            listener.walClosed(token, 3, 1);
-            listener.tableDropped(token, 4, 0);
-        }
-        Assert.assertEquals(List.of(
+        final List<String> tEvents = List.of(
                 "created t",
                 "commit t 1 false",
                 "segment t 1 0 1",
@@ -1175,7 +1215,14 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
                 "commit t 3 true",
                 "wal t 1 3",
                 "commit t 4 true"
-        ), events);
+        );
+        fireWalEvents(new ReplicationWalListener(sink, "sys."), tokens);
+        Assert.assertEquals(tEvents, events);
+
+        // under an empty system table prefix every token reads as a system table, and every one replicates
+        events.clear();
+        fireWalEvents(new ReplicationWalListener(sink, ""), token("t", "t~4", 4, TableToken.Type.TABLE, true, true));
+        Assert.assertEquals(tEvents, events);
     }
 
     private static void assertCairo(ThrowingRunnable r, String... fragments) {
@@ -1226,6 +1273,13 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
         if (token != null) {
             Assert.assertEquals(0, replica.getTableSequencerAPI().lastTxn(token));
         }
+    }
+
+    // waits until the node's promotion ends, whether it became writable or fenced itself
+    private static void awaitPromotion(ReplicatedCairoEngine engine) throws Exception {
+        TestUtils.assertEventually(() -> Assert.assertTrue(String.valueOf(engine.getRole()),
+                engine.getRole() == EngineRole.PRIMARY || engine.getRole() == EngineRole.FENCED), 60);
+        Assert.assertEquals(engine.getFenceReason(), EngineRole.PRIMARY, engine.getRole());
     }
 
     private static String columnNames(ReplicatedCairoEngine engine, String table) {
@@ -1290,6 +1344,34 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
         return b.array();
     }
 
+    private static void fireWalEvents(ReplicationWalListener listener, TableToken... tokens) {
+        for (TableToken token : tokens) {
+            listener.tableCreated(token, 0);
+            listener.dataTxnCommitted(token, 1, 0, 1, 0, 0);
+            listener.segmentClosed(token, 1, 1, 0);
+            listener.nonDataTxnCommitted(token, 2, 0);
+            listener.tableRenamed(token, 3, 0, token);
+            listener.walClosed(token, 3, 1);
+            listener.tableDropped(token, 4, 0);
+        }
+    }
+
+    // hooks a replication service into the engine before the engine completes its initialization, as the
+    // server does
+    private static ReplicationService installService(ReplicatedCairoEngine engine, MemoryObjectStore store) {
+        final ReplicationService service = new ReplicationService(engine, store);
+        try {
+            service.installHooks();
+            engine.completeInit();
+            engine.load();
+            engine.buildViewGraphs();
+            return service;
+        } catch (Throwable th) {
+            service.close();
+            throw th;
+        }
+    }
+
     private static String newDir(String name) {
         final String dir = root + File.separator + name;
         TestUtils.removeTestPath(dir);
@@ -1347,6 +1429,15 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
             TestUtils.printSql(engine, context, "SELECT * FROM '" + table + "' ORDER BY " + orderBy, sink);
         }
         return sink.toString();
+    }
+
+    // a primary that runs its replication service
+    private static ReplicationConfigurationImpl serviceConfiguration(String dir) {
+        return replicationConfiguration(dir, ReplicationRole.PRIMARY)
+                .setKeepaliveInterval(1_000)
+                .setRequestBaseTimeout(1_000)
+                .setRetryInterval(10)
+                .setThrottleWindowDuration(100);
     }
 
     private static <T extends ReplicatedCairoEngine> T start(T engine, ReplicationRole role) {

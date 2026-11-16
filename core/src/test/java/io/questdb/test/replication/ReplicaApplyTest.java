@@ -277,7 +277,7 @@ public class ReplicaApplyTest extends AbstractTest {
             final io.questdb.std.FilesFacade ff = FilesFacadeImpl.INSTANCE;
             try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
                  ReplicationWorker pw = worker(store, primary, a);
-                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(ff, (tableDir, partId) -> false, null);
+                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(ff, "sys.", (tableDir, partId) -> false, null);
                  Path path = new Path()) {
                 primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
                 primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
@@ -633,7 +633,7 @@ public class ReplicaApplyTest extends AbstractTest {
             try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY, ff);
                  ReplicationWorker pw = new ReplicationWorker(store, 1, true, ff, primary.getConfiguration().getMkDirMode(), primary,
                          a + File.separator + ".replication");
-                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(ff, (tableDir, partId) -> false, null);
+                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(ff, "sys.", (tableDir, partId) -> false, null);
                  Path path = new Path()) {
                 primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
                 primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");

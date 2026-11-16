@@ -35,58 +35,68 @@ import org.jetbrains.annotations.NotNull;
  */
 public class ReplicationWalListener implements WalListener {
     private final Sink sink;
+    private final String systemTablePrefix;
 
-    public ReplicationWalListener(@NotNull Sink sink) {
+    /**
+     * @param systemTablePrefix the engine's {@code cairo.system.table.prefix}, which tells node-local
+     *                          system tables from replicated ones
+     */
+    public ReplicationWalListener(@NotNull Sink sink, @NotNull CharSequence systemTablePrefix) {
         this.sink = sink;
+        this.systemTablePrefix = systemTablePrefix.toString();
     }
 
     @Override
     public void dataTxnCommitted(TableToken tableToken, long txn, long timestamp, int walId, int segmentId, int segmentTxn) {
-        if (ReplicationWalDirectoryPolicy.isReplicated(tableToken)) {
+        if (isReplicated(tableToken)) {
             sink.onCommit(tableToken, txn, false);
         }
     }
 
     @Override
     public void nonDataTxnCommitted(TableToken tableToken, long txn, long timestamp) {
-        if (ReplicationWalDirectoryPolicy.isReplicated(tableToken)) {
+        if (isReplicated(tableToken)) {
             sink.onCommit(tableToken, txn, true);
         }
     }
 
     @Override
     public void segmentClosed(TableToken tableToken, long txn, int walId, int segmentId) {
-        if (ReplicationWalDirectoryPolicy.isReplicated(tableToken)) {
+        if (isReplicated(tableToken)) {
             sink.onSegmentClosed(tableToken, walId, segmentId, txn);
         }
     }
 
     @Override
     public void tableCreated(TableToken tableToken, long timestamp) {
-        if (ReplicationWalDirectoryPolicy.isReplicated(tableToken)) {
+        if (isReplicated(tableToken)) {
             sink.onTableCreated(tableToken);
         }
     }
 
     @Override
     public void tableDropped(TableToken tableToken, long txn, long timestamp) {
-        if (ReplicationWalDirectoryPolicy.isReplicated(tableToken)) {
+        if (isReplicated(tableToken)) {
             sink.onCommit(tableToken, txn, true);
         }
     }
 
     @Override
     public void tableRenamed(TableToken tableToken, long txn, long timestamp, TableToken oldTableToken) {
-        if (ReplicationWalDirectoryPolicy.isReplicated(tableToken)) {
+        if (isReplicated(tableToken)) {
             sink.onCommit(tableToken, txn, true);
         }
     }
 
     @Override
     public void walClosed(TableToken tableToken, long txn, int walId) {
-        if (ReplicationWalDirectoryPolicy.isReplicated(tableToken)) {
+        if (isReplicated(tableToken)) {
             sink.onWalClosed(tableToken, walId, txn);
         }
+    }
+
+    private boolean isReplicated(TableToken tableToken) {
+        return ReplicationWalDirectoryPolicy.isReplicated(tableToken, systemTablePrefix);
     }
 
     /**

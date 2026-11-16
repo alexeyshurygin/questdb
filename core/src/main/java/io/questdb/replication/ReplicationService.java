@@ -203,7 +203,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         this.stallLimitMillis = Math.max(60_000, Math.max(20 * config.getKeepaliveInterval(), requestTimeLimitMillis()));
         this.configuredCheckpointListener = cairoConfig.getCheckpointListener();
         this.pins = isPrimary ? null : new ReplicaSegmentPins(10 * 60_000L);
-        this.policy = new ReplicationWalDirectoryPolicy(cairoConfig.getFilesFacade(), isPrimary ? this : null, pins);
+        this.policy = new ReplicationWalDirectoryPolicy(cairoConfig.getFilesFacade(), cairoConfig.getSystemTableNamePrefix(), isPrimary ? this : null, pins);
         final int threads = Math.max(1, Math.min(config.getMaxConcurrentRequests(), config.getMaxBatchSizeFast()));
         // No queue: a task goes to an idle thread, else to a new one up to the limit, else the submitting
         // thread runs it. Threads end after a minute of idleness, and each frees its context as it ends,
@@ -379,7 +379,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // also tells this service when a checkpoint restore ran: a restored copy is a new instance
         engine.setCheckpointListener(this);
         if (isPrimary) {
-            engine.setWalListener(new ReplicationWalListener(this));
+            engine.setWalListener(new ReplicationWalListener(this, engine.getConfiguration().getSystemTableNamePrefix()));
         }
     }
 
@@ -392,7 +392,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // not tracked yet: keep it, unless the table is node-local or gone
         final TableToken token = engine.getTableTokenByDirName(tableDir);
         if (token != null) {
-            return ReplicationWalDirectoryPolicy.isReplicated(token);
+            return policy.isReplicated(token);
         }
         // A table dropped before a restart: its log holds the drop record, which the store may still
         // lack. It stays until startup has looked: prepareUploaders() gives the table an uploader then,
@@ -675,7 +675,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final ObjHashSet<TableToken> tokens = new ObjHashSet<>();
         engine.getTableTokens(tokens, false);
         for (int i = 0, n = tokens.size(); i < n; i++) {
-            if (ReplicationWalDirectoryPolicy.isReplicated(tokens.get(i))) {
+            if (policy.isReplicated(tokens.get(i))) {
                 return true;
             }
         }
@@ -858,7 +858,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final ObjList<TableToken> tables = new ObjList<>();
         for (int i = 0, n = all.size(); i < n; i++) {
             final TableToken token = all.get(i);
-            if (ReplicationWalDirectoryPolicy.isReplicated(token)) {
+            if (policy.isReplicated(token)) {
                 tables.add(token);
             }
         }
@@ -1209,7 +1209,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         final io.questdb.cairo.TableNameRegistry registry = engine.getTableNameRegistry();
         if (registry.isWalTableDropped(dirName)) {
             final TableToken token = registry.getTokenByDirName(dirName);
-            if (token != null && ReplicationWalDirectoryPolicy.isReplicated(token)) {
+            if (token != null && policy.isReplicated(token)) {
                 return token;
             }
         }
@@ -1232,7 +1232,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 LOG.advisory().$("views and materialized views are not replicated in this version [name=").$(token).I$();
                 continue;
             }
-            if (!ReplicationWalDirectoryPolicy.isReplicated(token)) {
+            if (!policy.isReplicated(token)) {
                 continue;
             }
             final IndexTable t = stored.remove(token.getDirName());

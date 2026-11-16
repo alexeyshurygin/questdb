@@ -446,10 +446,9 @@ public class ReplicatedCairoEngine extends CairoEngine {
         }
     }
 
-    // As createTable() decides: with an empty system table prefix every name starts with it, and every
-    // token reads as a system table, so none of them is taken for one.
+    // as createTable() and the replication policy decide
     private boolean isNodeLocalSystemTable(TableToken token) {
-        return token.isSystem() && getConfiguration().getSystemTableNamePrefix().length() > 0;
+        return ReplicationWalDirectoryPolicy.isNodeLocalSystemTable(token, getConfiguration().getSystemTableNamePrefix());
     }
 
     private boolean isSystemTableName(CharSequence tableName) {
