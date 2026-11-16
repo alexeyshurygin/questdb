@@ -87,6 +87,8 @@ public class ReplicatedCairoEngine extends CairoEngine {
     private volatile long leaseValidUntilNanos = System.nanoTime();
     // the clock of the lease and of every replication timing; System.nanoTime() outside tests
     private volatile LongSupplier nanoClock = System::nanoTime;
+    // the threads of the replication service; close() frees nothing while one of them may still run
+    private volatile @Nullable ReplicationThreads replicationThreads;
     private volatile EngineRole role;
 
     public ReplicatedCairoEngine(
@@ -118,6 +120,22 @@ public class ReplicatedCairoEngine extends CairoEngine {
     @Override
     protected void assertRebaseRole(boolean replicaVariant) {
         throw CairoException.nonCritical().put("REBASE WAL is not supported when replication is enabled");
+    }
+
+    /**
+     * Frees the engine once no replication thread can use it any more. The replication service's own
+     * stop gives up on a thread stuck in a request that ignores interrupts; this waits for it a while
+     * longer and, if it still runs, leaves the engine open rather than free memory under it. A later
+     * call tries again.
+     */
+    @Override
+    public void close() {
+        final ReplicationThreads threads = replicationThreads;
+        if (threads != null && !threads.awaitEnd()) {
+            LOG.critical().$("a replication thread is still running; the engine stays open and its memory is not freed").$();
+            return;
+        }
+        super.close();
     }
 
     /**
@@ -381,6 +399,13 @@ public class ReplicatedCairoEngine extends CairoEngine {
     }
 
     /**
+     * Installs the threads that {@link #close()} waits for; the replication service installs its own.
+     */
+    public void setReplicationThreads(@Nullable ReplicationThreads replicationThreads) {
+        this.replicationThreads = replicationThreads;
+    }
+
+    /**
      * Changes the role under the role-switch write lock, so that no write that checked the old role
      * is still in flight when the new one is published.
      *
@@ -503,5 +528,18 @@ public class ReplicatedCairoEngine extends CairoEngine {
          * read-only until restarted with a fixed configuration.
          */
         FENCED
+    }
+
+    /**
+     * The threads of the replication service, which use the engine until they end.
+     */
+    @FunctionalInterface
+    public interface ReplicationThreads {
+        /**
+         * Waits, for a bounded time, until no replication thread can use the engine any more.
+         *
+         * @return true once none can; false when one still may after the wait
+         */
+        boolean awaitEnd();
     }
 }

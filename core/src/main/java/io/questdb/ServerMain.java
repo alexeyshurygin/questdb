@@ -1263,7 +1263,9 @@ public class ServerMain implements Closeable {
     /**
      * Starts replication once the engine is loaded: a replica begins following the object store, a
      * primary catches up and takes the ownership lease before its engine accepts writes. Stopping it
-     * drains a primary's uploads and releases the lease.
+     * drains a primary's uploads and releases the lease. A replication thread the stop gives up on may
+     * still use the engine, so freeOnExit closes the engine only after waiting for that thread, and
+     * leaves it open if it still runs (see ReplicatedCairoEngine#close()).
      */
     private final class ReplicationEnvelope implements Component {
         private final ObjList<String> empty = new ObjList<>();

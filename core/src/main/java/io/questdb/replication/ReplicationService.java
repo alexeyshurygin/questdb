@@ -118,7 +118,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private final ConcurrentHashMap<String, TableUploader> uploaders = new ConcurrentHashMap<>();
     // close(), the coordinator, the lease keeper and each pool thread hold a use of what they share: the
     // store, the index client, the worker contexts, the WAL policy, the pins and the path. The last to
-    // give its use back frees them, so a thread that close() gave up on never runs on freed memory.
+    // give its use back frees them, so a thread that close() gave up on never runs on freed memory. The
+    // engine is not theirs to free: its close() waits for them, see awaitThreadsEnd().
     private final Object useLock = new Object();
     private final Condition wakeUp = lock.newCondition();
     // closes of segments and WALs (segment WHOLE_WAL) of tables without an uploader yet: {walId, segmentId, lastTxn}
@@ -138,6 +139,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // the store holds this instance's delete list; coordinator thread only
     private boolean isDeleteListStored;
     private volatile boolean isClosed;
+    // close() gave its use back; guarded by useLock
+    private boolean isCloseUseReleased;
     // an operator allowed this node to take over a store it does not own or is behind; read at start
     private volatile boolean isMigrationAllowed;
     // this run removed the marker, on its way to a takeover that has not succeeded yet
@@ -153,6 +156,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private volatile boolean isNonDataPending;
     private volatile boolean isRestoredAtBoot;
     private volatile boolean isRunning;
+    // the last use was given back and what the uses share is freed; guarded by useLock
+    private boolean isSharedFreed;
     private volatile boolean isStarted;
     // prepareUploaders() decided which dropped tables still have a drop to upload
     private volatile boolean isUploadersPrepared;
@@ -193,14 +198,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         this.indexClient = new IndexClient(store, isChecksum);
         this.cleaner = new WalCleaner(config, this.store);
         // longer than any request that is not an upload may take with all its attempts and the pauses between them
-        this.stallLimitMillis = Math.max(
-                60_000,
-                Math.max(
-                        20 * config.getKeepaliveInterval(),
-                        (config.getRetryAttempts() + 2) * config.getRequestBaseTimeout()
-                                + io.questdb.replication.store.ObjectStoreUtils.totalRetryPause(config.getRetryAttempts(), config.getRetryInterval())
-                )
-        );
+        this.stallLimitMillis = Math.max(60_000, Math.max(20 * config.getKeepaliveInterval(), requestTimeLimitMillis()));
         this.configuredCheckpointListener = cairoConfig.getCheckpointListener();
         this.pins = isPrimary ? null : new ReplicaSegmentPins(10 * 60_000L);
         this.policy = new ReplicationWalDirectoryPolicy(cairoConfig.getFilesFacade(), isPrimary ? this : null, pins);
@@ -284,6 +282,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         } else {
             // the threads that ended give their uses back on their way out
             awaitLastUse(shutdownTimeoutMillis());
+        }
+        synchronized (useLock) {
+            isCloseUseReleased = true;
         }
         releaseUse();
     }
@@ -380,6 +381,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      */
     public void installHooks() {
         engine.setWalDirectoryPolicy(policy);
+        // the engine's close waits for the threads of this service
+        engine.setReplicationThreads(this::awaitThreadsEnd);
         // also tells this service when a checkpoint restore ran: a restored copy is a new instance
         engine.setCheckpointListener(this);
         if (isPrimary) {
@@ -553,6 +556,33 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * Waits until no thread of this service can use the engine: none holds a use, or the last of them
+     * has freed what they share. A thread that close() gave up on is stuck in a request, and the
+     * request ends by itself once it ran out of time and attempts, so this waits that long.
+     *
+     * @return true once no thread can use the engine; false when one still holds a use
+     */
+    private boolean awaitThreadsEnd() {
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(requestTimeLimitMillis());
+        synchronized (useLock) {
+            try {
+                // before close() gave its use back, a count of one is that use
+                while (isCloseUseReleased ? !isSharedFreed : useCount > 1) {
+                    final long remaining = deadline - System.nanoTime();
+                    if (remaining <= 0) {
+                        return false;
+                    }
+                    TimeUnit.NANOSECONDS.timedWait(useLock, remaining);
+                }
+                return true;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
             }
         }
     }
@@ -1049,7 +1079,14 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             useLock.notifyAll();
         }
         if (isLast) {
-            freeShared();
+            try {
+                freeShared();
+            } finally {
+                synchronized (useLock) {
+                    isSharedFreed = true;
+                    useLock.notifyAll();
+                }
+            }
         }
     }
 
@@ -1552,6 +1589,12 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      */
     private long leaseMillis() {
         return config.getKeepaliveInterval() * 5 / 2;
+    }
+
+    // how long a request that is not an upload may take with all its attempts and the pauses between them
+    private long requestTimeLimitMillis() {
+        return (config.getRetryAttempts() + 2) * config.getRequestBaseTimeout()
+                + io.questdb.replication.store.ObjectStoreUtils.totalRetryPause(config.getRetryAttempts(), config.getRetryInterval());
     }
 
     private long shutdownTimeoutMillis() {

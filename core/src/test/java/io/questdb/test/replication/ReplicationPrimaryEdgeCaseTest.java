@@ -33,8 +33,10 @@ import io.questdb.cairo.CommitMode;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.pool.ex.PoolClosedException;
 import io.questdb.cairo.wal.QdbrWalLocker;
 import io.questdb.cairo.wal.WalUtils;
+import io.questdb.griffin.SqlCompiler;
 import io.questdb.replication.IndexClient;
 import io.questdb.replication.ReplicatedCairoEngine;
 import io.questdb.replication.ReplicatedCairoEngine.EngineRole;
@@ -378,6 +380,108 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
                 awaitUploaded(node, "t", 1);
                 Assert.assertEquals(1, entry(readIndex(memory), "t").getLastTxn());
             }
+        });
+    }
+
+    @Test
+    public void testEngineCloseWaitsForACoordinatorThatOutlivesTheStop() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("engine-waits");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicReference<Thread> coordinator = new AtomicReference<>();
+            final AtomicReference<CairoEngine> engine = new AtomicReference<>();
+            final AtomicBoolean isEngineOpenAtResume = new AtomicBoolean();
+            final CountDownLatch blocked = new CountDownLatch(1);
+            final CountDownLatch never = new CountDownLatch(1);
+            final CountDownLatch resume = new CountDownLatch(1);
+            store.setFaultHook((op, key) -> {
+                // the first poll of the index outlasts the stop's waits, and goes on when the test says
+                if (op.equals("get") && key.equals(IndexClient.INDEX_KEY) && isThread(COORDINATOR_THREAD)
+                        && coordinator.compareAndSet(null, Thread.currentThread())) {
+                    blocked.countDown();
+                    if (!holdRequest(never)) {
+                        holdRequest(resume);
+                    }
+                    isEngineOpenAtResume.set(isEngineOpen(engine.get()));
+                }
+            });
+            // a request may take 50 s with all its attempts: the engine's close waits that long for the coordinator
+            final ReplicationConfigurationImpl config = config(dir, ReplicationRole.REPLICA).setRequestBaseTimeout(10_000);
+            try (Node node = newNode(dir, config, store)) {
+                engine.set(node.engine);
+                writeIndex(store, "a-primary", node.engine.getDataID().getHi(), node.engine.getDataID().getLo());
+                node.service.start();
+                await(blocked);
+                Assert.assertTrue(runInterrupted(node.service::close));
+                Assert.assertTrue(coordinator.get().isAlive());
+
+                // the server closes the engine next, and the coordinator goes on meanwhile
+                final Thread closer = new Thread(() -> {
+                    node.engine.close();
+                    Path.clearThreadLocals();
+                }, "test-engine-closer");
+                closer.start();
+                resume.countDown();
+                closer.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(closer.isAlive());
+                coordinator.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(coordinator.get().isAlive());
+                // the close waited for the coordinator to end, then freed the engine
+                Assert.assertTrue(isEngineOpenAtResume.get());
+                Assert.assertFalse(isEngineOpen(node.engine));
+                Assert.assertEquals(1, store.getCloseCount());
+            }
+        });
+    }
+
+    @Test
+    public void testEngineStaysOpenWhileACoordinatorOutlivesTheStop() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("engine-stays-open");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicReference<Thread> coordinator = new AtomicReference<>();
+            final AtomicReference<CairoEngine> engine = new AtomicReference<>();
+            final AtomicBoolean isEngineOpenAtResume = new AtomicBoolean();
+            final CountDownLatch blocked = new CountDownLatch(1);
+            final CountDownLatch never = new CountDownLatch(1);
+            final CountDownLatch resume = new CountDownLatch(1);
+            store.setFaultHook((op, key) -> {
+                // the first poll of the index outlasts every wait, and goes on when the test says
+                if (op.equals("get") && key.equals(IndexClient.INDEX_KEY) && isThread(COORDINATOR_THREAD)
+                        && coordinator.compareAndSet(null, Thread.currentThread())) {
+                    blocked.countDown();
+                    if (!holdRequest(never)) {
+                        holdRequest(resume);
+                    }
+                    isEngineOpenAtResume.set(isEngineOpen(engine.get()));
+                }
+            });
+            // a request may take 200 ms with all its attempts: the engine's close waits that long for the coordinator
+            final ReplicationConfigurationImpl config = config(dir, ReplicationRole.REPLICA)
+                    .setRequestBaseTimeout(100)
+                    .setRetryAttempts(0);
+            try (Node node = newNode(dir, config, store)) {
+                engine.set(node.engine);
+                try {
+                    writeIndex(store, "a-primary", node.engine.getDataID().getHi(), node.engine.getDataID().getLo());
+                    node.service.start();
+                    await(blocked);
+                    Assert.assertTrue(runInterrupted(node.service::close));
+                    Assert.assertTrue(coordinator.get().isAlive());
+
+                    // the server closes the engine next: the close gives up on the coordinator and frees nothing
+                    node.engine.close();
+                    Assert.assertTrue(isEngineOpen(node.engine));
+                } finally {
+                    resume.countDown();
+                }
+                coordinator.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(coordinator.get().isAlive());
+                Assert.assertTrue(isEngineOpenAtResume.get());
+                Assert.assertEquals(1, store.getCloseCount());
+                // the coordinator is gone: the next close frees the engine, and the leak check finds nothing left
+            }
+            Assert.assertFalse(isEngineOpen(engine.get()));
         });
     }
 
@@ -1084,6 +1188,15 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
             }
             return true;
         } catch (InterruptedException e) {
+            return false;
+        }
+    }
+
+    // a closed engine refuses to hand out a compiler
+    private static boolean isEngineOpen(CairoEngine engine) {
+        try (SqlCompiler ignore = engine.getSqlCompiler()) {
+            return true;
+        } catch (PoolClosedException e) {
             return false;
         }
     }

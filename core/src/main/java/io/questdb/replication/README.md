@@ -230,6 +230,17 @@ them.
    belong to stop replicating once the new primary writes those transaction
    numbers, and the node needs a fresh copy (see bootstrap).
 
+## Stopping
+
+A stop waits for the replication coordinator for three
+`replication.requests.base.timeout` intervals (5 s at least), interrupts it and
+waits as long again. A coordinator still stuck in a request after that is left
+running; it frees what replication holds when it ends. The server then closes
+the storage engine, which the coordinator may still use, so the engine first
+waits for it for as long as a request may take with all its retries. If it is
+still running then, the engine stays open and its memory is not freed, which
+the log reports as critical: nothing is freed under a running thread.
+
 ## Bootstrap and disaster recovery
 
 - **Fresh pair:** start both empty; the replica follows from the first
