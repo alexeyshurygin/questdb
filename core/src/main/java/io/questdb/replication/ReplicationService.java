@@ -93,13 +93,16 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private static final int WHOLE_WAL = -1;
     private final ConcurrentLinkedQueue<ReplicationWorker> allWorkers = new ConcurrentLinkedQueue<>();
     private final WalCleaner cleaner;
-    private final io.questdb.cairo.CheckpointListener configuredCheckpointListener;
-    private final ConcurrentLinkedQueue<io.questdb.replication.codec.CheckpointHistory.Checkpoint> pendingCheckpoints = new ConcurrentLinkedQueue<>();
     private final ReplicationConfiguration config;
+    private final io.questdb.cairo.CheckpointListener configuredCheckpointListener;
     private final ConcurrentHashMap<String, TableToken> createdTables = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Boolean> dirtyTables = new ConcurrentHashMap<>();
+    // closes of segments and WALs (segment WHOLE_WAL) of tables without an uploader yet: {walId, segmentId, lastTxn}
+    private final Map<String, List<long[]>> earlyCloses = new HashMap<>();
     private final ReplicatedCairoEngine engine;
     private final ExecutorService executor;
+    // the delete lists of other instances, which the list of this one covers once stored; coordinator thread only
+    private final List<String> foreignDeleteLists = new ArrayList<>();
     private final IndexClient indexClient;
     // The coordinator and the lease keeper both write the index. The lock guards the index client and what
     // an index write changes: sequence, lastCommittedIndex, lastIndexWriteNanos.
@@ -108,6 +111,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private final boolean isPrimary;
     private final ReentrantLock lock = new ReentrantLock();
     private final Path path = new Path();
+    private final ConcurrentLinkedQueue<io.questdb.replication.codec.CheckpointHistory.Checkpoint> pendingCheckpoints = new ConcurrentLinkedQueue<>();
+    // objects the WAL cleaner could not delete, or did not get to; coordinator thread only
+    private final List<String> pendingDeletes = new ArrayList<>();
     private final ReplicaSegmentPins pins;
     private final ReplicationWalDirectoryPolicy policy;
     private final HashMap<String, TableReplayer> replayers = new HashMap<>();
@@ -122,39 +128,34 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // engine is not theirs to free: its close() waits for them, see awaitThreadsEnd().
     private final Object useLock = new Object();
     private final Condition wakeUp = lock.newCondition();
-    // closes of segments and WALs (segment WHOLE_WAL) of tables without an uploader yet: {walId, segmentId, lastTxn}
-    private final Map<String, List<long[]>> earlyCloses = new HashMap<>();
-    // the delete lists of other instances, which the list of this one covers once stored; coordinator thread only
-    private final List<String> foreignDeleteLists = new ArrayList<>();
-    // objects the WAL cleaner could not delete, or did not get to; coordinator thread only
-    private final List<String> pendingDeletes = new ArrayList<>();
-    private final ThreadLocal<ReplicationWorker> workerSlot = new ThreadLocal<>();
     private final String workDir;
+    private final ThreadLocal<ReplicationWorker> workerSlot = new ThreadLocal<>();
+    private io.questdb.replication.codec.CheckpointHistory checkpointHistory;
+    private volatile Runnable closeHook;
+    // when close() began waiting for the coordinator, on System.nanoTime(); 0 until then
+    private volatile long closeStartedNanos;
     private volatile long epoch;
     private volatile String instanceId;
     // the WAL cleaner changed index entries it could not commit yet; coordinator thread only
     private boolean isCleanerCommitPending;
-    // the WAL cleaner read the delete lists in the store; coordinator thread only
-    private boolean isDeleteListsLoaded;
-    // the store holds this instance's delete list; coordinator thread only
-    private boolean isDeleteListStored;
     // guarded by this: close() gives its use back once, and a start() that runs at the same time either
     // starts the coordinator before close() looks for it or does not start it at all
     private boolean isClosed;
     // close() gave its use back; guarded by useLock
     private boolean isCloseUseReleased;
-    // an operator allowed this node to take over a store it does not own or is behind; read at start
-    private volatile boolean isMigrationAllowed;
-    // this run removed the marker, on its way to a takeover that has not succeeded yet
-    private boolean isMarkerRemoved;
-    // when close() began waiting for the coordinator, on System.nanoTime(); 0 until then
-    private volatile long closeStartedNanos;
-    private volatile Runnable closeHook;
     private volatile boolean isCrashed;
-    // set when the lease is released, the coordinator ends, or close() gives up waiting for it
-    private volatile boolean isLeaseKeeperStopped;
+    // the WAL cleaner read the delete lists in the store; coordinator thread only
+    private boolean isDeleteListsLoaded;
+    // the store holds this instance's delete list; coordinator thread only
+    private boolean isDeleteListStored;
     // guarded by indexLock
     private boolean isIndexClientClosed;
+    // set when the lease is released, the coordinator ends, or close() gives up waiting for it
+    private volatile boolean isLeaseKeeperStopped;
+    // this run removed the marker, on its way to a takeover that has not succeeded yet
+    private boolean isMarkerRemoved;
+    // an operator allowed this node to take over a store it does not own or is behind; read at start
+    private volatile boolean isMigrationAllowed;
     private volatile boolean isNonDataPending;
     private volatile boolean isRestoredAtBoot;
     private volatile boolean isRunning;
@@ -163,7 +164,6 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private volatile boolean isStarted;
     // prepareUploaders() decided which dropped tables still have a drop to upload
     private volatile boolean isUploadersPrepared;
-    private io.questdb.replication.codec.CheckpointHistory checkpointHistory;
     // the index the store accepted last from this node; guarded by indexLock
     private ReplicationIndex lastCommittedIndex;
     private ReplicationIndex lastIndex;
@@ -181,9 +181,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // how long the lease keeper renews for a coordinator that shows no sign of life
     private volatile long stallLimitMillis;
     private volatile String status = "starting";
+    private volatile Runnable takeoverHook;
     // guarded by useLock; close() holds one use from the start
     private int useCount = 1;
-    private volatile Runnable takeoverHook;
     // the index version acquireLease() saw unchanged for the whole wait; null when it did not have to wait
     private String watchedEtag;
     private long watchedSequence;
@@ -313,15 +313,6 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     /**
-     * Test seam: runs on the thread that called {@link #close()}, once close() has told the
-     * coordinator to stop and before it waits for it.
-     */
-    @org.jetbrains.annotations.TestOnly
-    public void setCloseHookForTesting(Runnable hook) {
-        this.closeHook = hook;
-    }
-
-    /**
      * The number of tables whose segment or WAL closes are kept until the tables have an uploader.
      */
     @org.jetbrains.annotations.TestOnly
@@ -329,49 +320,6 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         synchronized (earlyCloses) {
             return earlyCloses.size();
         }
-    }
-
-    /**
-     * The number of per-thread contexts alive: one for the coordinator and one for each pool thread
-     * that has not ended.
-     */
-    @org.jetbrains.annotations.TestOnly
-    public int getWorkerContextCount() {
-        return allWorkers.size();
-    }
-
-    /**
-     * Test seam: how long the lease keeper keeps renewing the lease while neither the coordinator nor
-     * its upload and cleanup requests make progress.
-     */
-    @org.jetbrains.annotations.TestOnly
-    public void setStallLimitForTesting(long millis) {
-        this.stallLimitMillis = millis;
-    }
-
-    /**
-     * Test seam: runs on the coordinator thread after this node decided it may take the lease and
-     * before it reads the index its takeover is based on.
-     */
-    @org.jetbrains.annotations.TestOnly
-    public void setTakeoverHookForTesting(Runnable hook) {
-        this.takeoverHook = hook;
-    }
-
-    /**
-     * The number of tables flushed when this node became the primary: 0 when its commit mode asks for
-     * no flush, -1 while it is not the primary.
-     */
-    public int getPromotionFlushedTableCount() {
-        return promotionFlushedTableCount;
-    }
-
-    /**
-     * Test seam: how long an idle pool thread lives.
-     */
-    @org.jetbrains.annotations.TestOnly
-    public void setWorkerKeepAliveForTesting(long millis) {
-        ((ThreadPoolExecutor) executor).setKeepAliveTime(millis, TimeUnit.MILLISECONDS);
     }
 
     public long getEpoch() {
@@ -383,10 +331,41 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     /**
+     * The number of tables flushed when this node became the primary: 0 when its commit mode asks for
+     * no flush, -1 while it is not the primary.
+     */
+    public int getPromotionFlushedTableCount() {
+        return promotionFlushedTableCount;
+    }
+
+    /**
      * Human-readable state of the coordinator, for logs and tests.
      */
     public String getStatus() {
         return status;
+    }
+
+    /**
+     * The last transaction of the table that the object store holds from this primary, or -1 when it
+     * uploaded none.
+     */
+    public long getUploadedTxn(@NotNull TableToken token) {
+        final TableUploader u = uploaders.get(token.getDirName());
+        if (u == null) {
+            return -1;
+        }
+        synchronized (u) {
+            return u.getCommittedTxn();
+        }
+    }
+
+    /**
+     * The number of per-thread contexts alive: one for the coordinator and one for each pool thread
+     * that has not ended.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public int getWorkerContextCount() {
+        return allWorkers.size();
     }
 
     /**
@@ -401,20 +380,6 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         engine.setCheckpointListener(this);
         if (isPrimary) {
             engine.setWalListener(new ReplicationWalListener(this));
-        }
-    }
-
-    /**
-     * The last transaction of the table that the object store holds from this primary, or -1 when it
-     * uploaded none.
-     */
-    public long getUploadedTxn(@NotNull TableToken token) {
-        final TableUploader u = uploaders.get(token.getDirName());
-        if (u == null) {
-            return -1;
-        }
-        synchronized (u) {
-            return u.getCommittedTxn();
         }
     }
 
@@ -494,6 +459,41 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     /**
+     * Test seam: runs on the thread that called {@link #close()}, once close() has told the
+     * coordinator to stop and before it waits for it.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setCloseHookForTesting(Runnable hook) {
+        this.closeHook = hook;
+    }
+
+    /**
+     * Test seam: how long the lease keeper keeps renewing the lease while neither the coordinator nor
+     * its upload and cleanup requests make progress.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setStallLimitForTesting(long millis) {
+        this.stallLimitMillis = millis;
+    }
+
+    /**
+     * Test seam: runs on the coordinator thread after this node decided it may take the lease and
+     * before it reads the index its takeover is based on.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setTakeoverHookForTesting(Runnable hook) {
+        this.takeoverHook = hook;
+    }
+
+    /**
+     * Test seam: how long an idle pool thread lives.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setWorkerKeepAliveForTesting(long millis) {
+        ((ThreadPoolExecutor) executor).setKeepAliveTime(millis, TimeUnit.MILLISECONDS);
+    }
+
+    /**
      * Starts the coordinator thread. A primary stays read-only until it caught up and holds the lease.
      */
     public synchronized void start() {
@@ -542,6 +542,40 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    // waits for the lease: free, released, ours, or not renewed for 3 keepalive intervals
+    private boolean acquireLease() {
+        long observedSeq = Long.MIN_VALUE;
+        String observedEtag = null;
+        long observedSince = nanoTime();
+        watchedEtag = null;
+        while (isRunning) {
+            final ReplicationIndex idx = indexClient.read();
+            if (isFree(idx)) {
+                return true;
+            }
+            final String etag = indexClient.getEtag();
+            if (observedEtag == null || !observedEtag.equals(etag) || idx.getSequence() != observedSeq) {
+                observedEtag = etag;
+                observedSeq = idx.getSequence();
+                observedSince = nanoTime();
+            }
+            final long waitedMs = TimeUnit.NANOSECONDS.toMillis(nanoTime() - observedSince);
+            final long leaseMs = 3 * config.getKeepaliveInterval();
+            if (waitedMs >= leaseMs) {
+                LOG.advisory().$("taking over the replication lease of an unresponsive primary [previousOwner=")
+                        .$(idx.getOwnerInstanceId()).$(", epoch=").$(idx.getEpoch()).I$();
+                watchedEtag = observedEtag;
+                watchedSequence = observedSeq;
+                return true;
+            }
+            status = "waiting for lease, owner=" + idx.getOwnerInstanceId();
+            LOG.info().$("waiting for the replication lease [owner=").$(idx.getOwnerInstanceId())
+                    .$(", remainingMs=").$(leaseMs - waitedMs).I$();
+            awaitWake(Math.min(config.getKeepaliveInterval(), Math.max(100, leaseMs - waitedMs)), false);
+        }
+        return false;
     }
 
     // false once the last use was given back and what the uses share is freed
@@ -599,40 +633,6 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 return false;
             }
         }
-    }
-
-    // waits for the lease: free, released, ours, or not renewed for 3 keepalive intervals
-    private boolean acquireLease() {
-        long observedSeq = Long.MIN_VALUE;
-        String observedEtag = null;
-        long observedSince = nanoTime();
-        watchedEtag = null;
-        while (isRunning) {
-            final ReplicationIndex idx = indexClient.read();
-            if (isFree(idx)) {
-                return true;
-            }
-            final String etag = indexClient.getEtag();
-            if (observedEtag == null || !observedEtag.equals(etag) || idx.getSequence() != observedSeq) {
-                observedEtag = etag;
-                observedSeq = idx.getSequence();
-                observedSince = nanoTime();
-            }
-            final long waitedMs = TimeUnit.NANOSECONDS.toMillis(nanoTime() - observedSince);
-            final long leaseMs = 3 * config.getKeepaliveInterval();
-            if (waitedMs >= leaseMs) {
-                LOG.advisory().$("taking over the replication lease of an unresponsive primary [previousOwner=")
-                        .$(idx.getOwnerInstanceId()).$(", epoch=").$(idx.getEpoch()).I$();
-                watchedEtag = observedEtag;
-                watchedSequence = observedSeq;
-                return true;
-            }
-            status = "waiting for lease, owner=" + idx.getOwnerInstanceId();
-            LOG.info().$("waiting for the replication lease [owner=").$(idx.getOwnerInstanceId())
-                    .$(", remainingMs=").$(leaseMs - waitedMs).I$();
-            awaitWake(Math.min(config.getKeepaliveInterval(), Math.max(100, leaseMs - waitedMs)), false);
-        }
-        return false;
     }
 
     // no index, a released one, or this node's own: nobody else holds the lease
@@ -1292,11 +1292,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     /**
-     * One primary round: uploads the dirty tables when {@code isUpload}, then commits the index if
-     * there is anything to commit, the lease needs renewing, or this is the final round.
-     */
-    /**
-     * Uploads what the dirty tables hold, one batch per table, and commits it.
+     * One primary round. With {@code isUpload}, it sets up the tables created since the last round,
+     * uploads what the dirty tables hold, one batch per table, and commits the index when there is
+     * anything to commit or a keepalive is due; without it, it only commits the index.
      *
      * @return the number of transactions uploaded
      */

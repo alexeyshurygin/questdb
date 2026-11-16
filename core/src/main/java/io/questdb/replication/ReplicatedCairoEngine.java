@@ -184,10 +184,6 @@ public class ReplicatedCairoEngine extends CairoEngine {
     }
 
     /**
-     * Refuses client drops of replicated tables while read-only. Replication applies a primary's drop
-     * through {@link #dropReplicatedTable(Path, TableToken)}.
-     */
-    /**
      * Refuses views while read-only, as every other DDL.
      */
     @Override
@@ -206,16 +202,20 @@ public class ReplicatedCairoEngine extends CairoEngine {
         return super.createView(securityContext, mem, blockFileWriter, path, ifNotExists, operation, metadata);
     }
 
-    @Override
-    public void dropTableOrViewOrMatView(Path path, TableToken tableToken) {
-        checkReplicatedWrite(tableToken);
-        super.dropTableOrViewOrMatView(path, tableToken);
-    }
-
     /**
      * Drops a table on behalf of replication, bypassing the read-only fence.
      */
     public void dropReplicatedTable(Path path, TableToken tableToken) {
+        super.dropTableOrViewOrMatView(path, tableToken);
+    }
+
+    /**
+     * Refuses client drops of replicated tables while read-only. Replication applies a primary's drop
+     * through {@link #dropReplicatedTable(Path, TableToken)}.
+     */
+    @Override
+    public void dropTableOrViewOrMatView(Path path, TableToken tableToken) {
+        checkReplicatedWrite(tableToken);
         super.dropTableOrViewOrMatView(path, tableToken);
     }
 
@@ -309,6 +309,14 @@ public class ReplicatedCairoEngine extends CairoEngine {
     }
 
     /**
+     * True when this boot minted the database id: the node started without one, so it may still take
+     * the id of the object store it joins.
+     */
+    public boolean isDataIdMintedAtBoot() {
+        return isDataIdMintedAtBoot;
+    }
+
+    /**
      * A read-only replica permits the break-glass alters that bypass the WAL (they mint no
      * replicated transaction), as QuestDB Enterprise does; the {@code readonly} lockdown still refuses
      * them.
@@ -351,15 +359,6 @@ public class ReplicatedCairoEngine extends CairoEngine {
         }
     }
 
-    /**
-     * Test seam: replaces the clock of {@link #getNanoTime()}. Set it before the replication service
-     * starts; a clock that jumps ahead stands in for a request that takes that long.
-     */
-    @org.jetbrains.annotations.TestOnly
-    public void setNanoClockForTesting(@NotNull LongSupplier nanoClock) {
-        this.nanoClock = nanoClock;
-    }
-
     @Override
     public TableToken rename(
             SecurityContext securityContext,
@@ -397,6 +396,15 @@ public class ReplicatedCairoEngine extends CairoEngine {
      */
     public void setCheckpointListener(@Nullable CheckpointListener checkpointListener) {
         this.checkpointListener = checkpointListener;
+    }
+
+    /**
+     * Test seam: replaces the clock of {@link #getNanoTime()}. Set it before the replication service
+     * starts; a clock that jumps ahead stands in for a request that takes that long.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setNanoClockForTesting(@NotNull LongSupplier nanoClock) {
+        this.nanoClock = nanoClock;
     }
 
     /**
@@ -463,14 +471,6 @@ public class ReplicatedCairoEngine extends CairoEngine {
             super.initDataID();
             isDataIdMintedAtBoot = !wasInitialized && getDataID().isInitialized();
         }
-    }
-
-    /**
-     * True when this boot minted the database id: the node started without one, so it may still take
-     * the id of the object store it joins.
-     */
-    public boolean isDataIdMintedAtBoot() {
-        return isDataIdMintedAtBoot;
     }
 
     private class RoleAwareQwpServerInfoProvider implements QwpServerInfoProvider {
