@@ -44,6 +44,7 @@ import io.questdb.cairo.wal.WalWriter;
 import io.questdb.cairo.wal.seq.TableSequencerAPI;
 import io.questdb.cairo.wal.seq.TableSequencerImpl;
 import io.questdb.cairo.wal.seq.TableTransactionLogFile;
+import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.replication.ReplicaSegmentPins;
 import io.questdb.replication.ReplicaTableApplier;
@@ -96,6 +97,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -333,6 +335,61 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
                 TestUtils.assertContains(replayer.getStaleReason(), "corrupt transaction log part [key=" + part1 + ", error=");
                 // the batch appended the first transaction before the second part stopped it
                 Assert.assertEquals(1, replica.getTableSequencerAPI().lastTxn(replica.verifyTableName("t")));
+            }
+        });
+    }
+
+    @Test
+    public void testFailedUploadMarkerFailsTheDirectory() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = newDir("marker-failure");
+            final AtomicBoolean isMarkerFailing = new AtomicBoolean();
+            final FilesFacade ff = new TestFilesFacadeImpl() {
+                @Override
+                public long openRW(LPSZ name, int opts) {
+                    if (isMarkerFailing.get() && Utf8s.endsWithAscii(name, ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER)) {
+                        return -1;
+                    }
+                    return super.openRW(name, opts);
+                }
+            };
+            final String failure = "could not create upload marker [path=";
+            try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
+                 ReplicationWalDirectoryPolicy policy = new ReplicationWalDirectoryPolicy(ff, (tableDir, partId) -> false, null)) {
+                primary.setWalDirectoryPolicy(policy);
+                primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                final TableToken t = primary.verifyTableName("t");
+                final java.nio.file.Path tableDir = Paths.get(primary.getConfiguration().getDbRoot().toString(), t.getDirName());
+                Assert.assertTrue(Files.exists(tableDir.resolve(WalUtils.SEQ_DIR).resolve(ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER)));
+
+                isMarkerFailing.set(true);
+                // a WAL segment the purge job could delete before its upload is never written
+                try {
+                    primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                    Assert.fail("expected the segment without its marker to fail the write");
+                } catch (CairoException e) {
+                    TestUtils.assertContains(e.getMessage(), failure);
+                }
+                Assert.assertEquals(0, primary.getTableSequencerAPI().lastTxn(t));
+                // and neither is a table whose sequencer the purge job could delete
+                try {
+                    primary.execute("CREATE TABLE u (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                    Assert.fail("expected the sequencer without its marker to fail the create");
+                } catch (SqlException e) {
+                    TestUtils.assertContains(e.getMessage(), failure);
+                }
+                Assert.assertNull(primary.getTableTokenIfExists("u"));
+
+                // once markers can be created again, the table takes writes, every segment protected
+                isMarkerFailing.set(false);
+                primary.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                TestUtils.drainWalQueue(primary);
+                Assert.assertEquals("ts\tv\n2024-01-01T00:00:00.000000Z\t1\n", rows(primary, "t", "ts"));
+                try (Stream<java.nio.file.Path> files = Files.walk(tableDir)) {
+                    files.filter(p -> p.getFileName().toString().equals(WalUtils.EVENT_FILE_NAME))
+                            .forEach(event -> Assert.assertTrue(String.valueOf(event.getParent()),
+                                    Files.exists(event.resolveSibling(ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER))));
+                }
             }
         });
     }

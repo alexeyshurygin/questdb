@@ -25,6 +25,7 @@
 
 package io.questdb.replication;
 
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.wal.DefaultWalDirectoryPolicy;
 import io.questdb.cairo.wal.WalDirectoryPolicy;
@@ -91,6 +92,10 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
         // without a token we cannot tell a node-local table: no marker
     }
 
+    /**
+     * Creates the marker of a new directory of a replicated table. A directory left without it would be
+     * open to the purge job before its upload, so a failed creation fails the directory's creator.
+     */
     @Override
     public void initDirectory(Path dirPath, TableToken tableToken) {
         if (primaryPins == null || tableToken == null || !isReplicated(tableToken)) {
@@ -99,9 +104,10 @@ public class ReplicationWalDirectoryPolicy implements WalDirectoryPolicy, QuietC
         synchronized (markerPath) {
             try {
                 final long fd = ff.openRW(markerOf(dirPath), 0);
-                if (fd > -1) {
-                    ff.close(fd);
+                if (fd < 0) {
+                    throw CairoException.critical(ff.errno()).put("could not create upload marker [path=").put(markerPath).put(']');
                 }
+                ff.close(fd);
             } finally {
                 releaseMarkerPath();
             }
