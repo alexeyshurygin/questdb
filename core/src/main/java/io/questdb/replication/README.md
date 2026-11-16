@@ -232,6 +232,13 @@ them.
 
 ## Stopping
 
+A graceful stop releases the lease only when every table is in the store. A
+new table whose upload cannot be set up while its directory exists (an
+unreadable sequencer log, say) is retried every throttle window with an error
+in the log, and keeps every stop from releasing the lease: until the table is
+repaired or dropped, the next primary waits three keepalive intervals for the
+lease to expire, the restarted node included.
+
 A stop waits for the replication coordinator for three
 `replication.requests.base.timeout` intervals (5 s at least), interrupts it and
 waits as long again. A coordinator still stuck in a request after that is left

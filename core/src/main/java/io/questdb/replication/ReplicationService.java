@@ -322,6 +322,16 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     /**
+     * The number of tables whose segment or WAL closes are kept until the tables have an uploader.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public int getEarlyCloseTableCount() {
+        synchronized (earlyCloses) {
+            return earlyCloses.size();
+        }
+    }
+
+    /**
      * The number of per-thread contexts alive: one for the coordinator and one for each pool thread
      * that has not ended.
      */
@@ -1309,6 +1319,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                     if (!engine.getConfiguration().getFilesFacade().exists(path.of(engine.getConfiguration().getDbRoot()).concat(dir).$())) {
                         // dropped and purged before it was set up: the store never knew it, and nothing is left to upload
                         createdTables.remove(dir);
+                        // nor is an uploader ever coming for the closes kept for it
+                        synchronized (earlyCloses) {
+                            earlyCloses.remove(dir);
+                        }
                         LOG.advisory().$("a new table is gone before its upload was set up [table=").$(token).I$();
                     } else {
                         LOG.error().$("could not set up the upload of a new table, will retry [table=").$(token)

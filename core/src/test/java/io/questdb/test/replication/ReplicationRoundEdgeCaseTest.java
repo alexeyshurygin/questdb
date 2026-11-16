@@ -1404,6 +1404,32 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testTableGoneBeforeItsSetupLeavesNoCloseBehind() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (Node node = newNode("p", primaryConfig(), store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                // the WAL listener reports the close of a segment of a new table and then the table, which is
+                // dropped and purged before a round sets its upload up
+                final TableToken gone = new TableToken("gone", "gone~999", null, 999, true, false, false);
+                node.service.onSegmentClosed(gone, 0, 0, 1);
+                Assert.assertEquals(1, node.service.getEarlyCloseTableCount());
+                node.service.onTableCreated(gone);
+                // the round that uploads a row of a later table began after the table was reported, so it
+                // looked at it and found it gone
+                node.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(node, store, "t", 0);
+                node.engine.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitUploaded(node, store, "t", 1);
+                Assert.assertNull(entry(readIndex(store), "gone"));
+                // and forgot the close it kept for the table's uploader
+                Assert.assertEquals(0, node.service.getEarlyCloseTableCount());
+            }
+        });
+    }
+
+    @Test
     public void testTakeoverFencesWhenTheStoreChangedToATableItCannotCatchUpWith() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
