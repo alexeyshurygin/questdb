@@ -332,6 +332,30 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testEmptySystemPrefixKeepsReplicatedTablesReadOnly() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final NodeConfiguration configuration = new NodeConfiguration(newDir("empty-prefix-writes"));
+            configuration.systemTableNamePrefix = "";
+            try (ReplicatedCairoEngine engine = newEngine(configuration, ReplicationRole.PRIMARY);
+                 Path path = new Path()) {
+                engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                final TableToken t = engine.verifyTableName("t");
+                // every name starts with an empty prefix, so the token of a client table reads as a system table
+                Assert.assertTrue(t.isSystem());
+
+                engine.setRole(EngineRole.REPLICA, null);
+                // the read-only node still refuses every client write to it
+                assertReadOnly(() -> engine.getWalWriter(t).close());
+                assertReadOnly(() -> engine.getTableWriterAPI(t, "test").close());
+                assertReadOnly(() -> engine.getTableWriterAPI("t", "test").close());
+                assertReadOnly(() -> engine.getWriter(t, "test").close());
+                assertReadOnly(() -> engine.dropTableOrViewOrMatView(path.of(engine.getConfiguration().getDbRoot()), t));
+                Assert.assertEquals(t, engine.getTableTokenIfExists("t"));
+            }
+        });
+    }
+
+    @Test
     public void testEmptySystemPrefixMakesNoTableNodeLocal() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final NodeConfiguration configuration = new NodeConfiguration(newDir("empty-prefix"));

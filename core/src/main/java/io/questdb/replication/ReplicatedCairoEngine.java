@@ -441,9 +441,15 @@ public class ReplicatedCairoEngine extends CairoEngine {
     // Non-WAL tables are not replicated; a replica creates some of its own (query export temp tables),
     // and system tables are node-local too.
     private void checkReplicatedWrite(TableToken token) {
-        if (isReadOnlyMode() && token.isWal() && !token.isLiveView() && !token.isSystem()) {
+        if (isReadOnlyMode() && token.isWal() && !token.isLiveView() && !isNodeLocalSystemTable(token)) {
             throw CairoException.readOnlyAccess();
         }
+    }
+
+    // As createTable() decides: with an empty system table prefix every name starts with it, and every
+    // token reads as a system table, so none of them is taken for one.
+    private boolean isNodeLocalSystemTable(TableToken token) {
+        return token.isSystem() && getConfiguration().getSystemTableNamePrefix().length() > 0;
     }
 
     private boolean isSystemTableName(CharSequence tableName) {
