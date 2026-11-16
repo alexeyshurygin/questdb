@@ -527,7 +527,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             status = "waiting for lease, owner=" + idx.getOwnerInstanceId();
             LOG.info().$("waiting for the replication lease [owner=").$(idx.getOwnerInstanceId())
                     .$(", remainingMs=").$(leaseMs - waitedMs).I$();
-            awaitWake(Math.min(config.getKeepaliveInterval(), Math.max(100, leaseMs - waitedMs)));
+            awaitWake(Math.min(config.getKeepaliveInterval(), Math.max(100, leaseMs - waitedMs)), false);
         }
         return false;
     }
@@ -579,10 +579,16 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         return false;
     }
 
-    private void awaitWake(long millis) {
+    /**
+     * Waits for the timeout or a wake-up. The primary's upload loop also stops waiting while a
+     * structural change waits to be uploaded. Nothing else may: the catch-up replays such changes
+     * through this node's own WAL listener, and the flag they set stays up until the first upload
+     * round of the node's term.
+     */
+    private void awaitWake(long millis, boolean isUploadLoop) {
         lock.lock();
         try {
-            if (isRunning && !isNonDataPending) {
+            if (isRunning && !(isUploadLoop && isNonDataPending)) {
                 wakeUp.await(millis, TimeUnit.MILLISECONDS);
             }
         } catch (InterruptedException e) {
@@ -1332,7 +1338,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 continue;
             }
             runHousekeeping(true);
-            awaitWake(Math.max(1, Math.min(window, config.getKeepaliveInterval()) / 4));
+            awaitWake(Math.max(1, Math.min(window, config.getKeepaliveInterval()) / 4), true);
         }
         // drain what is committed, then hand the lease over
         if (engine.isPrimaryRole() && !isCrashed) {
@@ -1581,7 +1587,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             }
             runHousekeeping(false);
             if (applied == 0) {
-                awaitWake(config.getReplicaPollInterval());
+                awaitWake(config.getReplicaPollInterval(), false);
             }
         }
     }

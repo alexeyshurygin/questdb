@@ -475,6 +475,46 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testLeaseWaitAfterACatchUpOfAStructureChangeKeepsItsPace() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            // node a uploads a table and a change of its structure, and dies holding the lease
+            try (Node a = newNode("a", primaryConfig(), store)) {
+                a.service.start();
+                awaitRole(a, EngineRole.PRIMARY);
+                a.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                a.engine.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                a.engine.execute("ALTER TABLE t ADD COLUMN s VARCHAR");
+                awaitUploaded(a, store, "t", 2);
+                a.service.crashForTesting();
+            }
+            final AtomicReference<ReplicationService> service = new AtomicReference<>();
+            final AtomicInteger readsWhileWaiting = new AtomicInteger();
+            store.setFaultHook((op, key) -> {
+                final ReplicationService s = service.get();
+                if (s != null && op.equals("get") && key.equals(IndexClient.INDEX_KEY)
+                        && COORDINATOR_THREAD.equals(Thread.currentThread().getName())
+                        && s.getStatus().startsWith("waiting for lease")) {
+                    readsWhileWaiting.incrementAndGet();
+                }
+            });
+            // node b replays the change as it catches up, then waits for the lease of node a: three
+            // keepalive intervals of 1 s
+            try (Node b = newNode("b", primaryConfig().setKeepaliveInterval(1_000), store)) {
+                allowPromotion(b);
+                service.set(b.service);
+                b.service.start();
+                awaitRole(b, EngineRole.PRIMARY);
+                Assert.assertEquals(2, b.engine.getTableSequencerAPI().lastTxn(b.engine.verifyTableName("t")));
+                // it read the index once a keepalive interval while it waited, and once more as it took
+                // the lease: about four reads, not one after another for three seconds
+                final int reads = readsWhileWaiting.get();
+                Assert.assertTrue("index reads while waiting for the lease: " + reads, reads <= 10);
+            }
+        });
+    }
+
+    @Test
     public void testMarkerWithdrawnDuringATakeoverThatNeedsNoMarker() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
