@@ -37,6 +37,15 @@ holds; the node is then behind its own store at its next start and refuses to
 run as primary without `_migrate_primary` (guardrail 6). The server logs an
 advisory at start when a replicated node runs without a durable commit mode.
 
+A replica does not flush what it replays, even under `adaptive`: as in QuestDB
+Enterprise, the object store is its durable copy, and only `sync` keeps a
+replica flushing. Two steps cover what that leaves open. A node that restarts
+writes again, from the object store, the WAL data of every transaction it had
+replayed and not yet applied to its tables, so a power loss between the two
+does not leave a table suspended. And a node that becomes the primary under
+`adaptive` flushes the files and the sequencer log of every replicated table
+once before it admits writes; if that flush fails, the server stops.
+
 The `access_key_id`/`secret_access_key`/`session_token` keys of the store string
 are optional. Without them the S3 client reads `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` from the environment, and then

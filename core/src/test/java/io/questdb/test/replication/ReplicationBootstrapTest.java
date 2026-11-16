@@ -59,6 +59,9 @@ public class ReplicationBootstrapTest extends AbstractReplicationTest {
                 try (TestServerMain primary = start(p)) {
                     awaitRole(primary, io.questdb.replication.ReplicatedCairoEngine.EngineRole.PRIMARY);
                     Assert.assertEquals(io.questdb.cairo.CommitMode.NOSYNC, primary.getEngine().getConfiguration().getCommitMode());
+                    // nosync asks for no flush, at promotion or ever
+                    Assert.assertEquals(0, primary.getReplicationService().getPromotionFlushedTableCount());
+                    Assert.assertEquals(-1, replica.getReplicationService().getPromotionFlushedTableCount());
                     Assert.assertEquals(io.questdb.cairo.CommitMode.NOSYNC, replica.getEngine().getConfiguration().getCommitMode());
                     primary.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
                     primary.execute("INSERT INTO t VALUES ('2024-01-01', 1), ('2024-01-02', 2)");

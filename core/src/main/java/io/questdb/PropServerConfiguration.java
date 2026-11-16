@@ -1817,6 +1817,10 @@ public class PropServerConfiguration implements ServerConfiguration {
             // node that can become primary: a primary then uploads only what is durable locally, so a power loss cannot
             // leave its log behind the object store.
             this.commitMode = getCommitMode(properties, env, PropertyKey.CAIRO_COMMIT_MODE, CommitMode.toString(CommitMode.DEFAULT));
+            if (replicationConfiguration.getRole().isEnabled() && !CommitMode.isPowerLossDurable(commitMode)) {
+                log.advisory().$("replication runs with cairo.commit.mode=").$(CommitMode.toString(commitMode))
+                        .$(": a power loss can leave a primary behind the object store; set cairo.commit.mode=adaptive on every node that can become primary").$();
+            }
             this.adaptiveEpochIntervalMs = getMillis(properties, env, PropertyKey.CAIRO_ADAPTIVE_EPOCH_INTERVAL, 60000);
             this.adaptiveEpochMaxRows = getLong(properties, env, PropertyKey.CAIRO_ADAPTIVE_EPOCH_MAX_ROWS, 5_000_000);
             // 0 fdatasyncs every commit before it returns. A negative value clamps to 0, so a

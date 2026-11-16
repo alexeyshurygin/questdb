@@ -361,6 +361,54 @@ public class ReplicaApplyTest extends AbstractTest {
     }
 
     @Test
+    public void testReplicaRecoversReplayedButUnappliedTransactionsTornByPowerLoss() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = newDir("torn-a");
+            final String b = newDir("torn-b");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (ReplicatedCairoEngine primary = newEngine(a, ReplicationRole.PRIMARY);
+                 ReplicationWorker pw = worker(store, primary, a)) {
+                final IndexTable entry = uploadSample(primary, pw);
+                // The replica replays all three transactions into its sequencer log and WAL, and loses
+                // power before the apply job moved any of them into the table.
+                try (ReplicatedCairoEngine replica = newEngine(b, ReplicationRole.REPLICA, null, io.questdb.cairo.CommitMode.ADAPTIVE);
+                     ReplicationWorker rw = worker(store, replica, b)) {
+                    Assert.assertEquals(3, new TableReplayer(entry.getKey()).replay(replica, entry, rw, null, 100));
+                }
+                // it does not flush what it replays, so the WAL data is gone while the log names it
+                int torn = 0;
+                try (java.util.stream.Stream<java.nio.file.Path> files = java.nio.file.Files.walk(java.nio.file.Paths.get(b, "db"))) {
+                    for (java.nio.file.Path f : (Iterable<java.nio.file.Path>) files::iterator) {
+                        final String name = f.toString();
+                        if (java.nio.file.Files.isRegularFile(f) && name.contains(File.separator + "wal") && !name.endsWith(".lock") && !name.contains("pending")) {
+                            java.nio.file.Files.write(f, new byte[0]);
+                            torn++;
+                        }
+                    }
+                }
+                Assert.assertTrue("nothing to tear", torn > 0);
+
+                // it comes back, follows the store and serves the same rows as the primary
+                try (ReplicatedCairoEngine replica = newEngine(b, ReplicationRole.REPLICA, null, io.questdb.cairo.CommitMode.ADAPTIVE);
+                     ReplicationWorker rw = worker(store, replica, b)) {
+                    final TableReplayer replayer = new TableReplayer(entry.getKey());
+                    replayer.replay(replica, entry, rw, null, 100);
+                    Assert.assertNull(replayer.getStaleReason());
+                    TestUtils.drainWalQueue(replica);
+                    TestUtils.drainWalQueue(primary);
+                    final TableToken token = replica.verifyTableName("t");
+                    Assert.assertFalse("the table is suspended", replica.getTableSequencerAPI().isSuspended(token));
+                    try (io.questdb.cairo.TableReader expected = primary.getReader(primary.verifyTableName("t"));
+                         io.questdb.cairo.TableReader actual = replica.getReader(token)) {
+                        Assert.assertEquals(3, expected.size());
+                        Assert.assertEquals(expected.size(), actual.size());
+                    }
+                }
+            }
+        });
+    }
+
+    @Test
     public void testReplayLeavesNoDurabilityPinBehind() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = newDir("pins-a");

@@ -157,6 +157,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private Thread mainThread;
     private long nextCheckpointUploadNanos;
     private long nextCleanerRunNanos;
+    // -1 until this node became the primary; then the number of tables its promotion flush covered
+    private volatile int promotionFlushedTableCount = -1;
     private volatile long sequence;
     // how long the lease keeper renews for a coordinator that shows no sign of life
     private volatile long stallLimitMillis;
@@ -331,6 +333,14 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     /**
+     * The number of tables flushed when this node became the primary: 0 when its commit mode asks for
+     * no flush, -1 while it is not the primary.
+     */
+    public int getPromotionFlushedTableCount() {
+        return promotionFlushedTableCount;
+    }
+
+    /**
      * Test seam: how long an idle pool thread lives.
      */
     @org.jetbrains.annotations.TestOnly
@@ -466,10 +476,6 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         isRunning = true;
         instanceId = loadInstanceId();
         isMigrationAllowed = isPrimary && Files.exists(Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE));
-        if (!CommitMode.isPowerLossDurable(engine.getConfiguration().getCommitMode())) {
-            LOG.advisory().$("replication runs with cairo.commit.mode=").$(CommitMode.toString(engine.getConfiguration().getCommitMode()))
-                    .$(": a power loss can leave a primary behind the object store; set cairo.commit.mode=adaptive on every node that can become primary").$();
-        }
         mainThread = new Thread(this::run, "qdb-replication");
         mainThread.setDaemon(true);
         mainThread.start();
@@ -725,6 +731,41 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         return System.nanoTime() - lastIndexWriteEndNanos >= TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval());
     }
 
+    /**
+     * Makes durable, once, what this node holds as it becomes the primary. While it was a replica it
+     * flushed nothing of what it replayed: the object store was the durable copy. From here on its own
+     * disk is, so under the adaptive commit mode the files of every WAL table and its sequencer log are
+     * flushed before writes are admitted, as QuestDB Enterprise does when it promotes a replica. A
+     * failed flush stops the engine: the node must not acknowledge writes on top of files it cannot
+     * make durable.
+     */
+    private void flushForPromotion() {
+        if (engine.getResolvedCommitMode() != CommitMode.ADAPTIVE) {
+            promotionFlushedTableCount = 0;
+            return;
+        }
+        final ObjHashSet<TableToken> all = new ObjHashSet<>();
+        engine.getTableTokens(all, false);
+        final ObjList<TableToken> tables = new ObjList<>();
+        for (int i = 0, n = all.size(); i < n; i++) {
+            final TableToken token = all.get(i);
+            if (ReplicationWalDirectoryPolicy.isReplicated(token)) {
+                tables.add(token);
+            }
+        }
+        final long start = System.nanoTime();
+        try {
+            io.questdb.cairo.DurableEpochManifest.fsyncTables(engine, tables);
+        } catch (Throwable th) {
+            LOG.critical().$("could not flush the tables as this node becomes the primary [error=").$(th).I$();
+            engine.handleDataSyncFailure(th);
+            throw th;
+        }
+        promotionFlushedTableCount = tables.size();
+        LOG.info().$("flushed the tables as this node becomes the primary [tables=").$(tables.size())
+                .$(", ms=").$(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)).I$();
+    }
+
     // the caller holds indexLock; isCommit is false for a renewal that carries no upload
     private boolean writeIndex(ReplicationIndex idx, boolean isReleased, boolean isCommit) {
         // the lease counts from before the request: the store accepted the write no earlier than this
@@ -965,7 +1006,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
 
     // under SYNC and ADAPTIVE, only what is durable locally: a crash could cut the rest and reissue its numbers
     private long durableTarget(TableUploader u, long last) {
-        final int commitMode = engine.getConfiguration().getCommitMode();
+        // the engine resolves the mode: a primary runs the configured one
+        final int commitMode = engine.getResolvedCommitMode();
         if (commitMode == CommitMode.ADAPTIVE || commitMode == CommitMode.SYNC) {
             final SeqTxnTracker tracker = engine.getTableSequencerAPI().getTxnTrackerIfExists(u.getToken());
             if (tracker != null) {
@@ -1230,6 +1272,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 return;
             }
         }
+        flushForPromotion();
         engine.setRole(ReplicatedCairoEngine.EngineRole.PRIMARY, null);
         status = "primary, epoch " + epoch;
         LOG.advisory().$("replication primary is writable [epoch=").$(epoch).$(", instance=").$(instanceId)

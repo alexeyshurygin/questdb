@@ -58,6 +58,8 @@ public class TableReplayer {
     // WALs whose transactions the current batch sequenced under a durable commit mode
     private final IntList replayedWalIds = new IntList();
     private final String tableKey;
+    // the unapplied tail was written again from the store after this start
+    private boolean isTailRepaired;
     private TxnPart cachedPart;
     private long cachedPartEpoch = -1;
     private static final int MAX_MISSING_ROUNDS = 5;
@@ -273,6 +275,10 @@ public class TableReplayer {
             checkCommonPrefix(engine, entry, worker, local);
             prefixCheckedTxn = common;
         }
+        if (!isTailRepaired) {
+            repairUnappliedTail(engine, entry, worker, pins, common);
+            isTailRepaired = true;
+        }
         if (local < entry.getFirstTxn() - 1) {
             throw ReplicationException.gap("the object store no longer holds the transactions after this node's last one [table="
                     + entry.getTableName() + ", local=" + local + ", storeFirst=" + entry.getFirstTxn() + ']');
@@ -281,7 +287,9 @@ public class TableReplayer {
             // ahead of the store, as a copy taken before the primary uploaded is: wait for the store
             return 0;
         }
-        final boolean isDurable = CommitMode.isPowerLossDurable(engine.getConfiguration().getCommitMode());
+        // The engine resolves the mode. A replica does not flush what it replays: the object store is its
+        // durable copy. A primary catching up flushes as its own writers do.
+        final boolean isDurable = CommitMode.isPowerLossDurable(engine.getResolvedCommitMode());
         final MicrosecondClock clock = engine.getConfiguration().getMicrosecondClock();
         final WalLocker walLocker = engine.getWalLocker();
         long applied = 0;
@@ -298,7 +306,8 @@ public class TableReplayer {
                     try {
                         applyDelta(engine, record, worker, isDurable, pins);
                         token = worker.getTableApplier().apply(token, record);
-                        if (isDurable && !replayedWalIds.contains(record.getWalId())) {
+                        // the sequencer pins by its own rule, whatever this node flushes
+                        if (!replayedWalIds.contains(record.getWalId())) {
                             replayedWalIds.add(record.getWalId());
                         }
                     } finally {
@@ -331,6 +340,57 @@ public class TableReplayer {
     }
 
     /**
+     * Writes again, from the object store, the WAL data of the transactions this node replayed before
+     * it last stopped and has not applied to the table yet. A replica does not flush what it replays,
+     * so after a power loss its sequencer log can name transactions whose WAL data never reached the
+     * disk; the apply job would fail on them and suspend the table. The store holds all of it, so
+     * nothing local has to be intact. Runs once per table after a start, before anything new is
+     * replayed; what the table already applied is left alone, and so is what the store no longer holds.
+     */
+    private void repairUnappliedTail(
+            ReplicatedCairoEngine engine,
+            IndexTable entry,
+            ReplicationWorker worker,
+            @Nullable ReplicaSegmentPins pins,
+            long common
+    ) {
+        final SeqTxnTracker tracker = engine.getTableSequencerAPI().getTxnTracker(token);
+        final long appliedTxn = tracker.getWriterTxn();
+        final long from = Math.max(Math.max(appliedTxn, 0) + 1, entry.getFirstTxn());
+        if (from > common) {
+            return;
+        }
+        final WalLocker walLocker = engine.getWalLocker();
+        long repaired = 0;
+        for (long txn = from; txn <= common; txn++) {
+            final long part = IndexTable.partOf(txn, entry.getPartTxnCount());
+            final TxnRecord record = loadPart(entry, worker, part, entry.getAuthoritativeEpoch(part), txn).getRecord(txn);
+            if (!record.isData()) {
+                continue;
+            }
+            walLocker.lockWriter(token, record.getWalId(), record.getSegmentId());
+            try {
+                applyDelta(engine, record, worker, false, pins);
+                repaired++;
+            } catch (ReplicationException e) {
+                if (e.getKind() != ReplicationException.Kind.MISSING) {
+                    throw e;
+                }
+                // the cleaner removed it: the local copy is all there is
+                LOG.info().$("WAL data of an unapplied transaction is no longer in the object store [table=").$(token)
+                        .$(", txn=").$(txn).I$();
+            } finally {
+                walLocker.unlockWriter(token, record.getWalId());
+            }
+        }
+        if (repaired > 0) {
+            LOG.info().$("rewrote the WAL data of unapplied transactions from the object store [table=").$(token)
+                    .$(", from=").$(from).$(", to=").$(common).I$();
+            engine.notifyWalTxnCommitted(token);
+        }
+    }
+
+    /**
      * Under a durable commit mode the sequencer pins every transaction it appends for the WAL writer
      * that wrote it, and holds the table's durable frontier below the pin until that writer flushes
      * the sequencer log. The writer of a replicated transaction is on the primary, so this node flushes
@@ -345,7 +405,8 @@ public class TableReplayer {
         try {
             if (!isDone) {
                 final SeqTxnTracker tracker = api.getTxnTrackerIfExists(token);
-                if (tracker != null) {
+                // no pin, as under nosync, means nothing to flush and nothing to release
+                if (tracker != null && tracker.getPendingWriterPinCount() > 0) {
                     final long orphanSweepMark = tracker.snapshotOrphanSweepMark();
                     final long covered = api.fdatasyncTxnLog(token);
                     for (int i = 0, n = replayedWalIds.size(); i < n; i++) {

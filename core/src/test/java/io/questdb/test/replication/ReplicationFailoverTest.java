@@ -239,6 +239,44 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
     }
 
     @Test
+    public void testReplicaWithTornWalAfterPowerLoss() throws Exception {
+        // probe: what a replica does when the WAL files it replayed without flushing lost their tail
+        TestUtils.assertMemoryLeak(() -> {
+            final String a = nodeRoot("a");
+            final String b = nodeRoot("b");
+            writeConfiguration(a, "primary");
+            writeConfiguration(b, "replica");
+            try (TestServerMain nodeA = start(a)) {
+                awaitRole(nodeA, EngineRole.PRIMARY);
+                nodeA.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                try (TestServerMain nodeB = start(b)) {
+                    awaitSame(nodeA, nodeB, "t");
+                }
+                // the replica is down; the primary moves on
+                nodeA.execute("INSERT INTO t VALUES ('2024-01-02', 2), ('2024-01-03', 3)");
+                awaitUploaded(nodeA, "t");
+                // the replica's WAL segment files lose their content, as after a power loss without a flush
+                int torn = 0;
+                try (java.util.stream.Stream<java.nio.file.Path> files = java.nio.file.Files.walk(java.nio.file.Paths.get(b, "db"))) {
+                    for (java.nio.file.Path f : (Iterable<java.nio.file.Path>) files::iterator) {
+                        final String name = f.toString();
+                        if (java.nio.file.Files.isRegularFile(f) && name.contains(File.separator + "wal") && (name.endsWith(".d") || name.endsWith("_event"))) {
+                            java.nio.file.Files.write(f, new byte[0]);
+                            torn++;
+                        }
+                    }
+                }
+                Assert.assertTrue(torn > 0);
+                try (TestServerMain nodeB = start(b)) {
+                    awaitSame(nodeA, nodeB, "t");
+                    nodeB.assertSql("SELECT count() n FROM t", "n\n3\n");
+                }
+            }
+        });
+    }
+
+    @Test
     public void testCrashedPrimaryRestartsAndUploadsItsTail() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String a = nodeRoot("a");
@@ -549,6 +587,8 @@ public class ReplicationFailoverTest extends AbstractReplicationTest {
                 awaitRole(nodeB, EngineRole.PRIMARY);
                 Assert.assertFalse(java.nio.file.Files.exists(marker));
                 Assert.assertEquals(nodeB.getReplicationService().getInstanceId(), readIndex().getOwnerInstanceId());
+                // under adaptive the promoted node flushed the one table it replayed as a replica
+                Assert.assertEquals(1, nodeB.getReplicationService().getPromotionFlushedTableCount());
             }
         });
     }

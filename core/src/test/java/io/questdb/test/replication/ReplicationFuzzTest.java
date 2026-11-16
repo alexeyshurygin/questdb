@@ -235,7 +235,7 @@ public class ReplicationFuzzTest extends AbstractReplicationTest {
                     final String table = tables[i];
                     awaitApplied(primaryNode, table);
                     final TableToken primaryToken = primaryNode.getEngine().verifyTableName(table);
-                    final String expectedColumns = print(primaryNode, "SHOW COLUMNS FROM " + table);
+                    final String expectedColumns = print(primaryNode, columnsOf(table));
                     final String expectedRows = print(primaryNode, "SELECT * FROM " + table);
                     TestUtils.assertEventually(() -> {
                         // the same incarnation of the table, at the same transaction, applied
@@ -248,7 +248,8 @@ public class ReplicationFuzzTest extends AbstractReplicationTest {
                         );
                         replicaNode.assertSql("SELECT writerTxn = sequencerTxn ok FROM wal_tables() WHERE name = '" + table + "'", "ok\ntrue\n");
                     }, 120);
-                    Assert.assertEquals(table, expectedColumns, print(replicaNode, "SHOW COLUMNS FROM " + table));
+                    // the metadata cache follows the writer: give it a moment
+                    TestUtils.assertEventually(() -> Assert.assertEquals(table, expectedColumns, print(replicaNode, columnsOf(table))), 30);
                     TestUtils.assertEquals(expectedRows, print(replicaNode, "SELECT * FROM " + table));
                     Assert.assertFalse(table, replicaNode.getEngine().getTableSequencerAPI().isSuspended(replicaNode.getEngine().verifyTableName(table)));
                 }
@@ -272,6 +273,16 @@ public class ReplicationFuzzTest extends AbstractReplicationTest {
      * Fails a share of the object store's requests: before the store sees them, with an error that is
      * worth retrying or one that is not, or after the store served them, as a lost response.
      */
+    /**
+     * The table's columns without their symbol capacity. A node's table writer doubles that capacity
+     * by itself, as housekeeping at the end of a WAL apply batch, when the symbol count has passed
+     * it. Batches end at different transactions on each node, so two nodes with the same rows can
+     * hold different capacities: it is local tuning, not replicated state.
+     */
+    private static String columnsOf(String table) {
+        return "SELECT \"column\", type, indexed, indexBlockCapacity, symbolCached, symbolTableSize, designated, upsertKey FROM table_columns('" + table + "')";
+    }
+
     private static class RandomFaults implements FaultyObjectStore.Hook {
         private final double afterProbability;
         private final double beforeProbability;

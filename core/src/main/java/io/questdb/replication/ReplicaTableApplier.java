@@ -230,7 +230,8 @@ public class ReplicaTableApplier implements QuietCloseable {
                     if (!metadata.isWalEnabled()) {
                         throw ReplicationException.unsupported("non-WAL tables are not replicated [table=" + manifest.getTableName() + ']');
                     }
-                    final int commitMode = configuration.getCommitMode();
+                    // resolved by the engine: a replica does not flush, the object store is its durable copy
+                    final int commitMode = engine.getResolvedCommitMode();
                     TableUtils.createTableOrViewOrMatView(
                             ff,
                             root,
