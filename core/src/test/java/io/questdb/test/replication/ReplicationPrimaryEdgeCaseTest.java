@@ -49,7 +49,6 @@ import io.questdb.replication.store.ObjectStoreException;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.CharSequenceLongHashMap;
 import io.questdb.std.Misc;
-import io.questdb.std.Os;
 import io.questdb.std.QuietCloseable;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
@@ -486,15 +485,44 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testInterruptedStopFreesTheIndexClient() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("interrupted-free");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicReference<Thread> coordinator = new AtomicReference<>();
+            final CountDownLatch polled = new CountDownLatch(2);
+            store.setFaultHook((op, key) -> {
+                if (op.equals("get") && key.equals(IndexClient.INDEX_KEY) && isThread(COORDINATOR_THREAD)) {
+                    coordinator.set(Thread.currentThread());
+                    polled.countDown();
+                }
+            });
+            try (Node node = newNode(dir, config(dir, ReplicationRole.REPLICA), store)) {
+                writeIndex(store, "a-primary", node.engine.getDataID().getHi(), node.engine.getDataID().getLo());
+                node.service.start();
+                // the second poll began, so the first decoded the index into the index client's buffers
+                await(polled);
+                // a stop asked for on an interrupted thread
+                Assert.assertTrue(runInterrupted(node.service::close));
+                coordinator.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(coordinator.get().isAlive());
+                // the store is closed once, and the leak check below finds the index client freed
+                Assert.assertEquals(1, store.getCloseCount());
+            }
+        });
+    }
+
+    @Test
     public void testInterruptedStopsDoNotWaitForTheCoordinator() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String dir = newDir("interrupted");
-            // an empty store: the index client never decodes an index, so it holds no native memory
             final MemoryObjectStore store = new MemoryObjectStore();
             final AtomicReference<Thread> coordinator = new AtomicReference<>();
             final AtomicBoolean isCoordinatorInterrupted = new AtomicBoolean();
+            final AtomicLong closesAtResume = new AtomicLong(-1);
             final CountDownLatch blocked = new CountDownLatch(1);
             final CountDownLatch never = new CountDownLatch(1);
+            final CountDownLatch stopped = new CountDownLatch(1);
             store.setFaultHook((op, key) -> {
                 // the first poll of the index never returns by itself
                 if (op.equals("get") && key.equals(IndexClient.INDEX_KEY) && isThread(COORDINATOR_THREAD)
@@ -502,11 +530,16 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
                     blocked.countDown();
                     if (!holdRequest(never)) {
                         isCoordinatorInterrupted.set(true);
-                        throw ObjectStoreException.retryable("injected: interrupted while polling the index", null);
+                        // interrupted, it goes on once the stop has returned: the poll reads the index from
+                        // the store and decodes it into the index client
+                        holdRequest(stopped);
+                        closesAtResume.set(store.getCloseCount());
                     }
                 }
             });
             try (Node node = newNode(dir, config(dir, ReplicationRole.REPLICA), store)) {
+                // the index client holds native memory once it decoded this index
+                writeIndex(store, "a-primary", node.engine.getDataID().getHi(), node.engine.getDataID().getLo());
                 node.service.start();
                 await(blocked);
 
@@ -516,12 +549,18 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
                 Assert.assertTrue(coordinator.get().isAlive());
                 Assert.assertFalse(isCoordinatorInterrupted.get());
 
-                // neither does a stop: it interrupts the coordinator, skips the index client that thread might
-                // still use, and the caller keeps its interrupt
+                // neither does a stop: it interrupts the coordinator, and the caller keeps its interrupt
                 Assert.assertTrue(runInterrupted(node.service::close));
+                Assert.assertTrue(coordinator.get().isAlive());
+                stopped.countDown();
                 coordinator.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
                 Assert.assertFalse(coordinator.get().isAlive());
                 Assert.assertTrue(isCoordinatorInterrupted.get());
+                // The stop left the store and the index client to the coordinator, which still used them,
+                // and the coordinator freed them as it ended: the store is closed once, after its last
+                // request, and the leak check below finds nothing left.
+                Assert.assertEquals(0, closesAtResume.get());
+                Assert.assertEquals(1, store.getCloseCount());
             }
         });
     }
@@ -747,29 +786,25 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
             Assert.assertEquals(2, released.getTables().size());
 
             allowPromotion(b);
-            final AtomicReference<Thread> closer = new AtomicReference<>();
             final AtomicReference<String> manifest = new AtomicReference<>();
             final CountDownLatch replaying = new CountDownLatch(1);
+            final CountDownLatch stopping = new CountDownLatch(1);
             final FaultyObjectStore store = new FaultyObjectStore(memory, new FaultyObjectStore.Hook() {
                 @Override
                 public void before(String op, String key) {
                     // the catch-up downloads the create manifest of the first table, and the node is stopped
-                    // meanwhile: this download ends once the stop waits for the coordinator
+                    // meanwhile: this download ends once the stop has told the coordinator to stop
                     if (op.equals("get") && key.endsWith("/create") && isThread(COORDINATOR_THREAD) && manifest.compareAndSet(null, key)) {
                         replaying.countDown();
-                        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(WAIT_SECONDS);
-                        while (closer.get() == null || closer.get().getState() != Thread.State.TIMED_WAITING) {
-                            if (System.nanoTime() > deadline) {
-                                throw new AssertionError("the stop did not begin");
-                            }
-                            Os.sleep(1);
+                        if (!holdRequest(stopping)) {
+                            throw new AssertionError("interrupted before the stop began");
                         }
                     }
                 }
             });
             try (Node nodeB = newNode(b, config(b, ReplicationRole.PRIMARY), store)) {
                 final Thread closerThread = new Thread(nodeB.service::close, "test-closer");
-                closer.set(closerThread);
+                nodeB.service.setCloseHookForTesting(stopping::countDown);
                 nodeB.service.start();
                 await(replaying);
                 closerThread.start();
@@ -801,8 +836,10 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
             final AtomicReference<String> coordinatorUpload = new AtomicReference<>();
             final AtomicReference<Thread> coordinator = new AtomicReference<>();
             final AtomicBoolean isCoordinatorInterrupted = new AtomicBoolean();
+            final AtomicLong closesAtResume = new AtomicLong(-1);
             final CountDownLatch poolInterrupted = new CountDownLatch(1);
             final CountDownLatch never = new CountDownLatch(1);
+            final CountDownLatch stopped = new CountDownLatch(1);
             final FaultyObjectStore store = new FaultyObjectStore(memory, new FaultyObjectStore.Hook() {
                 @Override
                 public void before(String op, String key) {
@@ -814,15 +851,6 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
                         if (!holdRequest(never)) {
                             poolInterrupted.countDown();
                         }
-                        // and goes on once the coordinator is gone, so the stop frees nothing it still uses
-                        final Thread c = coordinator.get();
-                        if (c != null) {
-                            try {
-                                c.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                            }
-                        }
                     } else if (isThread(COORDINATOR_THREAD) && coordinatorUpload.compareAndSet(null, key)) {
                         // the pool is busy, so the coordinator uploads the next table itself, and takes longer
                         // than the stop waits for it
@@ -830,10 +858,9 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
                         if (!holdRequest(never)) {
                             isCoordinatorInterrupted.set(true);
                         }
-                        // its upload ends once the stop has shut the pool down
-                        while (!holdRequest(poolInterrupted)) {
-                            Thread.onSpinWait();
-                        }
+                        // its upload ends once the stop has returned
+                        holdRequest(stopped);
+                        closesAtResume.set(memory.getCloseCount());
                     }
                 }
             });
@@ -853,12 +880,24 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
                 closer.start();
                 closer.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
                 Assert.assertFalse(closer.isAlive());
+                // the stop shut the pool down
+                Assert.assertEquals(0, poolInterrupted.getCount());
+                // it gave up waiting for the coordinator, interrupted it and returned while it still runs
+                Assert.assertTrue(isCoordinatorInterrupted.get());
+                Assert.assertTrue(coordinator.get().isAlive());
+                stopped.countDown();
+                coordinator.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(coordinator.get().isAlive());
 
                 Assert.assertNotNull(poolUpload.get());
                 Assert.assertNotNull(coordinatorUpload.get());
                 Assert.assertNotEquals(poolUpload.get(), coordinatorUpload.get());
-                // the stop gave up waiting for the coordinator and interrupted it
-                Assert.assertTrue(isCoordinatorInterrupted.get());
+                // The stop left the store and the coordinator's buffers to the coordinator, which went on
+                // uploading with them, and freed them as it ended: the store is closed once, after the
+                // coordinator's last request, and the leak check below finds nothing left.
+                Assert.assertEquals(0, closesAtResume.get());
+                Assert.assertEquals(1, memory.getCloseCount());
+                Assert.assertEquals(0, node.service.getWorkerContextCount());
                 // the third table came after the pool was shut down: refused, it never went up
                 final List<String> manifests = memory.keys(k -> k.startsWith("t/") && k.endsWith("/create"));
                 Assert.assertEquals(2, manifests.size());

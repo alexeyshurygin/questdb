@@ -44,6 +44,7 @@ import java.util.function.Predicate;
  * scriptable fault hook.
  */
 public class MemoryObjectStore implements ObjectStore {
+    private final AtomicLong closeCount = new AtomicLong();
     private final AtomicLong deleteCount = new AtomicLong();
     private final AtomicLong etagSequence = new AtomicLong();
     private final AtomicLong getCount = new AtomicLong();
@@ -59,6 +60,8 @@ public class MemoryObjectStore implements ObjectStore {
 
     @Override
     public void close() {
+        // the store stays usable: the nodes of a test share it, each closing it as it stops
+        closeCount.incrementAndGet();
     }
 
     @Override
@@ -92,6 +95,13 @@ public class MemoryObjectStore implements ObjectStore {
     public synchronized byte[] getBytes(String key) {
         final Entry e = objects.get(key);
         return e == null ? null : e.data.clone();
+    }
+
+    /**
+     * How many times a user closed the store.
+     */
+    public long getCloseCount() {
+        return closeCount.get();
     }
 
     public long getDeleteCount() {

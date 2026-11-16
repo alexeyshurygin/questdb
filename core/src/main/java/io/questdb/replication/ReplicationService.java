@@ -116,6 +116,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // every request but the index's goes through it: see leaseKeeperMain()
     private final ActivityObjectStore store;
     private final ConcurrentHashMap<String, TableUploader> uploaders = new ConcurrentHashMap<>();
+    // close(), the coordinator, the lease keeper and each pool thread hold a use of what they share: the
+    // store, the index client, the worker contexts, the WAL policy, the pins and the path. The last to
+    // give its use back frees them, so a thread that close() gave up on never runs on freed memory.
+    private final Object useLock = new Object();
     private final Condition wakeUp = lock.newCondition();
     // closes of segments and WALs (segment WHOLE_WAL) of tables without an uploader yet: {walId, segmentId, lastTxn}
     private final Map<String, List<long[]>> earlyCloses = new HashMap<>();
@@ -134,6 +138,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private boolean isMarkerRemoved;
     // when close() began waiting for the coordinator; 0 until then
     private volatile long closeStartedNanos;
+    private volatile Runnable closeHook;
     private volatile boolean isCrashed;
     // set when the lease is released, the coordinator ends, or close() gives up waiting for it
     private volatile boolean isLeaseKeeperStopped;
@@ -163,6 +168,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     // how long the lease keeper renews for a coordinator that shows no sign of life
     private volatile long stallLimitMillis;
     private volatile String status = "starting";
+    // guarded by useLock; close() holds one use from the start
+    private int useCount = 1;
     private volatile Runnable takeoverHook;
     // the index version acquireLease() saw unchanged for the whole wait; null when it did not have to wait
     private String watchedEtag;
@@ -203,11 +210,17 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 new SynchronousQueue<>(),
                 r -> {
                     final Thread t = new Thread(() -> {
+                        // only the coordinator submits, and it holds a use: a thread that finds none left
+                        // has nobody to work for
+                        if (!acquireUse()) {
+                            return;
+                        }
                         try {
                             r.run();
                         } finally {
                             releaseWorkerOfThisThread();
                             Path.clearThreadLocals();
+                            releaseUse();
                         }
                     }, "qdb-replication-worker");
                     t.setDaemon(true);
@@ -231,27 +244,28 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         closeStartedNanos = System.nanoTime();
         isRunning = false;
         wake();
+        final Runnable hook = closeHook;
+        if (hook != null) {
+            hook.run();
+        }
+        boolean isCoordinatorRunning = false;
         final Thread t = mainThread;
         if (t != null) {
-            try {
-                t.join(shutdownTimeoutMillis());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            joinQuietly(t, shutdownTimeoutMillis());
             if (t.isAlive()) {
-                LOG.critical().$("replication coordinator did not stop in time").$();
+                LOG.critical().$("replication coordinator did not stop in time, interrupting it").$();
+                // the uploads of the round it is in stop too: nothing they upload reaches the index
                 t.interrupt();
+                executor.shutdownNow();
+                joinQuietly(t, shutdownTimeoutMillis());
+                isCoordinatorRunning = t.isAlive();
             }
         }
         isLeaseKeeperStopped = true;
         final Thread keeper = leaseKeeperThread;
         if (keeper != null) {
             keeper.interrupt();
-            try {
-                keeper.join(shutdownTimeoutMillis());
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            joinQuietly(keeper, shutdownTimeoutMillis());
         }
         executor.shutdownNow();
         try {
@@ -259,31 +273,13 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        ReplicationWorker w;
-        while ((w = allWorkers.poll()) != null) {
-            Misc.free(w);
-        }
-        // a thread that did not stop in time may still be inside an index write: its buffers stay allocated
-        boolean isIndexLocked = false;
-        try {
-            isIndexLocked = indexLock.tryLock(shutdownTimeoutMillis(), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        if (isIndexLocked) {
-            try {
-                isIndexClientClosed = true;
-                indexClient.close();
-            } finally {
-                indexLock.unlock();
-            }
+        if (isCoordinatorRunning) {
+            LOG.critical().$("replication coordinator is still running; it frees what replication holds as it ends").$();
         } else {
-            LOG.critical().$("replication index write did not end in time; its buffers stay allocated").$();
+            // the threads that ended give their uses back on their way out
+            awaitLastUse(shutdownTimeoutMillis());
         }
-        Misc.free(policy);
-        Misc.free(pins);
-        Misc.free(store);
-        path.close();
+        releaseUse();
     }
 
     /**
@@ -303,6 +299,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    /**
+     * Test seam: runs on the thread that called {@link #close()}, once close() has told the
+     * coordinator to stop and before it waits for it.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setCloseHookForTesting(Runnable hook) {
+        this.closeHook = hook;
     }
 
     /**
@@ -469,16 +474,26 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      * Starts the coordinator thread. A primary stays read-only until it caught up and holds the lease.
      */
     public synchronized void start() {
-        if (isStarted) {
+        if (isStarted || isClosed) {
             return;
         }
         isStarted = true;
         isRunning = true;
         instanceId = loadInstanceId();
         isMigrationAllowed = isPrimary && Files.exists(Paths.get(engine.getConfiguration().getInstallRoot().toString(), MIGRATE_PRIMARY_FILE));
-        mainThread = new Thread(this::run, "qdb-replication");
-        mainThread.setDaemon(true);
-        mainThread.start();
+        if (!acquireUse()) {
+            return;
+        }
+        final Thread t = new Thread(this::run, "qdb-replication");
+        t.setDaemon(true);
+        mainThread = t;
+        try {
+            t.start();
+        } catch (Throwable th) {
+            mainThread = null;
+            releaseUse();
+            throw th;
+        }
     }
 
     /**
@@ -490,11 +505,49 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         return replicaRound(true);
     }
 
+    private static void joinQuietly(Thread t, long millis) {
+        try {
+            t.join(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private static void sleepQuietly(long millis) {
         try {
             Thread.sleep(millis);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    // false once the last use was given back and what the uses share is freed
+    private boolean acquireUse() {
+        synchronized (useLock) {
+            if (useCount == 0) {
+                return false;
+            }
+            useCount++;
+            return true;
+        }
+    }
+
+    // waits until close() holds the only use left
+    private void awaitLastUse(long timeoutMillis) {
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        synchronized (useLock) {
+            try {
+                while (useCount > 1) {
+                    final long remaining = deadline - System.nanoTime();
+                    if (remaining <= 0) {
+                        LOG.critical().$("a replication thread did not end in time; it frees what replication holds as it ends").$();
+                        return;
+                    }
+                    TimeUnit.NANOSECONDS.timedWait(useLock, remaining);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
@@ -893,14 +946,24 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             }
         } finally {
             Path.clearThreadLocals();
+            releaseUse();
         }
     }
 
     private void startLeaseKeeper() {
+        // the coordinator holds a use, so there is one to take
+        if (!acquireUse()) {
+            return;
+        }
         final Thread t = new Thread(this::leaseKeeperMain, "qdb-replication-lease");
         t.setDaemon(true);
         leaseKeeperThread = t;
-        t.start();
+        try {
+            t.start();
+        } catch (Throwable th) {
+            releaseUse();
+            throw th;
+        }
     }
 
     private void fence(String reason) {
@@ -954,12 +1017,42 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
     }
 
+    // frees what the uses share; the last user calls it, so no thread still runs with any of it
+    private void freeShared() {
+        ReplicationWorker w;
+        while ((w = allWorkers.poll()) != null) {
+            Misc.free(w);
+        }
+        indexLock.lock();
+        try {
+            isIndexClientClosed = true;
+            indexClient.close();
+        } finally {
+            indexLock.unlock();
+        }
+        Misc.free(policy);
+        Misc.free(pins);
+        Misc.free(store);
+        path.close();
+    }
+
+    private void releaseUse() {
+        final boolean isLast;
+        synchronized (useLock) {
+            isLast = --useCount == 0;
+            useLock.notifyAll();
+        }
+        if (isLast) {
+            freeShared();
+        }
+    }
+
     // gives up the calling thread's context, if it has one
     private void releaseWorkerOfThisThread() {
         final ReplicationWorker w = workerSlot.get();
         if (w != null) {
             workerSlot.remove();
-            // close() frees whatever is still registered: only one of the two gets each context
+            // the last user frees whatever is still registered: only one of the two gets each context
             if (allWorkers.remove(w)) {
                 Misc.free(w);
             }
@@ -1364,9 +1457,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         for (TableUploader u : uploaders.values()) {
             dirtyTables.put(u.getToken().getDirName(), Boolean.TRUE);
         }
-        // close() frees what the drain uses once it has waited shutdownTimeoutMillis() for the
-        // coordinator: no round starts in the second half of that wait, which is left to the round in
-        // progress and to the release
+        // close() interrupts the coordinator once it has waited shutdownTimeoutMillis() for it: no
+        // round starts in the second half of that wait, which is left to the round in progress and to
+        // the release
         final long closeStarted = closeStartedNanos;
         final long deadline = (closeStarted != 0 ? closeStarted : System.nanoTime()) + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() / 2);
         while (System.nanoTime() < deadline) {
@@ -1800,6 +1893,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             isLeaseKeeperStopped = true;
             releaseWorkerOfThisThread();
             Path.clearThreadLocals();
+            releaseUse();
         }
     }
 

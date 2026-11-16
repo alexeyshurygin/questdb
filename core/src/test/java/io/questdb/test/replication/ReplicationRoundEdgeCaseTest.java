@@ -1339,9 +1339,10 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
         return c;
     }
 
-    // runs close() on a thread of its own and returns once close() has told the coordinator to stop: the
-    // first thing close() waits for, with a timed join, is the coordinator thread
+    // runs close() on a thread of its own and returns once close() has told the coordinator to stop
     private static Thread closeInBackground(ReplicationService service) {
+        final CountDownLatch stopping = new CountDownLatch(1);
+        service.setCloseHookForTesting(stopping::countDown);
         final Thread closer = new Thread(() -> {
             try {
                 service.close();
@@ -1350,8 +1351,13 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
             }
         }, "test-closer");
         closer.start();
-        while (closer.isAlive() && closer.getState() != Thread.State.TIMED_WAITING) {
-            Os.pause();
+        try {
+            if (!stopping.await(30, TimeUnit.SECONDS)) {
+                throw new AssertionError("close() did not begin");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted while waiting for close() to begin", e);
         }
         return closer;
     }
