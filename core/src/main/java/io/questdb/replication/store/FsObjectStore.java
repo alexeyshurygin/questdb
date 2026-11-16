@@ -97,8 +97,7 @@ public class FsObjectStore implements ObjectStore {
     // Temporary file names are put-<pid>-<nonce>-<counter>.tmp. The pid and the counter are unique
     // only within one process: another node sharing atomic_write_dir, or a restarted process that
     // got the same pid, starts its counter over. The random nonce tells such processes apart.
-    private static final String TEMP_FILE_PREFIX = "put-" + ProcessHandle.current().pid() + '-'
-            + String.format("%016x", new SecureRandom().nextLong()) + '-';
+    private static final String TEMP_FILE_PREFIX = newTempFilePrefix(ProcessHandle.current().pid());
     private final Path atomicWriteDir;
     private final ReentrantLock conditionalWriteLock;
     private final String description;
@@ -135,6 +134,14 @@ public class FsObjectStore implements ObjectStore {
         final MessageDigest digest = ObjectStoreUtils.newSha256();
         digest.update(data, offset, length);
         return ObjectStoreUtils.hex(digest.digest(), ETAG_BYTES);
+    }
+
+    /**
+     * Prefix of the temporary file names one process uses, put-&lt;pid&gt;-&lt;nonce&gt;-. Each call draws
+     * a new random nonce, so two processes with the same pid get different prefixes.
+     */
+    public static @NotNull String newTempFilePrefix(long pid) {
+        return "put-" + pid + '-' + String.format("%016x", new SecureRandom().nextLong()) + '-';
     }
 
     @Override

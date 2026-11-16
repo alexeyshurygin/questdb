@@ -988,6 +988,19 @@ public class FsObjectStoreTest {
     }
 
     @Test
+    public void testTempFilePrefixNonceIsRandom() {
+        // testTempFileNameUniqueAcrossProcesses checks the name's format; a constant nonce would pass
+        // it. Two processes with the same pid must draw different prefixes.
+        final long pid = ProcessHandle.current().pid();
+        final String first = FsObjectStore.newTempFilePrefix(pid);
+        final String second = FsObjectStore.newTempFilePrefix(pid);
+        Assert.assertTrue(first, first.matches("put-" + pid + "-[0-9a-f]{16}-"));
+        Assert.assertTrue(second, second.matches("put-" + pid + "-[0-9a-f]{16}-"));
+        // two random 64-bit nonces are equal with probability 2^-64
+        Assert.assertNotEquals(first, second);
+    }
+
+    @Test
     public void testWrongScheme() {
         assertFails(
                 ObjectStoreException.Kind.FATAL,
