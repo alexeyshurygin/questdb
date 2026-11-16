@@ -123,6 +123,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private final Condition wakeUp = lock.newCondition();
     // closes of segments and WALs (segment WHOLE_WAL) of tables without an uploader yet: {walId, segmentId, lastTxn}
     private final Map<String, List<long[]>> earlyCloses = new HashMap<>();
+    // the delete lists of other instances, which the list of this one covers once stored; coordinator thread only
+    private final List<String> foreignDeleteLists = new ArrayList<>();
     // objects the WAL cleaner could not delete, or did not get to; coordinator thread only
     private final List<String> pendingDeletes = new ArrayList<>();
     private final ThreadLocal<ReplicationWorker> workerSlot = new ThreadLocal<>();
@@ -131,6 +133,10 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private volatile String instanceId;
     // the WAL cleaner changed index entries it could not commit yet; coordinator thread only
     private boolean isCleanerCommitPending;
+    // the WAL cleaner read the delete lists in the store; coordinator thread only
+    private boolean isDeleteListsLoaded;
+    // the store holds this instance's delete list; coordinator thread only
+    private boolean isDeleteListStored;
     private volatile boolean isClosed;
     // an operator allowed this node to take over a store it does not own or is behind; read at start
     private volatile boolean isMigrationAllowed;
@@ -1768,6 +1774,12 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             isCleanerCommitPending = false;
         }
         final ReplicationWorker w = worker();
+        if (!isDeleteListsLoaded) {
+            // what the cleaner of an earlier primary, this node's included, took out of the index and
+            // had not deleted when it stopped
+            loadDeleteLists(w);
+            isDeleteListsLoaded = true;
+        }
         final Map<String, Long> cutoffs = config.isCleanerCheckpointSource() ? cleaner.computeCutoffs(w) : null;
         // what earlier runs could not delete goes first: no index names those objects any more, so no
         // later plan would find them
@@ -1827,7 +1839,86 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             isCleanerCommitPending |= isIndexChanged;
             throw th;
         }
+        if (!keys.isEmpty()) {
+            try {
+                // no index names these objects now; the list names them until they are gone, so a stop
+                // that cuts the deletes short leaves them to the next primary instead of the store for good
+                storeDeleteList(w, keys);
+            } catch (Throwable th) {
+                pendingDeletes.addAll(keys);
+                throw th;
+            }
+        }
         deleteObjects(keys);
+        if (isRunning) {
+            dropDeleteLists(pendingDeletes.isEmpty());
+        }
+    }
+
+    /**
+     * Deletes the delete lists of other instances, which the list of this one covers, and this
+     * instance's own once it has nothing left to delete.
+     */
+    private void dropDeleteLists(boolean isOwnDone) {
+        for (int i = foreignDeleteLists.size() - 1; i >= 0; i--) {
+            store.delete(foreignDeleteLists.get(i));
+            foreignDeleteLists.remove(i);
+        }
+        if (isOwnDone && isDeleteListStored) {
+            store.delete(StoreKeys.deleteList(instanceId));
+            isDeleteListStored = false;
+        }
+    }
+
+    /**
+     * Adds the objects that the delete lists in the store name to the pending deletes. A list names
+     * only objects that an accepted index stopped naming, and object keys are never reused, so every
+     * one of them can go.
+     */
+    private void loadDeleteLists(ReplicationWorker w) {
+        final List<String> lists = new ArrayList<>();
+        store.list(StoreKeys.DELETES_PREFIX, null, (key, size) -> {
+            lists.add(key);
+            return true;
+        });
+        final String own = StoreKeys.deleteList(instanceId);
+        final io.questdb.replication.codec.NativeBuffer buf = w.getBuffer();
+        for (int i = 0, n = lists.size(); i < n; i++) {
+            final String key = lists.get(i);
+            try {
+                if (!w.getIo().get(key, buf)) {
+                    continue;
+                }
+            } catch (ReplicationException e) {
+                LOG.error().$("ignoring an unreadable delete list [key=").$safe(key).$(", error=").$safe(e.getMessage()).I$();
+                continue;
+            }
+            final byte[] text = new byte[(int) buf.size()];
+            io.questdb.std.Unsafe.copyMemory(null, buf.ptr(), text, io.questdb.std.Unsafe.BYTE_OFFSET, text.length);
+            int count = 0;
+            for (String object : new String(text, StandardCharsets.UTF_8).split("\n")) {
+                // the cleaner deletes table objects only, whatever a list says
+                if (object.startsWith(StoreKeys.TABLES_PREFIX)) {
+                    pendingDeletes.add(object);
+                    count++;
+                }
+            }
+            if (key.equals(own)) {
+                isDeleteListStored = true;
+            } else {
+                foreignDeleteLists.add(key);
+            }
+            LOG.info().$("WAL cleaner resumes the deletes of an earlier run [list=").$safe(key).$(", objects=").$(count).I$();
+        }
+    }
+
+    private void storeDeleteList(ReplicationWorker w, List<String> keys) {
+        final byte[] text = String.join("\n", keys).getBytes(StandardCharsets.UTF_8);
+        final io.questdb.replication.codec.NativeBuffer buf = w.getBuffer();
+        buf.clear();
+        buf.putBytes(text, 0, text.length);
+        w.getIo().put(StoreKeys.deleteList(instanceId), buf, false);
+        isDeleteListStored = true;
     }
 
     private void deleteObjects(List<String> keys) {

@@ -32,6 +32,8 @@ import org.jetbrains.annotations.NotNull;
  * <pre>
  * _index                                              replication index: lease + table catalog
  * _checkpoints/&lt;instance id&gt;                          checkpoint history of one instance
+ * _deletes/&lt;instance id&gt;                              objects the instance's WAL cleaner took out of the
+ *                                                     index and may not have deleted yet
  * t/&lt;table key&gt;/create                                table create manifest
  * t/&lt;table key&gt;/seq/&lt;part&gt;.&lt;epoch&gt;                     transaction log part
  * t/&lt;table key&gt;/wal/&lt;walId&gt;/&lt;segment&gt;/&lt;lo&gt;-&lt;hi&gt;.&lt;epoch&gt;  WAL segment delta
@@ -42,6 +44,7 @@ import org.jetbrains.annotations.NotNull;
  */
 public final class StoreKeys {
     public static final String CHECKPOINTS_PREFIX = "_checkpoints/";
+    public static final String DELETES_PREFIX = "_deletes/";
     public static final String TABLES_PREFIX = "t/";
 
     private StoreKeys() {
@@ -53,6 +56,10 @@ public final class StoreKeys {
 
     public static @NotNull String create(@NotNull String tableKey) {
         return TABLES_PREFIX + tableKey + "/create";
+    }
+
+    public static @NotNull String deleteList(@NotNull String instanceId) {
+        return DELETES_PREFIX + instanceId;
     }
 
     public static @NotNull String segmentDelta(@NotNull String tableKey, int walId, int segmentId, int lo, int hi, long epoch) {

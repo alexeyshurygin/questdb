@@ -112,6 +112,8 @@ INSERT on a read-only node.
 ```
 _index                                        commit point: DataID, ownership lease, table catalog
 _checkpoints/<instance id>                    checkpoint history of one instance
+_deletes/<instance id>                        objects the instance's WAL cleaner took out of the index
+                                              and may not have deleted yet
 t/<table id>_<create ts>/create               table create manifest (sequencer _meta.0)
 t/<table id>_<create ts>/seq/<part>.<epoch>    shipped transaction log records
 t/<table id>_<create ts>/wal/<walId>/<segment>/<lo>-<hi>.<epoch>
@@ -261,10 +263,11 @@ deletes anything. It deletes dropped tables after
 that many checkpoints, nothing is cleaned: a store whose nodes never run
 `CHECKPOINT RELEASE` grows without limit. An instance that is gone keeps
 holding history back until its `_checkpoints/<instance id>` object is deleted
-by hand. The cleaner retries a deletion that
-fails on its next run. It keeps that list in memory: a primary that restarts
-before the retry leaves those objects in the store, where no index names them
-any more.
+by hand. Once the index no longer names the objects a run is about to delete,
+the cleaner lists them in `_deletes/<instance id>` and deletes that list when
+they are all gone. A deletion that fails, or that a stop cuts short, stays on
+the list: the next run retries it, and so does the first run of the next
+primary, whichever node that is.
 
 ## Differences from QuestDB Enterprise
 

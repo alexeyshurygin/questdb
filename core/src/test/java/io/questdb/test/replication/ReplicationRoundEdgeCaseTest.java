@@ -618,6 +618,64 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testNextPrimaryDeletesWhatAStoppedCleanerLeft() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicReference<String> watchedPrefix = new AtomicReference<>();
+            final AtomicReference<ReplicationService> service = new AtomicReference<>();
+            final AtomicReference<Thread> closer = new AtomicReference<>();
+            store.setFaultHook((op, key) -> {
+                final String prefix = watchedPrefix.get();
+                if (op.equals("delete") && prefix != null && key.startsWith(prefix)) {
+                    synchronized (closer) {
+                        if (closer.get() == null) {
+                            // the node is told to stop while the cleaner's first deletes are in flight
+                            closer.set(closeInBackground(service.get()));
+                        }
+                    }
+                }
+            });
+            final ReplicationConfigurationImpl config = primaryConfig()
+                    .setSequencerPartTxnCount(2)
+                    .setCleanerEnabled(true)
+                    .setCleanerInterval(20)
+                    .setCleanerDroppedTableCooloff(0)
+                    .setCleanerDeleteConcurrency(4);
+            final String prefix;
+            try (Node a = newNode("a", config, store)) {
+                service.set(a.service);
+                a.service.start();
+                awaitRole(a, EngineRole.PRIMARY);
+                a.engine.execute("CREATE TABLE gone (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                for (int i = 1; i <= 6; i++) {
+                    a.engine.execute("INSERT INTO gone VALUES ('2024-01-0" + i + "', " + i + ')');
+                    awaitUploaded(a, store, "gone", i);
+                }
+                prefix = StoreKeys.tablePrefix(entry(readIndex(store), "gone").getKey());
+                Assert.assertTrue(countKeys(store, prefix) > 8);
+                watchedPrefix.set(prefix);
+                a.engine.execute("DROP TABLE gone");
+                TestUtils.assertEventually(() -> Assert.assertNotNull(closer.get()), 30);
+                closer.get().join(60_000);
+                Assert.assertFalse(closer.get().isAlive());
+            }
+            // the stop cut the cleaner short: no index names the objects it had not deleted yet
+            watchedPrefix.set(null);
+            Assert.assertTrue(countKeys(store, prefix) > 0);
+            Assert.assertNull(entry(readIndex(store), "gone"));
+
+            // the next primary, another node, deletes them
+            try (Node b = newNode("b", config, store)) {
+                allowPromotion(b);
+                b.service.start();
+                awaitRole(b, EngineRole.PRIMARY);
+                TestUtils.assertEventually(() -> Assert.assertEquals(0, countKeys(store, prefix)), 30);
+                Assert.assertEquals(EngineRole.PRIMARY, b.engine.getRole());
+            }
+        });
+    }
+
+    @Test
     public void testNodeThatLostATableIsBehindItsOwnStore() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
