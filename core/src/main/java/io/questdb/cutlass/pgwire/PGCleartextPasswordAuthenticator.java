@@ -76,6 +76,8 @@ public class PGCleartextPasswordAuthenticator implements SocketAuthenticator {
     protected CharSequence username;
     private byte authType = AUTH_TYPE_NONE;
     private UsernamePasswordMatcher matcher;
+    // the login response is built; see loginOK()
+    private boolean isLoginOkPrepared;
     private long recvBufEnd;
     private long recvBufReadPos;
     private long recvBufStart;
@@ -228,6 +230,7 @@ public class PGCleartextPasswordAuthenticator implements SocketAuthenticator {
     public void init(@NotNull Socket socket, long recvBuffer, long recvBufferLimit, long sendBuffer, long sendBufferLimit) {
         this.circuitBreaker.setSecret(registry.getNewSecret());
         this.state = State.EXPECT_INIT_MESSAGE;
+        this.isLoginOkPrepared = false;
         this.username = null;
         this.socket = socket;
         this.recvBufStart = recvBuffer;
@@ -247,9 +250,14 @@ public class PGCleartextPasswordAuthenticator implements SocketAuthenticator {
 
     @Override
     public int loginOK() throws AuthenticatorException {
-        compactRecvBuf();
-        prepareLoginOk();
-        state = State.WRITE_AND_AUTH_SUCCESS;
+        // The caller calls this again when the socket did not take the whole login response the first time and
+        // the write finished later: the response is built once, the second call only reports the outcome.
+        if (!isLoginOkPrepared) {
+            isLoginOkPrepared = true;
+            compactRecvBuf();
+            prepareLoginOk();
+            state = State.WRITE_AND_AUTH_SUCCESS;
+        }
         return handleIO();
     }
 

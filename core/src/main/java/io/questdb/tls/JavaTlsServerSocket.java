@@ -63,6 +63,9 @@ public final class JavaTlsServerSocket implements Socket {
     private static final int HS_NEED_OUTPUT = 2;
     private static final int INITIAL_BUFFER_CAPACITY_BYTES = 256 * 1024;
     private static final long LIMIT_FIELD_OFFSET;
+    // How many records in a row may carry no plaintext (key updates, warning alerts, empty records) before the
+    // peer is taken for one that only keeps a worker busy. Well-behaved peers send such records one at a time.
+    private static final int MAX_EMPTY_RECORDS_IN_A_ROW = 32;
     private static final int MAX_LOGGED_ERROR_CHARS = 256;
     // The largest input buffer the socket grows to: far above the largest TLS record (16 KiB plus overhead), so
     // only a buffer configured below one record ever grows.
@@ -99,6 +102,7 @@ public final class JavaTlsServerSocket implements Socket {
     private final ByteBuffer unwrapOutputBuffer;
     private final ByteBuffer wrapInputBuffer;
     private final ByteBuffer wrapOutputBuffer;
+    private int emptyRecordsInARow;
     private boolean isHandshakeFailed;
     private boolean isHandshakeInputShort;
     private boolean morePlaintextBuffered;
@@ -108,6 +112,12 @@ public final class JavaTlsServerSocket implements Socket {
     private long plaintextStagingPtr;
     private SSLEngine sslEngine;
     private int state = STATE_EMPTY;
+    // A copy of the plaintext that send() has encrypted and not reported as sent yet, because the socket did not
+    // take all of its ciphertext: at most one TLS record of it, [unackedPlainLo, unackedPlainHi). See send().
+    private int unackedPlainCapacity;
+    private int unackedPlainHi;
+    private int unackedPlainLo;
+    private long unackedPlainPtr;
     private long unwrapInputBufferPtr;
     private long wrapOutputBufferPtr;
 
@@ -133,9 +143,9 @@ public final class JavaTlsServerSocket implements Socket {
             case STATE_TLS: {
                 assert sslEngine != null;
                 state = STATE_CLOSING;
-                sslEngine.closeOutbound();
                 try {
-                    sslEngine.wrap(EMPTY_BUFFER, wrapOutputBuffer);
+                    sslEngine.closeOutbound();
+                    wrapClosingRecords();
                     while (wantsTlsWrite()) {
                         final var n = tlsIO(Socket.WRITE_FLAG);
                         if (n < 0 || wantsTlsWrite()) {
@@ -143,8 +153,9 @@ public final class JavaTlsServerSocket implements Socket {
                             break;
                         }
                     }
-                } catch (SSLException e) {
-                    log.debug().$("could not send TLS close_notify").$(e).$();
+                } catch (SSLException | RuntimeException e) {
+                    // close() must end with the socket closed and the buffers freed, whatever the engine does
+                    log.debug().$("could not send TLS close_notify [error=").$(sanitize(e)).I$();
                 }
                 sslEngine = null;
             } // fall through
@@ -240,6 +251,17 @@ public final class JavaTlsServerSocket implements Socket {
                     plaintextStagedHi = result.bytesProduced();
                     received += drainStagedPlaintext(bufferPtr + received, room);
                 }
+                if (result.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_WRAP && !wrapOwedRecords()) {
+                    return -1;
+                }
+                if (result.bytesProduced() > 0) {
+                    emptyRecordsInARow = 0;
+                } else if (result.bytesConsumed() > 0 && ++emptyRecordsInARow > MAX_EMPTY_RECORDS_IN_A_ROW) {
+                    // each such record costs a pass of this loop and returns nothing to the caller
+                    log.info().$("TLS peer sends records without data in a row, closing [fd=").$(delegate.getFd())
+                            .$(", records=").$(emptyRecordsInARow).I$();
+                    return -1;
+                }
                 if (isEngineStuck(result)) {
                     return -1;
                 }
@@ -289,25 +311,53 @@ public final class JavaTlsServerSocket implements Socket {
                 return progress;
             }
         }
+        if (sslEngine.isOutboundDone()) {
+            // shutdown(SHUT_WR) has ended the stream: nothing is sent after close_notify, and what a short
+            // write left unreported is not reported either. Bytes still queued get one more try, so a failed
+            // transport answers with its own error code.
+            final var pending = wrapOutputBuffer.position();
+            if (pending > 0) {
+                final var sent = writeToSocket(pending);
+                if (sent < 0) {
+                    return sent;
+                }
+            }
+            return -1;
+        }
         try {
+            // ciphertext an earlier call left behind goes first
+            final var pending = wrapOutputBuffer.position();
+            if (pending > 0) {
+                final var sent = writeToSocket(pending);
+                if (sent < 0) {
+                    return sent;
+                }
+                if (sent < pending) {
+                    return 0;
+                }
+            }
+            // The socket has everything encrypted so far. Plaintext that an earlier call encrypted without
+            // reporting it is sent now; the caller presents those bytes again, as after any short write.
+            var plainBytesSent = 0;
+            if (unackedPlainHi > unackedPlainLo) {
+                plainBytesSent = Math.min(bufferLen, unackedPlainHi - unackedPlainLo);
+                if (!Vect.memeq(bufferPtr, unackedPlainPtr + unackedPlainLo, plainBytesSent)) {
+                    // skipping these bytes would put the wrong ones behind what the peer already has
+                    log.error().$("send() after a short write must present the same bytes again [fd=").$(delegate.getFd()).I$();
+                    return -1;
+                }
+                unackedPlainLo += plainBytesSent;
+                if (unackedPlainLo < unackedPlainHi) {
+                    // the caller presented fewer bytes than are encrypted: the rest follows in its next call
+                    return plainBytesSent;
+                }
+                unackedPlainLo = 0;
+                unackedPlainHi = 0;
+            }
             resetBufferToPointer(wrapInputBuffer, bufferPtr, bufferLen);
-            wrapInputBuffer.position(0);
-            var plainBytesConsumed = 0;
-            for (; ; ) {
-                final var bytesToSend = wrapOutputBuffer.position();
-                if (bytesToSend > 0) {
-                    final var sent = writeToSocket(bytesToSend);
-                    if (sent < 0) {
-                        return sent;
-                    } else if (sent < bytesToSend) {
-                        return plainBytesConsumed;
-                    }
-                }
-                if (wrapInputBuffer.remaining() == 0) {
-                    return plainBytesConsumed;
-                }
+            wrapInputBuffer.position(plainBytesSent);
+            while (wrapInputBuffer.remaining() > 0) {
                 final var result = sslEngine.wrap(wrapInputBuffer, wrapOutputBuffer);
-                plainBytesConsumed += result.bytesConsumed();
                 if (isEngineStuck(result)) {
                     return -1;
                 }
@@ -315,17 +365,30 @@ public final class JavaTlsServerSocket implements Socket {
                     case BUFFER_UNDERFLOW:
                         throw new AssertionError("Underflow while reading a plain text. This should not happen, please report as a bug");
                     case BUFFER_OVERFLOW:
-                        if (wrapOutputBuffer.position() == 0) {
-                            growWrapOutputBuffer();
-                        }
-                        break;
-                    case OK:
-                        break;
+                        // the buffer was empty before the wrap: the record is larger than the whole buffer
+                        growWrapOutputBuffer();
+                        continue;
                     case CLOSED:
                         log.error().$("Attempt to send to a closed SSLEngine").$();
                         return -1;
+                    default:
+                        break;
                 }
+                final var bytesToSend = wrapOutputBuffer.position();
+                final var sent = writeToSocket(bytesToSend);
+                if (sent < 0) {
+                    return sent;
+                }
+                if (sent < bytesToSend) {
+                    // These bytes are encrypted, so they cannot be taken back, yet they are not sent until the
+                    // socket takes the rest of their record. Reporting them now would let a caller that closes
+                    // after its last send() lose the tail of what it wrote.
+                    keepUnackedPlaintext(bufferPtr + plainBytesSent, result.bytesConsumed());
+                    return plainBytesSent;
+                }
+                plainBytesSent += result.bytesConsumed();
             }
+            return plainBytesSent;
         } catch (SSLException | RuntimeException e) {
             log.error().$("could not wrap SSL packet [fd=").$(delegate.getFd()).$(", error=").$(sanitize(e)).I$();
             return -1;
@@ -340,9 +403,9 @@ public final class JavaTlsServerSocket implements Socket {
     @Override
     public int shutdown(int how) {
         if (how != SHUT_RD && state == STATE_TLS) {
-            sslEngine.closeOutbound();
             try {
-                sslEngine.wrap(EMPTY_BUFFER, wrapOutputBuffer);
+                sslEngine.closeOutbound();
+                wrapClosingRecords();
             } catch (SSLException | RuntimeException e) {
                 log.debug().$("could not queue TLS close_notify [fd=").$(delegate.getFd()).$(", error=").$(sanitize(e)).I$();
             }
@@ -371,6 +434,9 @@ public final class JavaTlsServerSocket implements Socket {
             state = STATE_HANDSHAKE;
             isHandshakeFailed = false;
             isHandshakeInputShort = false;
+            emptyRecordsInARow = 0;
+            unackedPlainLo = 0;
+            unackedPlainHi = 0;
             advanceHandshake(true);
         } catch (SSLException | RuntimeException e) {
             sslEngine = null;
@@ -647,6 +713,13 @@ public final class JavaTlsServerSocket implements Socket {
             plaintextStagedLo = 0;
             plaintextStagedHi = 0;
         }
+        if (unackedPlainPtr != 0) {
+            Unsafe.free(unackedPlainPtr, unackedPlainCapacity, MemoryTag.NATIVE_TLS_RSS);
+            unackedPlainPtr = 0;
+            unackedPlainCapacity = 0;
+        }
+        unackedPlainLo = 0;
+        unackedPlainHi = 0;
         if (wrapOutputBufferPtr != 0) {
             final var capacity = wrapOutputBuffer.capacity();
             resetBufferToPointer(wrapOutputBuffer, 0, 0);
@@ -700,6 +773,19 @@ public final class JavaTlsServerSocket implements Socket {
         wrapOutputBufferPtr = expandBuffer(wrapOutputBuffer, wrapOutputBufferPtr);
     }
 
+    // one wrap() consumes at most one record of plaintext, so the copy stays small
+    private void keepUnackedPlaintext(long ptr, int len) {
+        if (len > unackedPlainCapacity) {
+            unackedPlainPtr = Unsafe.realloc(unackedPlainPtr, unackedPlainCapacity, len, MemoryTag.NATIVE_TLS_RSS);
+            unackedPlainCapacity = len;
+        }
+        if (len > 0) {
+            Vect.memcpy(unackedPlainPtr, ptr, len);
+        }
+        unackedPlainLo = 0;
+        unackedPlainHi = len;
+    }
+
     private void logHandshakeFailure(Exception e) {
         final var line = log.info().$("TLS handshake failed [fd=").$(delegate.getFd()).$(", error=");
         if (e instanceof TlsSessionInitFailedException tlsException) {
@@ -746,6 +832,77 @@ public final class JavaTlsServerSocket implements Socket {
         }
         unwrapInputBuffer.limit(writerPos + n);
         return n;
+    }
+
+    /**
+     * Encrypts what the engine still owes the peer once its outbound side is closed: the answers to
+     * post-handshake requests first, close_notify last, one record per wrap. What the socket does not take is
+     * left in the buffer for the caller's single flush attempt.
+     */
+    private void wrapClosingRecords() throws SSLException {
+        while (!sslEngine.isOutboundDone()) {
+            final var before = wrapOutputBuffer.position();
+            final var result = sslEngine.wrap(EMPTY_BUFFER, wrapOutputBuffer);
+            if (result.getStatus() == SSLEngineResult.Status.BUFFER_OVERFLOW) {
+                if (before == 0) {
+                    growWrapOutputBuffer();
+                } else if (writeToSocket(before) <= 0) {
+                    if (wrapOutputBuffer.capacity() >= INITIAL_BUFFER_CAPACITY_BYTES) {
+                        // the socket takes nothing: the rest is lost, as on any close with unsent bytes
+                        return;
+                    }
+                    // a buffer configured small: make room, so the caller's flush can carry close_notify too
+                    final var pending = wrapOutputBuffer.position();
+                    growWrapOutputBuffer();
+                    wrapOutputBuffer.position(pending);
+                }
+            } else if (result.bytesProduced() == 0) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * Encrypts the answers the engine owes after a post-handshake request, such as a TLS 1.3 key update, so
+     * that {@link #wantsTlsWrite()} reports them and the dispatcher sends them. Left inside the engine they
+     * would pile up unseen for as long as the server only reads, one record per request the client cares to
+     * send.
+     *
+     * @return false when the peer asks faster than it reads the answers: the output buffer is full of them and
+     * the socket takes none
+     */
+    private boolean wrapOwedRecords() throws SSLException {
+        while (sslEngine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_WRAP) {
+            final var before = wrapOutputBuffer.position();
+            final var result = sslEngine.wrap(EMPTY_BUFFER, wrapOutputBuffer);
+            switch (result.getStatus()) {
+                case BUFFER_OVERFLOW:
+                    if (before == 0) {
+                        growWrapOutputBuffer();
+                    } else if (writeToSocket(before) <= 0) {
+                        // The socket takes nothing right now. A buffer configured below the default grows up to
+                        // it, so that a slow reader's occasional key update still fits; past that the answers
+                        // only pile up, and the connection goes.
+                        if (wrapOutputBuffer.capacity() >= INITIAL_BUFFER_CAPACITY_BYTES) {
+                            log.info().$("TLS peer requests key updates faster than it reads the answers, closing [fd=")
+                                    .$(delegate.getFd()).I$();
+                            return false;
+                        }
+                        final var pending = wrapOutputBuffer.position();
+                        growWrapOutputBuffer();
+                        wrapOutputBuffer.position(pending);
+                    }
+                    break;
+                case CLOSED:
+                    return true;
+                default:
+                    if (result.bytesProduced() == 0) {
+                        return true;
+                    }
+                    break;
+            }
+        }
+        return true;
     }
 
     private int writeToSocket(int bytesToSend) {
