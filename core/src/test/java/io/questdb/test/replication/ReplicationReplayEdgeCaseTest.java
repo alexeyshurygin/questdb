@@ -563,6 +563,14 @@ public class ReplicationReplayEdgeCaseTest extends AbstractTest {
                             .forEach(event -> Assert.assertTrue(String.valueOf(event.getParent()),
                                     Files.exists(event.resolveSibling(ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER))));
                 }
+                // nor does the directory the failed create left behind keep the name from a new table
+                primary.execute("CREATE TABLE u (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                primary.execute("INSERT INTO u VALUES ('2024-01-02', 2)");
+                TestUtils.drainWalQueue(primary);
+                Assert.assertEquals("ts\tv\n2024-01-02T00:00:00.000000Z\t2\n", rows(primary, "u", "ts"));
+                final TableToken u = primary.verifyTableName("u");
+                Assert.assertTrue(Files.exists(Paths.get(primary.getConfiguration().getDbRoot().toString(), u.getDirName(),
+                        WalUtils.SEQ_DIR, ReplicationWalDirectoryPolicy.UPLOAD_PENDING_MARKER)));
             }
         });
     }
