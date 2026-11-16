@@ -49,7 +49,6 @@ import io.questdb.replication.store.ObjectStoreException;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.FlyweightMessageContainer;
 import io.questdb.std.Misc;
-import io.questdb.std.Os;
 import io.questdb.std.QuietCloseable;
 import io.questdb.std.Unsafe;
 import io.questdb.std.str.LPSZ;
@@ -303,9 +302,11 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
             final AtomicReference<String> watchedPrefix = new AtomicReference<>();
+            // the node's clock, which paces the cleaner, runs this far ahead of System.nanoTime()
+            final AtomicLong clockOffset = new AtomicLong();
             final AtomicLong listedNanos = new AtomicLong();
             final List<Long> deleteNanos = Collections.synchronizedList(new ArrayList<>());
-            final AtomicInteger slowDeletes = new AtomicInteger(4);
+            final AtomicBoolean isFirstDelete = new AtomicBoolean(true);
             store.setFaultHook((op, key) -> {
                 final String prefix = watchedPrefix.get();
                 if (prefix == null) {
@@ -313,13 +314,13 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
                 }
                 if (op.equals("list") && key.equals(prefix)) {
                     // the cleaner lists a dropped table's objects before it deletes the first of them
-                    listedNanos.set(System.nanoTime());
+                    listedNanos.set(System.nanoTime() + clockOffset.get());
                 } else if (op.equals("delete") && key.startsWith(prefix)) {
-                    deleteNanos.add(System.nanoTime());
-                    if (slowDeletes.getAndDecrement() > 0) {
+                    if (isFirstDelete.compareAndSet(true, false)) {
                         // the first batch takes 500 ms, longer than the 400 ms its four requests are due
-                        Os.sleep(500);
+                        clockOffset.addAndGet(TimeUnit.MILLISECONDS.toNanos(500));
                     }
+                    deleteNanos.add(System.nanoTime() + clockOffset.get());
                 }
             });
             // ten delete requests a second, four at a time
@@ -331,6 +332,7 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
                     .setCleanerDeleteConcurrency(4)
                     .setCleanerMaxRequestsPerSecond(10);
             try (Node node = newNode("p", config, store)) {
+                node.engine.setNanoClockForTesting(() -> System.nanoTime() + clockOffset.get());
                 node.service.start();
                 awaitRole(node, EngineRole.PRIMARY);
                 node.engine.execute("CREATE TABLE gone (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
@@ -345,7 +347,7 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
                 // a batch slower than its share of the rate leaves nothing to wait for, and the run goes on
                 TestUtils.assertEventually(() -> Assert.assertEquals(0, countKeys(store, prefix)), 30);
                 // batch k of four starts no earlier than 4k requests at ten a second allow, counted from
-                // before the first batch
+                // before the first batch on the node's clock
                 synchronized (deleteNanos) {
                     // the create manifest, the log parts with the drop and the deltas: three batches
                     Assert.assertTrue(deleteNanos.size() > 8);
@@ -448,6 +450,8 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
             // lands; 4: the next one lands at once, and so do all later ones. The lease keeper's writes are
             // refused from 1 on, so the coordinator renews the lapsed lease itself.
             final AtomicInteger phase = new AtomicInteger();
+            // how far the node's clock runs ahead of System.nanoTime()
+            final AtomicLong clockOffset = new AtomicLong();
             final AtomicInteger coordinatorRefusals = new AtomicInteger();
             final AtomicInteger unexpectedFailures = new AtomicInteger();
             final AtomicReference<ReplicatedCairoEngine> engine = new AtomicReference<>();
@@ -477,9 +481,10 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
                         throw new IllegalStateException("injected unexpected failure");
                     }
                     case 3 -> {
-                        // the lease counts from when the node sent the write, and lasts 2.5 s
+                        // the lease counts from when the node sent the write, and lasts 2.5 s: the node's
+                        // clock moves 3 s on while the write is in flight
                         phase.set(4);
-                        Os.sleep(3_000);
+                        clockOffset.addAndGet(TimeUnit.SECONDS.toNanos(3));
                     }
                     case 4 -> {
                         phase.set(5);
@@ -492,6 +497,7 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
             // the lease lasts two and a half keepalive intervals: 2.5 s
             try (Node node = newNode("p", primaryConfig().setKeepaliveInterval(1_000), store)) {
                 engine.set(node.engine);
+                node.engine.setNanoClockForTesting(() -> System.nanoTime() + clockOffset.get());
                 node.service.start();
                 awaitRole(node, EngineRole.PRIMARY);
                 node.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");

@@ -61,6 +61,7 @@ import org.jetbrains.annotations.Nullable;
 
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
+import java.util.function.LongSupplier;
 
 /**
  * The storage engine of a replicated node. It carries the node's replication role and refuses client
@@ -84,6 +85,8 @@ public class ReplicatedCairoEngine extends CairoEngine {
     // a primary acknowledges writes until this moment; the replication service moves it with every
     // index write that the object store accepted
     private volatile long leaseValidUntilNanos = System.nanoTime();
+    // the clock of the lease and of every replication timing; System.nanoTime() outside tests
+    private volatile LongSupplier nanoClock = System::nanoTime;
     private volatile EngineRole role;
 
     public ReplicatedCairoEngine(
@@ -219,6 +222,14 @@ public class ReplicatedCairoEngine extends CairoEngine {
         return leaseValidUntilNanos;
     }
 
+    /**
+     * The time on the scale of {@link System#nanoTime()} by which the lease and the replication
+     * service's timings are measured.
+     */
+    public long getNanoTime() {
+        return nanoClock.getAsLong();
+    }
+
     @Override
     public @NotNull QwpServerInfoProvider getQwpServerInfoProvider() {
         return qwpServerInfoProvider;
@@ -296,7 +307,7 @@ public class ReplicatedCairoEngine extends CairoEngine {
      * in a request to an unreachable store.
      */
     public boolean isLeaseLapsed() {
-        return role == EngineRole.PRIMARY && System.nanoTime() - leaseValidUntilNanos >= 0;
+        return role == EngineRole.PRIMARY && getNanoTime() - leaseValidUntilNanos >= 0;
     }
 
     /**
@@ -313,12 +324,21 @@ public class ReplicatedCairoEngine extends CairoEngine {
 
     /**
      * Records a lease renewal: the node may act as primary until {@code validUntilNanos}
-     * ({@link System#nanoTime()} scale). Only moves the bound forward.
+     * ({@link #getNanoTime()} scale). Only moves the bound forward.
      */
     public void renewLease(long validUntilNanos) {
         if (validUntilNanos - leaseValidUntilNanos > 0) {
             leaseValidUntilNanos = validUntilNanos;
         }
+    }
+
+    /**
+     * Test seam: replaces the clock of {@link #getNanoTime()}. Set it before the replication service
+     * starts; a clock that jumps ahead stands in for a request that takes that long.
+     */
+    @org.jetbrains.annotations.TestOnly
+    public void setNanoClockForTesting(@NotNull LongSupplier nanoClock) {
+        this.nanoClock = nanoClock;
     }
 
     @Override

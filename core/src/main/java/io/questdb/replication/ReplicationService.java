@@ -247,7 +247,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             return;
         }
         isClosed = true;
-        closeStartedNanos = System.nanoTime();
+        closeStartedNanos = nanoTime();
         isRunning = false;
         wake();
         final Runnable hook = closeHook;
@@ -540,11 +540,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
 
     // waits until close() holds the only use left
     private void awaitLastUse(long timeoutMillis) {
-        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        final long deadline = nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
         synchronized (useLock) {
             try {
                 while (useCount > 1) {
-                    final long remaining = deadline - System.nanoTime();
+                    final long remaining = deadline - nanoTime();
                     if (remaining <= 0) {
                         LOG.critical().$("a replication thread did not end in time; it frees what replication holds as it ends").$();
                         return;
@@ -561,7 +561,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private boolean acquireLease() {
         long observedSeq = Long.MIN_VALUE;
         String observedEtag = null;
-        long observedSince = System.nanoTime();
+        long observedSince = nanoTime();
         watchedEtag = null;
         while (isRunning) {
             final ReplicationIndex idx = indexClient.read();
@@ -572,9 +572,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             if (observedEtag == null || !observedEtag.equals(etag) || idx.getSequence() != observedSeq) {
                 observedEtag = etag;
                 observedSeq = idx.getSequence();
-                observedSince = System.nanoTime();
+                observedSince = nanoTime();
             }
-            final long waitedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - observedSince);
+            final long waitedMs = TimeUnit.NANOSECONDS.toMillis(nanoTime() - observedSince);
             final long leaseMs = 3 * config.getKeepaliveInterval();
             if (waitedMs >= leaseMs) {
                 LOG.advisory().$("taking over the replication lease of an unresponsive primary [previousOwner=")
@@ -763,7 +763,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         indexLock.lock();
         try {
             if (!isIndexWritable() || isLeaseKeeperStopped || isCrashed || !engine.isPrimaryRole() || lastCommittedIndex == null
-                    || System.nanoTime() - lastIndexWriteNanos < dueNanos) {
+                    || nanoTime() - lastIndexWriteNanos < dueNanos) {
                 // released, stopped, fenced, or the coordinator wrote the index meanwhile
                 return false;
             }
@@ -793,7 +793,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
      * lease keeper covers the difference.
      */
     private boolean isKeepaliveDue() {
-        return System.nanoTime() - lastIndexWriteEndNanos >= TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval());
+        return nanoTime() - lastIndexWriteEndNanos >= TimeUnit.MILLISECONDS.toNanos(config.getKeepaliveInterval());
     }
 
     /**
@@ -818,7 +818,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 tables.add(token);
             }
         }
-        final long start = System.nanoTime();
+        final long start = nanoTime();
         try {
             io.questdb.cairo.DurableEpochManifest.fsyncTables(engine, tables);
         } catch (Throwable th) {
@@ -828,13 +828,13 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         }
         promotionFlushedTableCount = tables.size();
         LOG.info().$("flushed the tables as this node becomes the primary [tables=").$(tables.size())
-                .$(", ms=").$(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)).I$();
+                .$(", ms=").$(TimeUnit.NANOSECONDS.toMillis(nanoTime() - start)).I$();
     }
 
     // the caller holds indexLock; isCommit is false for a renewal that carries no upload
     private boolean writeIndex(ReplicationIndex idx, boolean isReleased, boolean isCommit) {
         // the lease counts from before the request: the store accepted the write no earlier than this
-        final long writeStartNanos = System.nanoTime();
+        final long writeStartNanos = nanoTime();
         try {
             indexClient.write(idx, config.getCompressionLevel());
         } catch (ObjectStoreException e) {
@@ -891,7 +891,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // the lease counts from when the write was sent, so the next renewal is due from then too: a
         // write that took long must not push the next one past the end of the lease
         lastIndexWriteNanos = writeStartNanos;
-        lastIndexWriteEndNanos = System.nanoTime();
+        lastIndexWriteEndNanos = nanoTime();
         if (!isReleased) {
             engine.renewLease(writeStartNanos + TimeUnit.MILLISECONDS.toNanos(leaseMillis()));
         }
@@ -934,7 +934,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                         LOG.critical().$("the replication coordinator made no progress, its lease is left to lapse [idleMs=")
                                 .$(TimeUnit.NANOSECONDS.toMillis(idleNanos)).I$();
                     }
-                } else if (System.nanoTime() - lastIndexWriteNanos >= dueNanos) {
+                } else if (nanoTime() - lastIndexWriteNanos >= dueNanos) {
                     isStalled = false;
                     try {
                         if (renewLeaseOnly(dueNanos)) {
@@ -1143,6 +1143,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         } finally {
             r.closeFiles();
         }
+    }
+
+    // the clock of the lease: every timing of the service reads it, so that they agree with the engine's
+    private long nanoTime() {
+        return engine.getNanoTime();
     }
 
     // the token of a table this node dropped and whose directory the purge job has not removed yet
@@ -1460,9 +1465,9 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 LOG.advisory().$("replication lease renewed, the primary accepts writes again [epoch=").$(epoch).I$();
             }
             if (!dirtyTables.isEmpty() && firstDirtyNanos == 0) {
-                firstDirtyNanos = System.nanoTime();
+                firstDirtyNanos = nanoTime();
             }
-            final boolean isWindowDue = firstDirtyNanos != 0 && System.nanoTime() - firstDirtyNanos >= TimeUnit.MILLISECONDS.toNanos(window);
+            final boolean isWindowDue = firstDirtyNanos != 0 && nanoTime() - firstDirtyNanos >= TimeUnit.MILLISECONDS.toNanos(window);
             final boolean isKeepaliveDue = isKeepaliveDue();
             // a new table sets isNonDataPending unless structural changes wait for the window too
             final boolean isUploadDue = isNonDataPending || isWindowDue;
@@ -1516,8 +1521,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         // round starts in the second half of that wait, which is left to the round in progress and to
         // the release
         final long closeStarted = closeStartedNanos;
-        final long deadline = (closeStarted != 0 ? closeStarted : System.nanoTime()) + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() / 2);
-        while (System.nanoTime() < deadline) {
+        final long deadline = (closeStarted != 0 ? closeStarted : nanoTime()) + TimeUnit.MILLISECONDS.toNanos(shutdownTimeoutMillis() / 2);
+        while (nanoTime() < deadline) {
             store.touch();
             final long uploaded = primaryRound(true);
             if (uploaded == 0 || dirtyTables.isEmpty() || !engine.isPrimaryRole()) {
@@ -1742,7 +1747,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
 
     // checkpoint history uploads on every node, the WAL cleaner on the primary
     private void runHousekeeping(boolean isPrimaryNode) {
-        final long now = System.nanoTime();
+        final long now = nanoTime();
         if (!pendingCheckpoints.isEmpty() && now >= nextCheckpointUploadNanos) {
             try {
                 uploadCheckpointHistory();
@@ -1760,7 +1765,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 } catch (Throwable th) {
                     LOG.error().$("WAL cleaner run failed, will retry [error=").$(th).I$();
                 }
-                nextCleanerRunNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.getCleanerInterval());
+                nextCleanerRunNanos = nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.getCleanerInterval());
             }
         }
     }
@@ -1930,7 +1935,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             rps = store.getDefaultCleanerMaxRequestsPerSecond();
         }
         final int concurrency = Math.max(1, config.getCleanerDeleteConcurrency());
-        final long startNanos = System.nanoTime();
+        final long startNanos = nanoTime();
         int deleted = 0;
         int next = 0;
         for (int n = keys.size(); next < n && isRunning; next += concurrency) {
@@ -1952,7 +1957,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             }
             if (rps > 0) {
                 final long dueNanos = startNanos + TimeUnit.SECONDS.toNanos(Math.min(keys.size(), i + concurrency)) / rps;
-                final long sleepNanos = dueNanos - System.nanoTime();
+                final long sleepNanos = dueNanos - nanoTime();
                 if (sleepNanos > 0) {
                     sleepQuietly(TimeUnit.NANOSECONDS.toMillis(sleepNanos) + 1);
                 }
