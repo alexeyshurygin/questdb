@@ -228,6 +228,63 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testContextOfACallerThatRanATaskIsFreedAtTheStop() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("caller-context");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final Thread caller = Thread.currentThread();
+            final CountDownLatch callerFetched = new CountDownLatch(1);
+            store.setFaultHook((op, key) -> {
+                if (op.equals("get") && key.startsWith(StoreKeys.TABLES_PREFIX)) {
+                    if (Thread.currentThread() == caller) {
+                        callerFetched.countDown();
+                    } else if (isThread(WORKER_THREAD)) {
+                        // the pool's only thread stays busy until the caller has run the other table itself
+                        holdRequest(callerFetched);
+                    }
+                }
+            });
+            // one pool thread: a task that finds it busy runs on the thread that submits it
+            try (Node node = newNode(dir, config(dir, ReplicationRole.REPLICA).setMaxConcurrentRequests(1), store)) {
+                writeIndex(store, "a-primary", node.engine.getDataID().getHi(), node.engine.getDataID().getLo(),
+                        tableEntry(1, "a"), tableEntry(2, "b"));
+                // the store holds neither table's create manifest: nothing is applied
+                Assert.assertEquals(0, node.service.syncReplicaOnce());
+                Assert.assertEquals(0, callerFetched.getCount());
+                // the pool thread and the caller each have a context
+                Assert.assertEquals(2, node.service.getWorkerContextCount());
+                node.service.close();
+                // the stop freed both: the pool thread's as the thread ended, the caller's with what the threads share
+                Assert.assertEquals(0, node.service.getWorkerContextCount());
+                Assert.assertEquals(1, store.getCloseCount());
+            }
+        });
+    }
+
+    @Test
+    public void testCoordinatorThatCannotStartHoldsNothing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("coordinator-unstartable");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (Node node = newNode(dir, config(dir, ReplicationRole.PRIMARY), store)) {
+                node.service.setThreadFactoryForTesting(ReplicationPrimaryEdgeCaseTest::unstartableThread);
+                try {
+                    node.service.start();
+                    Assert.fail("the start must fail without a coordinator thread");
+                } catch (OutOfMemoryError e) {
+                    TestUtils.assertContains(e.getMessage(), "unable to create native thread");
+                }
+                // no coordinator runs: the node asked the store nothing and stays read-only
+                Assert.assertEquals(0, store.getGetCount() + store.getPutCount() + store.getListCount());
+                Assert.assertEquals(EngineRole.PRIMARY_CATCHUP, node.engine.getRole());
+                // the start gave back the use it took for the coordinator: the stop waits for nobody and frees the store
+                node.service.close();
+                Assert.assertEquals(1, store.getCloseCount());
+            }
+        });
+    }
+
+    @Test
     public void testDroppedTableKeepsItsSequencerUntilStartupDecides() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String dir = newDir("pins");
@@ -486,6 +543,40 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testEngineThatClosesBeforeTheServiceStops() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // a service that never started has no thread that could use the engine: the engine closes at once
+            final String idle = newDir("engine-first-idle");
+            final MemoryObjectStore idleStore = new MemoryObjectStore();
+            final Node idleNode = newNode(idle, config(idle, ReplicationRole.REPLICA), idleStore);
+            try {
+                idleNode.engine.close();
+                Assert.assertFalse(isEngineOpen(idleNode.engine));
+                Assert.assertEquals(0, idleStore.getCloseCount());
+            } finally {
+                idleNode.service.close();
+            }
+            Assert.assertEquals(1, idleStore.getCloseCount());
+
+            // the coordinator of a running service ends only when the service stops: an engine close that comes
+            // first waits for it as long as a request may take, 200 ms, then gives up and frees nothing
+            final String running = newDir("engine-first-running");
+            final MemoryObjectStore runningStore = new MemoryObjectStore();
+            final ReplicationConfigurationImpl config = config(running, ReplicationRole.REPLICA)
+                    .setRequestBaseTimeout(100)
+                    .setRetryAttempts(0);
+            try (Node node = newNode(running, config, runningStore)) {
+                node.service.start();
+                node.engine.close();
+                Assert.assertTrue(isEngineOpen(node.engine));
+                Assert.assertEquals(0, runningStore.getCloseCount());
+                // the server stops the service, then closes the engine again: that close frees it
+            }
+            Assert.assertEquals(1, runningStore.getCloseCount());
+        });
+    }
+
+    @Test
     public void testFailedFlushAtPromotionStopsTheEngine() throws Exception {
         assertPromotionFlushFailure(true);
     }
@@ -589,6 +680,54 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testInterruptedStopDoesNotWaitForAStuckDownload() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("stuck-download");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicReference<Thread> coordinator = new AtomicReference<>();
+            final AtomicReference<Thread> worker = new AtomicReference<>();
+            final AtomicLong closesAtResume = new AtomicLong(-1);
+            final CountDownLatch blocked = new CountDownLatch(1);
+            final CountDownLatch resume = new CountDownLatch(1);
+            store.setFaultHook((op, key) -> {
+                if (!op.equals("get")) {
+                    return;
+                }
+                if (key.equals(IndexClient.INDEX_KEY) && isThread(COORDINATOR_THREAD)) {
+                    coordinator.set(Thread.currentThread());
+                } else if (key.startsWith(StoreKeys.TABLES_PREFIX) && isThread(WORKER_THREAD)
+                        && worker.compareAndSet(null, Thread.currentThread())) {
+                    // the first download of the table outlasts the stop, interrupts included
+                    blocked.countDown();
+                    holdRequestThroughInterrupts(resume);
+                    closesAtResume.set(store.getCloseCount());
+                }
+            });
+            try (Node node = newNode(dir, config(dir, ReplicationRole.REPLICA), store)) {
+                writeIndex(store, "a-primary", node.engine.getDataID().getHi(), node.engine.getDataID().getLo(), tableEntry(1, "t"));
+                node.service.start();
+                try {
+                    await(blocked);
+                    // A stop asked for on an interrupted thread interrupts the coordinator, which stops waiting for
+                    // the download, and the pool, whose thread goes on. It waits for neither and keeps its interrupt.
+                    Assert.assertTrue(runInterrupted(node.service::close));
+                    coordinator.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                    Assert.assertFalse(coordinator.get().isAlive());
+                    Assert.assertTrue(worker.get().isAlive());
+                } finally {
+                    resume.countDown();
+                }
+                worker.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(worker.get().isAlive());
+                // the download went on with the store open, and its thread freed the store as it ended
+                Assert.assertEquals(0, closesAtResume.get());
+                Assert.assertEquals(1, store.getCloseCount());
+                Assert.assertNull(node.engine.getTableTokenIfExists("t"));
+            }
+        });
+    }
+
+    @Test
     public void testInterruptedStopFreesTheIndexClient() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String dir = newDir("interrupted-free");
@@ -611,6 +750,40 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
                 coordinator.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
                 Assert.assertFalse(coordinator.get().isAlive());
                 // the store is closed once, and the leak check below finds the index client freed
+                Assert.assertEquals(1, store.getCloseCount());
+            }
+        });
+    }
+
+    @Test
+    public void testInterruptedStopsDoNotWaitForAThreadThatHoldsAUse() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("interrupted-holder");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final CountDownLatch running = new CountDownLatch(1);
+            final CountDownLatch resume = new CountDownLatch(1);
+            try (Node node = newNode(dir, config(dir, ReplicationRole.REPLICA), store)) {
+                // a pool thread that holds a use of what the threads share
+                final Thread worker = node.service.newWorkerThreadForTesting(() -> {
+                    running.countDown();
+                    holdRequest(resume);
+                });
+                worker.start();
+                try {
+                    await(running);
+                    // a stop asked for on an interrupted thread does not wait for the thread, and keeps its interrupt
+                    Assert.assertTrue(runInterrupted(node.service::close));
+                    Assert.assertTrue(worker.isAlive());
+                    Assert.assertEquals(0, store.getCloseCount());
+                    // neither does an engine close: it gives up on the thread, frees nothing, and keeps its interrupt
+                    Assert.assertTrue(runInterrupted(node.engine::close));
+                    Assert.assertTrue(isEngineOpen(node.engine));
+                } finally {
+                    resume.countDown();
+                }
+                worker.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(worker.isAlive());
+                // the thread freed what the threads share as it ended; the next engine close frees the engine
                 Assert.assertEquals(1, store.getCloseCount());
             }
         });
@@ -730,6 +903,28 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testLeaseKeeperThatCannotStartFencesThePrimary() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("keeper-unstartable");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicInteger threads = new AtomicInteger();
+            try (Node node = newNode(dir, config(dir, ReplicationRole.PRIMARY), store)) {
+                // the coordinator starts; the lease keeper, which it starts once it holds the lease, cannot
+                node.service.setThreadFactoryForTesting(r -> threads.incrementAndGet() == 1 ? new Thread(r) : unstartableThread(r));
+                node.service.start();
+                // without a lease keeper the primary must not accept writes: the coordinator fails and fences the node
+                awaitRole(node.engine, EngineRole.FENCED);
+                TestUtils.assertContains(node.engine.getFenceReason(), "replication coordinator failed: unable to create native thread");
+                Assert.assertEquals(2, threads.get());
+                Assert.assertTrue(node.engine.isReadOnlyMode());
+            }
+            // the lease the node took is left to expire, and the use taken for the keeper came back: the stop freed the store
+            Assert.assertFalse(readIndex(store).isReleased());
+            Assert.assertEquals(1, store.getCloseCount());
+        });
+    }
+
+    @Test
     public void testOwnerThatAppearsBeforeTheTakeoverIsWaitedFor() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String dir = newDir("owner-appears");
@@ -814,6 +1009,93 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testRenewalOvertakenByAFenceWritesNothing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("renewal-after-fence");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicBoolean isArmed = new AtomicBoolean();
+            final AtomicReference<Thread> keeper = new AtomicReference<>();
+            final CountDownLatch keeperHeld = new CountDownLatch(1);
+            final CountDownLatch keeperResume = new CountDownLatch(1);
+            try (Node node = newNode(dir, config(dir, ReplicationRole.PRIMARY), store)) {
+                node.engine.setNanoClockForTesting(() -> {
+                    if (isThread(KEEPER_THREAD) && isArmed.compareAndSet(true, false)) {
+                        // the lease keeper is about to find a renewal due, and waits for the test
+                        keeper.set(Thread.currentThread());
+                        keeperHeld.countDown();
+                        holdRequest(keeperResume);
+                        return System.nanoTime() + TimeUnit.HOURS.toNanos(1);
+                    }
+                    return System.nanoTime();
+                });
+                node.service.start();
+                awaitRole(node.engine, EngineRole.PRIMARY);
+                isArmed.set(true);
+                await(keeperHeld);
+                // another node takes the store over; the coordinator's next keepalive finds out and fences the node
+                final ReplicationIndex taken = new ReplicationIndex();
+                taken.setDataId(node.engine.getDataID().getHi(), node.engine.getDataID().getLo());
+                taken.setOwner("another-primary", 9, 1, 100, false);
+                try (IndexClient client = new IndexClient(store, true)) {
+                    while (true) {
+                        Assert.assertNotNull(client.read());
+                        try {
+                            client.write(taken, 1);
+                            break;
+                        } catch (ObjectStoreException e) {
+                            // a keepalive of the coordinator came between the read and the write
+                            Assert.assertEquals(ObjectStoreException.Kind.PRECONDITION_FAILED, e.getKind());
+                        }
+                    }
+                }
+                awaitRole(node.engine, EngineRole.FENCED);
+                // The coordinator read the other node's index as it fenced the node, so a write based on it would
+                // succeed. The renewal comes after the fence and writes nothing.
+                keeperResume.countDown();
+                keeper.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(keeper.get().isAlive());
+                final ReplicationIndex index = readIndex(store);
+                Assert.assertEquals("another-primary", index.getOwnerInstanceId());
+                Assert.assertEquals(100, index.getSequence());
+            }
+            Assert.assertEquals("another-primary", readIndex(store).getOwnerInstanceId());
+        });
+    }
+
+    @Test
+    public void testRenewalOvertakenByTheReleaseWritesNothing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("renewal-after-release");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicBoolean isArmed = new AtomicBoolean();
+            final CountDownLatch keeperHeld = new CountDownLatch(1);
+            try (Node node = newNode(dir, config(dir, ReplicationRole.PRIMARY), store)) {
+                node.engine.setNanoClockForTesting(() -> {
+                    if (isThread(KEEPER_THREAD) && isArmed.compareAndSet(true, false)) {
+                        // The lease keeper is about to find a renewal due, and waits until the stop interrupts it.
+                        // The stop does that once the coordinator has drained and released the lease.
+                        keeperHeld.countDown();
+                        holdUntilInterrupted();
+                        return System.nanoTime() + TimeUnit.HOURS.toNanos(1);
+                    }
+                    return System.nanoTime();
+                });
+                node.service.start();
+                awaitRole(node.engine, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                node.engine.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                isArmed.set(true);
+                await(keeperHeld);
+                node.service.close();
+            }
+            // the renewal came after the release and wrote nothing: the store holds the release, over everything
+            final ReplicationIndex index = readIndex(store);
+            Assert.assertTrue(index.isReleased());
+            Assert.assertEquals(1, entry(index, "t").getLastTxn());
+        });
+    }
+
+    @Test
     public void testReplicaPollsAtOnceWhenItsWaitIsInterrupted() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String dir = newDir("replica-wait");
@@ -867,6 +1149,53 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
                 after.removeAll(before);
                 Assert.assertEquals(started, after);
                 Assert.assertEquals(instanceId, node.service.getInstanceId());
+            }
+        });
+    }
+
+    @Test
+    public void testSegmentClosesOfViewsAndOnAReplicaAreNotKept() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final TableToken table = new TableToken("t", "t~10", null, 10, TableToken.Type.TABLE, true, false, false, false);
+            final TableToken view = new TableToken("v", "v~11", null, 11, TableToken.Type.VIEW, true, false, false, false);
+            final TableToken matView = new TableToken("mv", "mv~12", null, 12, TableToken.Type.MAT_VIEW, true, false, false, false);
+            final String p = newDir("closes-primary");
+            try (Node node = newNode(p, config(p, ReplicationRole.PRIMARY), new MemoryObjectStore())) {
+                // views and materialized views never get an uploader: no close of theirs is kept for one
+                node.service.onSegmentClosed(view, 1, 0, 1);
+                node.service.onWalClosed(matView, 1, 1);
+                Assert.assertEquals(0, node.service.getEarlyCloseTableCount());
+                // the close of a table that has no uploader yet waits for it
+                node.service.onSegmentClosed(table, 1, 0, 1);
+                Assert.assertEquals(1, node.service.getEarlyCloseTableCount());
+            }
+            final String r = newDir("closes-replica");
+            try (Node node = newNode(r, config(r, ReplicationRole.REPLICA), new MemoryObjectStore())) {
+                // a replica uploads nothing
+                node.service.onSegmentClosed(table, 1, 0, 1);
+                node.service.onWalClosed(table, 1, 1);
+                Assert.assertEquals(0, node.service.getEarlyCloseTableCount());
+            }
+        });
+    }
+
+    @Test
+    public void testStartAfterTheStopIsIgnored() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("start-after-stop");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (Node node = newNode(dir, config(dir, ReplicationRole.REPLICA), store)) {
+                final Set<Thread> before = coordinatorThreads();
+                node.service.close();
+                // a start that comes after the stop starts no coordinator and leaves the store alone
+                node.service.start();
+                final Set<Thread> after = coordinatorThreads();
+                after.removeAll(before);
+                Assert.assertTrue(after.isEmpty());
+                Assert.assertNull(node.service.getInstanceId());
+                Assert.assertEquals("starting", node.service.getStatus());
+                Assert.assertEquals(0, store.getGetCount() + store.getPutCount() + store.getListCount());
+                Assert.assertEquals(1, store.getCloseCount());
             }
         });
     }
@@ -927,6 +1256,40 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
             Assert.assertEquals(released.getSequence(), after.getSequence());
             Assert.assertTrue(after.isReleased());
             Assert.assertTrue(Files.exists(Paths.get(b, ReplicationService.MIGRATE_PRIMARY_FILE)));
+        });
+    }
+
+    @Test
+    public void testStopGivesUpOnAThreadThatOutlivesItsWait() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("outliving-thread");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicLong closesAtResume = new AtomicLong(-1);
+            final CountDownLatch running = new CountDownLatch(1);
+            final CountDownLatch resume = new CountDownLatch(1);
+            try (Node node = newNode(dir, config(dir, ReplicationRole.REPLICA), store)) {
+                // a pool thread that holds a use past the five seconds the stop waits for the threads
+                final Thread worker = node.service.newWorkerThreadForTesting(() -> {
+                    running.countDown();
+                    holdRequest(resume);
+                    closesAtResume.set(store.getCloseCount());
+                });
+                worker.start();
+                try {
+                    await(running);
+                    node.service.close();
+                    // the stop gave up on the thread and left what the threads share to it
+                    Assert.assertTrue(worker.isAlive());
+                    Assert.assertEquals(0, store.getCloseCount());
+                } finally {
+                    resume.countDown();
+                }
+                worker.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(worker.isAlive());
+                // the thread went on with the store open, and freed it as it ended
+                Assert.assertEquals(0, closesAtResume.get());
+                Assert.assertEquals(1, store.getCloseCount());
+            }
         });
     }
 
@@ -1086,6 +1449,57 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
         });
     }
 
+    @Test
+    public void testTableCreatedTwiceOrAsAViewGetsNoSecondUploader() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("created-again");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (Node node = newNode(dir, config(dir, ReplicationRole.PRIMARY), store)) {
+                node.service.start();
+                awaitRole(node.engine, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                node.engine.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitUploaded(node, "t", 1);
+                // The WAL listener reports no view or materialized view, and no table twice. Reported anyway, they
+                // get no uploader: the table keeps the one that uploaded it, and the stop releases the lease.
+                node.service.onTableCreated(new TableToken("v", "v~90", null, 90, TableToken.Type.VIEW, true, false, false, false));
+                node.service.onTableCreated(new TableToken("mv", "mv~91", null, 91, TableToken.Type.MAT_VIEW, true, false, false, false));
+                node.service.onTableCreated(node.engine.verifyTableName("t"));
+                node.engine.execute("INSERT INTO t VALUES ('2024-01-02', 2)");
+                awaitUploaded(node, "t", 2);
+            }
+            final ReplicationIndex index = readIndex(store);
+            Assert.assertTrue(index.isReleased());
+            Assert.assertEquals(1, index.getTables().size());
+            Assert.assertEquals(1, entry(index, "t").getFirstTxn());
+            Assert.assertEquals(2, entry(index, "t").getLastTxn());
+        });
+    }
+
+    @Test
+    public void testWorkerThreadStartedAfterTheLastUseRunsNothing() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final String dir = newDir("late-worker");
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (Node node = newNode(dir, config(dir, ReplicationRole.REPLICA), store)) {
+                node.service.close();
+                Assert.assertEquals(1, store.getCloseCount());
+                // a pool thread that starts only after the stop gave the last use back and freed what the threads
+                // share has nobody to work for
+                final AtomicBoolean isRun = new AtomicBoolean();
+                final Thread worker = node.service.newWorkerThreadForTesting(() -> isRun.set(true));
+                Assert.assertEquals(WORKER_THREAD, worker.getName());
+                Assert.assertTrue(worker.isDaemon());
+                worker.start();
+                worker.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
+                Assert.assertFalse(worker.isAlive());
+                Assert.assertFalse(isRun.get());
+                // nor does it free anything a second time
+                Assert.assertEquals(1, store.getCloseCount());
+            }
+        });
+    }
+
     private static void allowPromotion(String installRoot) throws Exception {
         Files.createFile(Paths.get(installRoot, ReplicationService.MIGRATE_PRIMARY_FILE));
     }
@@ -1192,6 +1606,38 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
         }
     }
 
+    // holds a store request until the latch opens, through any interrupt, which the thread keeps
+    private static void holdRequestThroughInterrupts(CountDownLatch latch) {
+        boolean isInterrupted = false;
+        try {
+            while (true) {
+                try {
+                    if (!latch.await(WAIT_SECONDS, TimeUnit.SECONDS)) {
+                        throw new AssertionError("the test did not release the request");
+                    }
+                    return;
+                } catch (InterruptedException e) {
+                    isInterrupted = true;
+                }
+            }
+        } finally {
+            if (isInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    // holds the calling thread until something interrupts it, and keeps the interrupt
+    private static void holdUntilInterrupted() {
+        try {
+            if (!new CountDownLatch(1).await(WAIT_SECONDS, TimeUnit.SECONDS)) {
+                throw new AssertionError("nothing interrupted the thread");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     // a closed engine refuses to hand out a compiler
     private static boolean isEngineOpen(CairoEngine engine) {
         try (SqlCompiler ignore = engine.getSqlCompiler()) {
@@ -1290,13 +1736,34 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
         return isStillInterrupted.get();
     }
 
-    // creates the index of an empty store, held by the owner, as another node would
-    private static void writeIndex(ObjectStore store, @Nullable String owner, long dataIdHi, long dataIdLo) {
+    // an index entry of a table created under replication, with one transaction, of which the store holds nothing
+    private static IndexTable tableEntry(int tableId, String tableName) {
+        final IndexTable t = new IndexTable().of(tableId, 1_700_000_000_000_000L, tableName + '~' + tableId, tableName, IndexTable.KIND_TABLE, 1_000);
+        t.setFirstTxn(1);
+        t.setLastTxn(1);
+        return t;
+    }
+
+    // a thread that cannot start, as when the process ran out of native threads
+    private static Thread unstartableThread(Runnable r) {
+        return new Thread(r) {
+            @Override
+            public void start() {
+                throw new OutOfMemoryError("unable to create native thread: possibly out of memory or process/resource limits reached");
+            }
+        };
+    }
+
+    // creates the index of an empty store, held by the owner, as another node would, listing the tables
+    private static void writeIndex(ObjectStore store, @Nullable String owner, long dataIdHi, long dataIdLo, IndexTable... tables) {
         try (IndexClient client = new IndexClient(store, true)) {
             Assert.assertNull(client.read());
             final ReplicationIndex idx = new ReplicationIndex();
             idx.setDataId(dataIdHi, dataIdLo);
             idx.setOwner(owner, 1, 1, 1, false);
+            for (IndexTable t : tables) {
+                idx.addTable(t);
+            }
             client.write(idx, 1);
         }
     }

@@ -64,6 +64,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
@@ -184,6 +185,8 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private volatile long stallLimitMillis;
     private volatile String status = "starting";
     private volatile Runnable takeoverHook;
+    // makes the coordinator and lease keeper threads
+    private volatile ThreadFactory threadFactory = Thread::new;
     // guarded by useLock; close() holds one use from the start
     private int useCount = 1;
     // the index version acquireLease() saw unchanged for the whole wait; null when it did not have to wait
@@ -216,24 +219,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
                 60,
                 TimeUnit.SECONDS,
                 new SynchronousQueue<>(),
-                r -> {
-                    final Thread t = new Thread(() -> {
-                        // only the coordinator submits, and it holds a use: a thread that finds none left
-                        // has nobody to work for
-                        if (!acquireUse()) {
-                            return;
-                        }
-                        try {
-                            r.run();
-                        } finally {
-                            releaseWorkerOfThisThread();
-                            Path.clearThreadLocals();
-                            releaseUse();
-                        }
-                    }, "qdb-replication-worker");
-                    t.setDaemon(true);
-                    return t;
-                },
+                this::newWorkerThread,
                 (task, pool) -> {
                     if (pool.isShutdown()) {
                         throw new RejectedExecutionException("replication is stopping");
@@ -402,6 +388,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         return !isUploadersPrepared && droppedToken(tableDir) != null;
     }
 
+    /**
+     * Test seam: a thread made as the worker pool makes its threads. It runs the task only while it
+     * holds a use of what the threads of this service share, as a pool thread does.
+     */
+    @TestOnly
+    public Thread newWorkerThreadForTesting(Runnable task) {
+        return newWorkerThread(task);
+    }
+
     @Override
     public void onCheckpointReleased(long timestampMicros, io.questdb.std.CharSequenceLongHashMap tableDirNamesToSeqTxn) {
         try {
@@ -497,6 +492,14 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     /**
+     * Test seam: makes the coordinator and lease keeper threads, which this service names and starts.
+     */
+    @TestOnly
+    public void setThreadFactoryForTesting(ThreadFactory factory) {
+        this.threadFactory = factory;
+    }
+
+    /**
      * Test seam: how long an idle pool thread lives.
      */
     @org.jetbrains.annotations.TestOnly
@@ -518,8 +521,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         if (!acquireUse()) {
             return;
         }
-        final Thread t = new Thread(this::run, "qdb-replication");
-        t.setDaemon(true);
+        final Thread t = newThread(this::run, "qdb-replication");
         mainThread = t;
         try {
             t.start();
@@ -1021,8 +1023,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         if (!acquireUse()) {
             return;
         }
-        final Thread t = new Thread(this::leaseKeeperMain, "qdb-replication-lease");
-        t.setDaemon(true);
+        final Thread t = newThread(this::leaseKeeperMain, "qdb-replication-lease");
         leaseKeeperThread = t;
         try {
             t.start();
@@ -1282,6 +1283,13 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
         isUploadersPrepared = true;
     }
 
+    private Thread newThread(Runnable r, String name) {
+        final Thread t = threadFactory.newThread(r);
+        t.setName(name);
+        t.setDaemon(true);
+        return t;
+    }
+
     private TableUploader newUploader(TableToken token, long localLastTxn) {
         final FilesFacade ff = engine.getConfiguration().getFilesFacade();
         path.of(engine.getConfiguration().getDbRoot()).concat(token.getDirName()).concat(WalUtils.SEQ_DIR).slash()
@@ -1305,6 +1313,26 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
             policy.initDirectory(path.of(engine.getConfiguration().getDbRoot()).concat(token.getDirName()).concat(WalUtils.SEQ_DIR).slash(), token);
         }
         return new TableUploader(token, t, false);
+    }
+
+    // a thread of the worker pool
+    private Thread newWorkerThread(Runnable r) {
+        final Thread t = new Thread(() -> {
+            // the coordinator submits, and it holds a use: a pool thread that finds none left started
+            // after the last use was given back, and has nobody to work for
+            if (!acquireUse()) {
+                return;
+            }
+            try {
+                r.run();
+            } finally {
+                releaseWorkerOfThisThread();
+                Path.clearThreadLocals();
+                releaseUse();
+            }
+        }, "qdb-replication-worker");
+        t.setDaemon(true);
+        return t;
     }
 
     /**
