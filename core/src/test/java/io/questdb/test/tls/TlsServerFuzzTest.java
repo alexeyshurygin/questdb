@@ -199,7 +199,7 @@ public class TlsServerFuzzTest extends AbstractBootstrapTest {
                                     1 + clientRnd.nextInt(3)
                             );
                             ingestPlans.add(plan);
-                            tasks.add(new NamedTask("ingestion client " + i + " over " + plan.transport, () -> ingest(plan, httpPort, ilpPort)));
+                            tasks.add(new NamedTask("ingestion client " + i + " over " + plan.transport, () -> ingest(plan, httpPort, ilpPort, pgPort)));
                         }
                         default -> tasks.add(new NamedTask("slow HTTPS client " + i, () -> slowHttpsQueries(httpPort, clientRnd, requests)));
                     }
@@ -299,7 +299,7 @@ public class TlsServerFuzzTest extends AbstractBootstrapTest {
         }
         // the line receiver last: the query above proves that PGWire can check on it
         final IngestPlan plan = new IngestPlan(table, "tcps", 10, 1);
-        ingest(plan, httpPort, ilpPort);
+        ingest(plan, httpPort, ilpPort, pgPort);
         awaitTable(pgPort, plan.table, plan.rows);
     }
 
@@ -465,8 +465,12 @@ public class TlsServerFuzzTest extends AbstractBootstrapTest {
 
     /**
      * Sends ids 0 to {@code rows - 1}, each batch over a connection of its own.
+     * <p>
+     * Over TCP with TLS the client keeps its connection open until the server holds the batch. Its close never
+     * reads the session ticket a TLS 1.3 server sends after the handshake, so the close resets the connection and
+     * the kernel discards whatever the client had not sent yet: a client defect, not the server's.
      */
-    private static void ingest(IngestPlan plan, int httpPort, int ilpPort) {
+    private static void ingest(IngestPlan plan, int httpPort, int ilpPort, int pgPort) throws Exception {
         final int port = "tcps".equals(plan.transport) ? ilpPort : httpPort;
         final int batchSize = (plan.rows + plan.batches - 1) / plan.batches;
         // The HTTP transport sends a batch again when it gave up on the answer, and a batch the server had
@@ -483,6 +487,9 @@ public class TlsServerFuzzTest extends AbstractBootstrapTest {
                             .at(BASE_TIMESTAMP_MICROS + id, ChronoUnit.MICROS);
                 }
                 sender.flush();
+                if ("tcps".equals(plan.transport)) {
+                    awaitTable(pgPort, plan.table, to);
+                }
             }
         }
     }
