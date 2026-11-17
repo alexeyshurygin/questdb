@@ -63,3 +63,4 @@ compat/src/test/rust/scenarios/target/
 
 # Python bytecode caches written by the CI helper scripts and their fixtures
 __pycache__/
+/core/docker-tls/questdb.jar

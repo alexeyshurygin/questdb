@@ -1,0 +1,194 @@
+name: Publish QuestDB TLS image
+
+# Builds the QuestDB image from THIS branch using the upstream core/Dockerfile
+# unmodified, and publishes a multi-arch image to GHCR.
+#
+# The image ships no certificates and no TLS configuration. TLS is opt-in at run
+# time by overriding the command to select io.questdb.tls.TlsServerMain; with no
+# override the image behaves as the stock QuestDB release it is built from.
+#
+# Each architecture builds on a native runner. jlink (the core/pom.xml jlink execution) emits an
+# architecture-specific runtime, so cross-building would mean emulating a full
+# GraalVM + Maven + npm + cmake compile - far slower than two native jobs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (e.g. 10.2.0-tls)"
+        required: true
+        default: "10.2.0-tls"
+  push:
+    tags:
+      - "*-tls"
+
+env:
+  REGISTRY: ghcr.io
+  # Each repository publishes into its own owner's GHCR namespace, so the
+  # same workflow works unchanged in any fork. GHCR needs lowercase names;
+  # the "Normalize image name" step lowercases the owner before use.
+  IMAGE_NAME: ${{ github.repository_owner }}/questdb
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Normalize image name
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # fetch-depth: 0 because buildnumber-maven-plugin (core/pom.xml) runs
+      # git during `validate` to embed the HEAD revision, and pom.xml declares
+      # an <scm> connection. actions/checkout gives a real .git directory, so the
+      # worktree pointer-file problem that breaks local builds does not apply here.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: false   # the pinned java-questdb-client is released; Maven Central
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.arch }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: core/Dockerfile
+          target: questdb
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          build-args: |
+            tag_name=${{ steps.meta.outputs.tag }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}-${{ matrix.arch }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+  manifest:
+    name: merge and smoke test
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Normalize image name
+        run: echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
+
+      - name: Resolve tag
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          set -eux
+          BASE="${REGISTRY}/${IMAGE_NAME}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          docker buildx imagetools create -t "${BASE}:${TAG}" \
+            "${BASE}:${TAG}-amd64" \
+            "${BASE}:${TAG}-arm64"
+          # Immutable pin for consumers: Testcontainers and deploy configs
+          # reference this tag, since a re-published mutable tag is never
+          # re-pulled by Testcontainers on machines that already have it.
+          SHORT="${GITHUB_SHA:0:9}"
+          docker buildx imagetools create -t "${BASE}:${TAG}-${SHORT}" \
+            "${BASE}:${TAG}-amd64" \
+            "${BASE}:${TAG}-arm64"
+          echo "### Published tags" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${BASE}:${TAG}\` (mutable)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`${BASE}:${TAG}-${SHORT}\` (immutable pin - use this in consumers)" >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "${BASE}:${TAG}"
+
+      # Runs on amd64, so this exercises the amd64 variant only. The arm64
+      # variant is not smoke-tested here; core/docker-tls covers it on arm64 hosts.
+      - name: Smoke test plaintext start
+        run: |
+          set -eux
+          BASE="${REGISTRY}/${IMAGE_NAME}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          docker run -d --name qdb-smoke -p 9000:9000 "${BASE}:${TAG}"
+          for i in $(seq 1 60); do
+            curl -sf "http://localhost:9000/exec?query=SELECT+42" >/dev/null && break
+            sleep 2
+          done
+          curl -sf "http://localhost:9000/exec?query=SELECT+42" | grep -q '\[\[42\]\]' \
+            || { echo "=== container log ==="; docker logs qdb-smoke; exit 1; }
+          docker rm -f qdb-smoke
+
+      - name: Smoke test TLS start
+        run: |
+          set -eux
+          BASE="${REGISTRY}/${IMAGE_NAME}"
+          TAG="${{ steps.meta.outputs.tag }}"
+          mkdir -p /tmp/tls /tmp/conf
+          openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+            -subj "/CN=localhost" \
+            -keyout /tmp/tls/server.key -out /tmp/tls/server.crt
+          # The container drops privileges to uid 10001; openssl writes the key
+          # 0600 for the runner user, which leaves it unreadable in-container.
+          chmod 644 /tmp/tls/server.key /tmp/tls/server.crt
+          cat > /tmp/conf/server.conf <<EOF
+          tls.enabled=true
+          tls.cert.path=/etc/questdb/tls/server.crt
+          tls.private.key.path=/etc/questdb/tls/server.key
+          http.bind.to=0.0.0.0:9000
+          EOF
+          docker run -d --name qdb-tls -p 9443:9000 \
+            -v /tmp/tls:/etc/questdb/tls:ro \
+            -v /tmp/conf:/var/lib/questdb/conf \
+            "${BASE}:${TAG}" \
+            -ea -Dnoebug -XX:+UseParallelGC \
+            --sun-misc-unsafe-memory-access=allow --enable-native-access=io.questdb \
+            --add-opens=java.base/java.lang=io.questdb \
+            --add-opens=java.base/java.lang.reflect=io.questdb \
+            --add-opens=java.base/java.nio=io.questdb \
+            --add-opens=java.base/java.time.zone=io.questdb \
+            --add-exports=java.base/jdk.internal.vm=io.questdb \
+            -m io.questdb/io.questdb.tls.TlsServerMain -d /var/lib/questdb
+          for i in $(seq 1 60); do
+            curl -sfk "https://localhost:9443/exec?query=SELECT+42" >/dev/null && break
+            sleep 2
+          done
+          curl -sfk "https://localhost:9443/exec?query=SELECT+42" | grep -q '\[\[42\]\]' \
+            || { echo "=== TLS container log ==="; docker logs qdb-tls; exit 1; }
+          docker rm -f qdb-tls
