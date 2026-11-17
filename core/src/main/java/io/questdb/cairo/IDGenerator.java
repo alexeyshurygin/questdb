@@ -35,6 +35,13 @@ public interface IDGenerator extends Closeable {
 
     void open(Path path);
 
+    /**
+     * Makes sure no id {@code <= minId} is handed out from now on. Replication uses it to keep ids
+     * taken from a primary (table ids, WAL ids) from being issued again after a promotion. Durable
+     * under the generator's commit mode; never lowers the counter.
+     */
+    void advanceTo(long minId);
+
     long getCurrentId();
 
     long getNextId();

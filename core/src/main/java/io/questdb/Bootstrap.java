@@ -88,6 +88,7 @@ public class Bootstrap {
     private static final String PUBLIC_VERSION_TXT = "version.txt";
     private static final String PUBLIC_ZIP = "/io/questdb/site/public.zip";
     private final String banner;
+    private final java.util.Map<String, String> env;
     private final BuildInformation buildInformation;
     private final ServerConfiguration config;
     private final Log log;
@@ -100,11 +101,20 @@ public class Bootstrap {
         this(new PropBootstrapConfiguration(), args);
     }
 
+    /**
+     * The process environment as the bootstrap configuration supplies it; replication reads object
+     * store credentials (AWS_*) from it.
+     */
+    public java.util.Map<String, String> getEnv() {
+        return env;
+    }
+
     public Bootstrap(BootstrapConfiguration bootstrapConfiguration, String... args) {
         if (args.length < 2) {
             throw new BootstrapException("Root directory name expected (-d <root-path>)");
         }
         Os.init();
+        env = bootstrapConfiguration.getEnv();
         banner = bootstrapConfiguration.getBanner();
         microsecondClock = bootstrapConfiguration.getMicrosecondClock();
         buildInformation = new BuildInformationHolder(bootstrapConfiguration.getClass());
@@ -393,6 +403,17 @@ public class Bootstrap {
     }
 
     public CairoEngine newCairoEngine() {
+        final io.questdb.replication.ReplicationConfiguration replicationConfiguration = getConfiguration().getReplicationConfiguration();
+        if (replicationConfiguration.getRole().isEnabled()) {
+            // Partial initialization: the replication service installs its WAL hooks before the engine
+            // envelope runs completeInit(), so that no sequencer opens with the default policy.
+            return new io.questdb.replication.ReplicatedCairoEngine(
+                    getConfiguration().getCairoConfiguration(),
+                    new io.questdb.cairo.wal.QdbrWalLocker(),
+                    durabilityFailureHandler,
+                    replicationConfiguration
+            );
+        }
         return new CairoEngine(
                 getConfiguration().getCairoConfiguration(),
                 new io.questdb.cairo.wal.QdbrWalLocker(),

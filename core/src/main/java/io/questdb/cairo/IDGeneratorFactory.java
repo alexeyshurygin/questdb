@@ -110,6 +110,18 @@ public class IDGeneratorFactory {
         }
 
         @Override
+        public void advanceTo(long minId) {
+            long cur = getCurrentId();
+            while (cur < minId) {
+                final long seen = Os.compareAndSwap(uniqueIdMem, cur, minId);
+                if (seen == cur) {
+                    break;
+                }
+                cur = seen;
+            }
+        }
+
+        @Override
         public long getNextId() {
             long next;
             long x = getCurrentId();
@@ -129,6 +141,22 @@ public class IDGeneratorFactory {
         public SyncIDGenerator(CairoConfiguration configuration, String uniqueIdFileName, int step) {
             super(configuration, uniqueIdFileName);
             this.step = step;
+        }
+
+        @Override
+        public synchronized void advanceTo(long minId) {
+            // the file holds the high-water mark of reserved batches: raise it first, durably, then skip
+            // whatever part of the cached batch it covers
+            if (minId > Unsafe.getLong(uniqueIdMem)) {
+                Unsafe.putLong(uniqueIdMem, minId);
+                configuration.getFilesFacade().msync(uniqueIdMem, uniqueIdMemSize, configuration.getCommitMode() == CommitMode.ASYNC);
+            }
+            if (minId > base.get()) {
+                base.set(minId);
+            }
+            if (minId > end) {
+                end = minId;
+            }
         }
 
         @Override

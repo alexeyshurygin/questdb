@@ -2593,6 +2593,14 @@ public class CairoEngine implements Closeable, WriterSource {
         return LocalDurabilityPolicy.resolveCommitMode(configuration.getCommitMode(), localDurabilityPolicy);
     }
 
+    /**
+     * Replication: keeps the local table id generator above an id the primary chose, so that a later
+     * local CREATE never reuses it.
+     */
+    public void advanceTableIdTo(long minTableId) {
+        tableIdGenerator.advanceTo(minTableId);
+    }
+
     public Lock getRoleSwitchReadLock() {
         return roleSwitchReadLock;
     }

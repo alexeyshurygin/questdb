@@ -43,6 +43,83 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class IDGeneratorTest extends AbstractCairoTest {
 
     @Test
+    public void testAdvanceTo() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int commitMode : new int[]{CommitMode.NOSYNC, CommitMode.ASYNC, CommitMode.SYNC}) {
+                final String fileName = "id_generator_advance_" + commitMode + ".test";
+                final CairoConfiguration config = new CairoConfigurationWrapper(configuration) {
+                    @Override
+                    public int getCommitMode() {
+                        return commitMode;
+                    }
+                };
+                try (IDGenerator generator = IDGeneratorFactory.newIDGenerator(config, fileName, 16)) {
+                    generator.open();
+                    Assert.assertEquals(1, generator.getNextId());
+                    // replication raises the floor to the primary's highest id
+                    generator.advanceTo(100);
+                    Assert.assertEquals(100, generator.getCurrentId());
+                    Assert.assertEquals(101, generator.getNextId());
+                    // never lowers it
+                    generator.advanceTo(50);
+                    Assert.assertEquals(102, generator.getNextId());
+                    generator.advanceTo(102);
+                    Assert.assertEquals(103, generator.getNextId());
+                }
+                // the floor survives a reopen
+                try (IDGenerator generator = IDGeneratorFactory.newIDGenerator(config, fileName, 16)) {
+                    generator.open();
+                    Assert.assertTrue("commitMode=" + commitMode, generator.getNextId() > 103);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testAdvanceToConcurrentWithNextId() throws Exception {
+        assertMemoryLeak(() -> {
+            for (int commitMode : new int[]{CommitMode.NOSYNC, CommitMode.SYNC}) {
+                final CairoConfiguration config = new CairoConfigurationWrapper(configuration) {
+                    @Override
+                    public int getCommitMode() {
+                        return commitMode;
+                    }
+                };
+                try (IDGenerator generator = IDGeneratorFactory.newIDGenerator(config, "id_generator_race_" + commitMode + ".test", 8)) {
+                    generator.open();
+                    final int count = 20_000;
+                    final CyclicBarrier start = new CyclicBarrier(2);
+                    final AtomicInteger errors = new AtomicInteger();
+                    final Thread advancer = new Thread(() -> {
+                        try {
+                            start.await();
+                            for (int i = 1; i <= count; i++) {
+                                generator.advanceTo(i * 2L);
+                            }
+                        } catch (Throwable th) {
+                            errors.incrementAndGet();
+                        }
+                    });
+                    advancer.start();
+                    final LongList ids = new LongList();
+                    start.await();
+                    for (int i = 0; i < count; i++) {
+                        ids.add(generator.getNextId());
+                    }
+                    advancer.join();
+                    Assert.assertEquals(0, errors.get());
+                    // ids stay unique and increasing, and the floor holds
+                    for (int i = 1, n = ids.size(); i < n; i++) {
+                        Assert.assertTrue(ids.getQuick(i) > ids.getQuick(i - 1));
+                    }
+                    Assert.assertTrue(generator.getCurrentId() >= count * 2L);
+                    Assert.assertTrue(generator.getNextId() > count * 2L);
+                }
+            }
+        });
+    }
+
+    @Test
     public void testASyncMode() throws Exception {
         assertMemoryLeak(() -> {
             Set<Long> set = testGenerateId(configuration, CommitMode.ASYNC, 256, 5000);

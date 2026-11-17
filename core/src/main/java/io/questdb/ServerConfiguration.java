@@ -35,6 +35,8 @@ import io.questdb.cutlass.qwp.server.QwpUdpReceiverConfiguration;
 import io.questdb.metrics.MetricsConfiguration;
 import io.questdb.mp.WorkerPool;
 import io.questdb.mp.WorkerPoolConfiguration;
+import io.questdb.replication.ReplicationConfiguration;
+import io.questdb.replication.ReplicationConfigurationImpl;
 import io.questdb.std.str.Utf8StringSink;
 
 public interface ServerConfiguration {
@@ -96,6 +98,13 @@ public interface ServerConfiguration {
 
     default String getReleaseType() {
         return OSS;
+    }
+
+    /**
+     * Replication settings; replication is disabled unless an implementation says otherwise.
+     */
+    default ReplicationConfiguration getReplicationConfiguration() {
+        return new ReplicationConfigurationImpl();
     }
 
     WorkerPoolConfiguration getSharedWorkerPoolNetworkConfiguration();

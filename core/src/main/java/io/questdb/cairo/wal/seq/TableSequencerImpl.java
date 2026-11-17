@@ -193,6 +193,30 @@ public class TableSequencerImpl implements TableSequencer {
             TableToken tableToken,
             int tableId
     ) {
+        createSequencerFiles(
+                configuration,
+                walDirectoryPolicy,
+                path,
+                tableStruct,
+                tableToken,
+                tableId,
+                configuration.getMicrosecondClock().getTicks()
+        );
+    }
+
+    /**
+     * Creates sequencer files with a given table create timestamp; replication creates a replica's
+     * copy of a table with the primary's create timestamp.
+     */
+    public static void createSequencerFiles(
+            CairoConfiguration configuration,
+            WalDirectoryPolicy walDirectoryPolicy,
+            Path path,
+            TableStructure tableStruct,
+            TableToken tableToken,
+            int tableId,
+            long createTimestamp
+    ) {
         final int tableDirLen = path.size();
         final int rootLen = path.concat(SEQ_DIR).size();
         try (
@@ -215,7 +239,7 @@ public class TableSequencerImpl implements TableSequencer {
                     tableStruct,
                     tableToken,
                     tableId,
-                    configuration.getMicrosecondClock().getTicks()
+                    createTimestamp
             );
         } finally {
             path.trimTo(tableDirLen);
@@ -275,6 +299,10 @@ public class TableSequencerImpl implements TableSequencer {
         metadata.dropTable();
         notifyTxnCommitted(Long.MAX_VALUE);
         engine.getWalListener().tableDropped(tableToken, txn, timestamp);
+    }
+
+    public void advanceWalIdTo(long minWalId) {
+        walIdGenerator.advanceTo(minWalId);
     }
 
     public int getCurrentWalId() {
@@ -447,6 +475,14 @@ public class TableSequencerImpl implements TableSequencer {
 
     @Override
     public long nextStructureTxn(long expectedStructureVersion, TableMetadataChange change) {
+        return nextStructureTxn(expectedStructureVersion, change, Long.MIN_VALUE);
+    }
+
+    /**
+     * Appends a structural change. Replication passes the primary's commit timestamp, so a replica's
+     * log records the same commit times; {@link Long#MIN_VALUE} stamps the local clock.
+     */
+    public long nextStructureTxn(long expectedStructureVersion, TableMetadataChange change, long commitTimestamp) {
         // Writing to TableSequencer can happen from multiple threads, so we need to protect against concurrent writes.
         assert !closed;
         checkDropped();
@@ -455,7 +491,7 @@ public class TableSequencerImpl implements TableSequencer {
         try {
             // From sequencer perspective metadata version is the same as column structure version
             if (metadata.getMetadataVersion() == expectedStructureVersion) {
-                final long timestamp = microClock.getTicks();
+                final long timestamp = commitTimestamp == Long.MIN_VALUE ? microClock.getTicks() : commitTimestamp;
                 // Local commits keep the configured grade, including on a replica.
                 final int commitMode = engine.getConfiguration().getCommitMode();
                 final boolean isDurableMode = commitMode == CommitMode.ADAPTIVE || commitMode == CommitMode.SYNC;
@@ -552,6 +588,35 @@ public class TableSequencerImpl implements TableSequencer {
             long txnMaxTimestamp,
             long txnRowCount
     ) {
+        return nextTxnIfLastTxn(
+                expectedLastTxn,
+                expectedStructureVersion,
+                walId,
+                segmentId,
+                segmentTxn,
+                Long.MIN_VALUE,
+                txnMinTimestamp,
+                txnMaxTimestamp,
+                txnRowCount
+        );
+    }
+
+    /**
+     * Appends a data transaction. Replication passes the primary's commit timestamp, so that a replica
+     * applies SQL transactions with the same {@code now()} as the primary; {@link Long#MIN_VALUE}
+     * stamps the local clock.
+     */
+    public long nextTxnIfLastTxn(
+            long expectedLastTxn,
+            long expectedStructureVersion,
+            int walId,
+            int segmentId,
+            int segmentTxn,
+            long commitTimestamp,
+            long txnMinTimestamp,
+            long txnMaxTimestamp,
+            long txnRowCount
+    ) {
         // TableSequencerAPI holds the sequencer write lock across this check and transaction-log append.
         assert !closed;
         checkDropped();
@@ -560,7 +625,7 @@ public class TableSequencerImpl implements TableSequencer {
             return FENCE_REJECTED;
         }
         long txn;
-        final long timestamp = microClock.getTicks();
+        final long timestamp = commitTimestamp == Long.MIN_VALUE ? microClock.getTicks() : commitTimestamp;
         try {
             // From sequencer perspective metadata version is the same as column structure version.
             if (metadata.getMetadataVersion() == expectedStructureVersion) {

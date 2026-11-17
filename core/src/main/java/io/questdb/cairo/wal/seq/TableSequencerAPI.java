@@ -107,6 +107,20 @@ public class TableSequencerAPI implements QuietCloseable {
         }
     }
 
+    /**
+     * Replication: keeps the table's WAL id generator above a WAL id the primary used, so that after a
+     * promotion no local writer reuses a WAL directory the old primary wrote.
+     */
+    public void advanceWalIdTo(final TableToken tableToken, long minWalId) {
+        try (TableSequencerImpl tableSequencer = openSequencerLocked(tableToken, SequencerLockType.READ)) {
+            try {
+                tableSequencer.advanceWalIdTo(minWalId);
+            } finally {
+                tableSequencer.unlockRead();
+            }
+        }
+    }
+
     public void dropTable(TableToken tableToken, boolean failedCreate) {
         LOG.info().$("dropping wal table [table=").$(tableToken).I$();
         try (TableSequencerImpl seq = openSequencerLocked(tableToken, SequencerLockType.WRITE)) {
@@ -390,6 +404,73 @@ public class TableSequencerAPI implements QuietCloseable {
                 tableSequencer.unlockWrite();
             }
             return txn;
+        }
+    }
+
+    /**
+     * Replication apply: appends a structural change shipped from the primary as transaction
+     * {@code expectedLastTxn + 1}, with the primary's commit timestamp.
+     *
+     * @return the new txn, {@link TableSequencer#FENCE_REJECTED} when the log does not end at
+     * {@code expectedLastTxn}, or {@link TableSequencer#NO_TXN} when the structure version differs
+     */
+    public long nextReplicatedStructureTxn(
+            final TableToken tableToken,
+            long expectedLastTxn,
+            long structureVersion,
+            AlterOperation alterOp,
+            long commitTimestamp
+    ) {
+        try (TableSequencerImpl tableSequencer = openSequencerLocked(tableToken, SequencerLockType.WRITE)) {
+            try {
+                if (tableSequencer.lastTxn() != expectedLastTxn) {
+                    return TableSequencer.FENCE_REJECTED;
+                }
+                return tableSequencer.nextStructureTxn(structureVersion, alterOp, commitTimestamp);
+            } finally {
+                tableSequencer.unlockWrite();
+            }
+        }
+    }
+
+    /**
+     * Replication apply: appends a data transaction shipped from the primary as transaction
+     * {@code expectedLastTxn + 1}, with the primary's commit timestamp, WAL coordinates and statistics.
+     *
+     * @return the new txn, {@link TableSequencer#FENCE_REJECTED} when the log does not end at
+     * {@code expectedLastTxn}, or {@link TableSequencer#NO_TXN} when the structure version differs
+     */
+    public long nextReplicatedTxn(
+            final TableToken tableToken,
+            long expectedLastTxn,
+            int walId,
+            long expectedSchemaVersion,
+            int segmentId,
+            int segmentTxn,
+            long commitTimestamp,
+            long txnMinTimestamp,
+            long txnMaxTimestamp,
+            long txnRowCount
+    ) {
+        try (TableSequencerImpl tableSequencer = openSequencerLocked(tableToken, SequencerLockType.WRITE)) {
+            try {
+                if (!tableSequencer.getTableToken().equals(tableToken)) {
+                    throw TableReferenceOutOfDateException.of(tableToken);
+                }
+                return tableSequencer.nextTxnIfLastTxn(
+                        expectedLastTxn,
+                        expectedSchemaVersion,
+                        walId,
+                        segmentId,
+                        segmentTxn,
+                        commitTimestamp,
+                        txnMinTimestamp,
+                        txnMaxTimestamp,
+                        txnRowCount
+                );
+            } finally {
+                tableSequencer.unlockWrite();
+            }
         }
     }
 
