@@ -34,11 +34,23 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
 import java.io.IOException;
+import java.net.Authenticator;
+import java.net.CookieHandler;
+import java.net.ProxySelector;
 import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static io.questdb.test.replication.store.FsObjectStoreTest.assertFails;
@@ -181,6 +193,78 @@ public class S3CredentialsTest {
         Assert.assertEquals(FakeImdsServer.SECRET_PREFIX + 2, second.getSecretAccessKey());
         Assert.assertEquals(FakeImdsServer.SESSION_TOKEN_PREFIX + 2, second.getSessionToken());
         Assert.assertEquals(6, imds.getRequests().size());
+    }
+
+    @Test
+    public void testImdsClientTimeout() {
+        // the client's own request timeout races with the provider's, and means the same
+        final HttpClient timingOut = new HttpClient() {
+            @Override
+            public Optional<Authenticator> authenticator() {
+                return httpClient.authenticator();
+            }
+
+            @Override
+            public Optional<Duration> connectTimeout() {
+                return httpClient.connectTimeout();
+            }
+
+            @Override
+            public Optional<CookieHandler> cookieHandler() {
+                return httpClient.cookieHandler();
+            }
+
+            @Override
+            public Optional<Executor> executor() {
+                return httpClient.executor();
+            }
+
+            @Override
+            public Redirect followRedirects() {
+                return httpClient.followRedirects();
+            }
+
+            @Override
+            public Optional<ProxySelector> proxy() {
+                return httpClient.proxy();
+            }
+
+            @Override
+            public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+                throw new UnsupportedOperationException();
+            }
+
+            @Override
+            public <T> CompletableFuture<HttpResponse<T>> sendAsync(HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+                return CompletableFuture.failedFuture(new HttpTimeoutException("request timed out"));
+            }
+
+            @Override
+            public <T> CompletableFuture<HttpResponse<T>> sendAsync(
+                    HttpRequest request,
+                    HttpResponse.BodyHandler<T> handler,
+                    HttpResponse.PushPromiseHandler<T> pushPromiseHandler
+            ) {
+                return sendAsync(request, handler);
+            }
+
+            @Override
+            public SSLContext sslContext() {
+                return httpClient.sslContext();
+            }
+
+            @Override
+            public SSLParameters sslParameters() {
+                return httpClient.sslParameters();
+            }
+
+            @Override
+            public Version version() {
+                return httpClient.version();
+            }
+        };
+        assertFails(ObjectStoreException.Kind.RETRYABLE, 0, "EC2 instance metadata request timed out [path=/latest/api/token, timeout=150ms]",
+                () -> new S3ImdsCredentialsProvider(timingOut, imds.getEndpoint(), 150, clock::get).getCredentials());
     }
 
     @Test
