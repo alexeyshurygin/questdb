@@ -48,6 +48,7 @@ import io.questdb.std.QuietCloseable;
 import io.questdb.std.str.Path;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -132,6 +133,7 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private final ThreadLocal<ReplicationWorker> workerSlot = new ThreadLocal<>();
     private io.questdb.replication.codec.CheckpointHistory checkpointHistory;
     private volatile Runnable closeHook;
+    private volatile Runnable engineCloseHook;
     // when close() began waiting for the coordinator, on System.nanoTime(); 0 until then
     private volatile long closeStartedNanos;
     private volatile long epoch;
@@ -468,6 +470,15 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     }
 
     /**
+     * Runs as the engine's close starts waiting for the replication threads, while it holds the lock those
+     * threads need to give their uses back.
+     */
+    @TestOnly
+    public void setEngineCloseHookForTesting(Runnable hook) {
+        this.engineCloseHook = hook;
+    }
+
+    /**
      * Test seam: how long the lease keeper keeps renewing the lease while neither the coordinator nor
      * its upload and cleanup requests make progress.
      */
@@ -618,6 +629,11 @@ public class ReplicationService implements QuietCloseable, ReplicationWalListene
     private boolean awaitThreadsEnd() {
         final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(requestTimeLimitMillis());
         synchronized (useLock) {
+            final Runnable hook = engineCloseHook;
+            if (hook != null) {
+                // runs under useLock: a thread giving its use back waits until the close waits too
+                hook.run();
+            }
             try {
                 // before close() gave its use back, a count of one is that use
                 while (isCloseUseReleased ? !isSharedFreed : useCount > 1) {

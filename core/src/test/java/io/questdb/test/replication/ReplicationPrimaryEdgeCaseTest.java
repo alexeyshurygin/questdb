@@ -415,13 +415,13 @@ public class ReplicationPrimaryEdgeCaseTest extends AbstractTest {
                 Assert.assertTrue(runInterrupted(node.service::close));
                 Assert.assertTrue(coordinator.get().isAlive());
 
-                // the server closes the engine next, and the coordinator goes on meanwhile
+                // the server closes the engine next; the coordinator goes on only once that close is waiting
+                node.service.setEngineCloseHookForTesting(resume::countDown);
                 final Thread closer = new Thread(() -> {
                     node.engine.close();
                     Path.clearThreadLocals();
                 }, "test-engine-closer");
                 closer.start();
-                resume.countDown();
                 closer.join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));
                 Assert.assertFalse(closer.isAlive());
                 coordinator.get().join(TimeUnit.SECONDS.toMillis(WAIT_SECONDS));

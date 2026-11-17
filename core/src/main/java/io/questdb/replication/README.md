@@ -106,7 +106,8 @@ a starting primary and the replica role on replicas and fenced nodes. Queries
 work in every role, from the node's local tables. Live views, system tables and
 non-WAL tables stay writable at the engine on every node; SQL still refuses an
 INSERT on a read-only node. With an empty `cairo.system.table.prefix` no table
-is a system table: every WAL table replicates.
+is a system table: every WAL table replicates, except views, materialized views
+and live views.
 
 ## Object store layout
 
@@ -237,8 +238,9 @@ A graceful stop releases the lease only when every table is in the store. A
 new table whose upload cannot be set up while its directory exists (an
 unreadable sequencer log, say) is retried every throttle window with an error
 in the log, and keeps every stop from releasing the lease: until the table is
-repaired or dropped, the next primary waits three keepalive intervals for the
-lease to expire, the restarted node included.
+repaired or dropped, another node that becomes the primary waits three
+keepalive intervals for the lease to expire. The same node restarting keeps its
+instance id and takes its own lease back at once.
 
 A stop waits for the replication coordinator for three
 `replication.requests.base.timeout` intervals (5 s at least), interrupts it and
