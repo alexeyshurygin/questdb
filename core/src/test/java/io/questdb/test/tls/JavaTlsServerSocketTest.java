@@ -47,11 +47,17 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.rules.Timeout;
 
+import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLContextSpi;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLServerSocketFactory;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSessionContext;
 import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 import java.io.ByteArrayOutputStream;
@@ -70,6 +76,7 @@ import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.UnaryOperator;
 
 import static org.junit.Assert.*;
 
@@ -226,6 +233,27 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testCloseDoesNotSpinOnEngineThatWrapsNothingToCloseWith() throws Exception {
+        // close() wraps until the engine's outbound side is done. An engine that is never done, and wraps nothing,
+        // would keep close() spinning: close() stops, and still closes the fd and frees every buffer.
+        final var engine = new ScriptedEngine();
+        assertWithMemoryHandshake(engine.context(), -1, TLS_13, (client, server, transport, buf) -> {
+            engine.isOutboundNeverDone = true;
+            engine.wrapStep = (delegate, src, dst) -> new SSLEngineResult(
+                    SSLEngineResult.Status.CLOSED,
+                    SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                    0,
+                    0
+            );
+            final var sentBefore = transport.toClient.totalWritten;
+            server.close();
+            assertTrue(server.isClosed());
+            assertFalse(server.isTlsSessionStarted());
+            assertEquals("nothing was wrapped, so nothing goes out", sentBefore, transport.toClient.totalWritten);
+        });
+    }
+
+    @Test
     public void testCloseDuringHandshakeReleasesResources() throws Exception {
         Assume.assumeTrue("openssl not available", opensslAvailable);
         TestUtils.assertMemoryLeak(() -> {
@@ -325,6 +353,76 @@ public class JavaTlsServerSocketTest {
             record[record.length - 1] ^= 1; // breaks the record's authentication tag
             client.writeRaw(record);
             assertEquals(-1, recvUntilNonZero(server, buf, 4096));
+        });
+    }
+
+    @Test
+    public void testEngineClosedOnHandshakeWrapSendsItsAlertAndFailsStart() throws Exception {
+        // An engine that closes on a handshake wrap has wrapped a fatal alert: the socket sends the alert on a
+        // best-effort basis and fails the handshake.
+        final byte[] alert = {0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28}; // fatal handshake_failure
+        final var engine = new ScriptedEngine();
+        engine.wrapStep = (delegate, src, dst) -> {
+            dst.put(alert);
+            return new SSLEngineResult(SSLEngineResult.Status.CLOSED, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 0, alert.length);
+        };
+        assertWithMemoryConnection(engine.context(), TLS_13, (client, server, transport, buf) -> {
+            // the ClientHello
+            client.pump();
+            try {
+                server.startTlsSession(null);
+                fail("the handshake must fail");
+            } catch (TlsSessionInitFailedException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "TLS handshake failed: engine closed");
+            }
+            assertFalse(server.isTlsSessionStarted());
+            client.pump();
+            assertArrayEquals("the alert goes out", alert, client.wire());
+            assertNotNull("the client reads the alert", client.failure);
+            TestUtils.assertContains(client.failure.getMessage(), "handshake_failure");
+        });
+    }
+
+    @Test
+    public void testEngineResultsWithoutProgressFailRecv() throws Exception {
+        // An engine that waits for handshake input after the handshake, or that neither consumes nor produces a
+        // byte, would keep recv() spinning: recv() gives the connection up instead, as on a renegotiation attempt.
+        final SSLEngineResult[] results = {
+                new SSLEngineResult(SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NEED_UNWRAP, 0, 0),
+                new SSLEngineResult(SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NEED_UNWRAP_AGAIN, 0, 0),
+                new SSLEngineResult(SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 0, 0),
+        };
+        for (var result : results) {
+            final var engine = new ScriptedEngine();
+            assertWithMemoryHandshake(engine.context(), -1, TLS_13, (client, server, transport, buf) -> {
+                engine.unwrapStep = (delegate, src, dst) -> result;
+                client.write("data".getBytes(StandardCharsets.UTF_8));
+                assertEquals(result.getHandshakeStatus().name(), -1, server.recv(buf, MEMORY_BUF_SIZE));
+            });
+        }
+    }
+
+    @Test
+    public void testEngineThatNeverCompletesRecordStopsGrowingInputAtCap() throws Exception {
+        // An engine that keeps asking for the rest of a record makes recv() grow the input buffer, which a buffer
+        // full of one incomplete record needs. The growth stops at 1 MiB, far above any TLS record: there recv()
+        // gives the connection up instead of buffering whatever the peer sends.
+        final var initialSize = 64 * 1024;
+        final var cap = 1024 * 1024;
+        final var engine = new ScriptedEngine();
+        assertWithMemoryHandshake(engine.context(), initialSize, TLS_13, (client, server, transport, buf) -> {
+            engine.unwrapStep = (delegate, src, dst) -> new SSLEngineResult(
+                    SSLEngineResult.Status.BUFFER_UNDERFLOW,
+                    SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                    0,
+                    0
+            );
+            final var bytes = new byte[2 * cap];
+            transport.toServer.append(bytes, 0, bytes.length);
+            final var tlsMem = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            assertEquals(-1, server.recv(buf, MEMORY_BUF_SIZE));
+            assertEquals("the input buffer grows to the cap", cap - initialSize, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS) - tlsMem);
+            assertEquals("recv() reads no more than the cap holds", bytes.length - cap, transport.toServer.available());
         });
     }
 
@@ -574,6 +672,67 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testHandshakeEndSeenOnlyAtApplicationDataStillHandsOverData() throws Exception {
+        // An engine that goes on asking for handshake input after the handshake has ended learns otherwise from the
+        // next record: application data, which it cannot unwrap without room for plaintext. The socket takes that
+        // for the end of the handshake, and the same recv() unwraps the record into the caller's buffer.
+        final var engine = new ScriptedEngine();
+        final var isEndHidden = new AtomicBoolean(true);
+        engine.handshakeStatusMapper = status -> isEndHidden.get()
+                && (status == SSLEngineResult.HandshakeStatus.FINISHED || status == SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING)
+                ? SSLEngineResult.HandshakeStatus.NEED_UNWRAP
+                : status;
+        engine.unwrapStep = (delegate, src, dst) -> {
+            final var result = delegate.unwrap(src, dst);
+            if (result.getStatus() == SSLEngineResult.Status.BUFFER_OVERFLOW) {
+                isEndHidden.set(false);
+            }
+            return result;
+        };
+        assertWithMemoryConnection(engine.context(), TLS_13, (client, server, transport, buf) -> {
+            server.startTlsSession(null);
+            stepUntilClientFinished(client, server, buf);
+            assertEquals(0, server.recv(buf, MEMORY_BUF_SIZE));
+            assertTrue("the engine still asks for handshake input", server.isHandshakeInProgress());
+            client.pump();
+            client.assertHealthy();
+            final var data = "first data".getBytes(StandardCharsets.UTF_8);
+            client.write(data);
+            assertEquals(data.length, server.recv(buf, MEMORY_BUF_SIZE));
+            assertNativeBytes(data, buf);
+            assertFalse(server.isHandshakeInProgress());
+            assertFalse("the engine no longer hides the end of the handshake", isEndHidden.get());
+        });
+    }
+
+    @Test
+    public void testHandshakeEndSeenOnlyInEngineStateStillHandsOverBufferedData() throws Exception {
+        // As in testTicketPartlySentStillHandsOverBufferedData, but no wrap result reports FINISHED: that the engine
+        // no longer handshakes after it wrapped its last handshake output must complete the handshake just the same,
+        // with that output partly unsent, so that recv() returns the data behind the client's Finished.
+        final var engine = new ScriptedEngine();
+        engine.handshakeStatusMapper = status -> status == SSLEngineResult.HandshakeStatus.FINISHED
+                ? SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING
+                : status;
+        assertWithMemoryConnection(engine.context(), TLS_13, (client, server, transport, buf) -> {
+            server.startTlsSession(null);
+            stepUntilClientFinished(client, server, buf);
+            final var data = "behind the Finished".getBytes(StandardCharsets.UTF_8);
+            client.write(data);
+            transport.sendBudget = 7;
+            assertEquals(data.length, server.recv(buf, MEMORY_BUF_SIZE));
+            assertNativeBytes(data, buf);
+            assertFalse(server.isHandshakeInProgress());
+            assertTrue("the rest of the last handshake output waits in the output buffer", server.wantsTlsWrite());
+            transport.sendBudget = Long.MAX_VALUE;
+            assertEquals(0, server.tlsIO(Socket.WRITE_FLAG));
+            assertFalse(server.wantsTlsWrite());
+            client.pump();
+            client.assertHealthy();
+        });
+    }
+
+    @Test
     public void testHandshakeFailureClearsSslEngine() throws Exception {
         Assume.assumeTrue("openssl not available", opensslAvailable);
         TestUtils.assertMemoryLeak(() -> {
@@ -743,6 +902,58 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testKeyUpdateAnswerGrowsEmptyOutputBufferOnEngineRequest() throws Exception {
+        // The JDK engine wraps the answer to a key update into any output buffer that holds one packet, and the
+        // handshake grows the buffer to that size. An engine that asks for more room on an empty buffer gets it:
+        // recv() doubles the buffer and wraps the answer again.
+        final var engine = new ScriptedEngine();
+        final var packetSize = packetBufferSize();
+        assertWithMemoryHandshake(engine.context(), packetSize, TLS_13, (client, server, transport, buf) -> {
+            engine.wrapStep = (delegate, src, dst) -> {
+                engine.wrapStep = null;
+                return new SSLEngineResult(SSLEngineResult.Status.BUFFER_OVERFLOW, delegate.getHandshakeStatus(), 0, 0);
+            };
+            final var wireBefore = client.wireSize();
+            final var tlsMem = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            client.keyUpdate();
+            assertEquals("a key update carries no data", 0, server.recv(buf, MEMORY_BUF_SIZE));
+            assertEquals("the output buffer doubles", packetSize, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS) - tlsMem);
+            assertTrue("the answer waits in the output buffer", server.wantsTlsWrite());
+            assertEquals(0, server.tlsIO(Socket.WRITE_FLAG));
+            assertFalse(server.wantsTlsWrite());
+            client.pump();
+            client.assertHealthy();
+            assertEquals("one answer", 1, countRecords(client.wire(), wireBefore));
+        });
+    }
+
+    @Test
+    public void testKeyUpdateAnswerNotProducedDoesNotSpinRecv() throws Exception {
+        // An engine that owes the answer to a key update, yet wraps nothing when asked for it, would keep recv()
+        // asking. recv() goes on instead, and the answer goes out once the engine wraps it, behind the next record.
+        final var engine = new ScriptedEngine();
+        assertWithMemoryHandshake(engine.context(), -1, TLS_13, (client, server, transport, buf) -> {
+            engine.wrapStep = (delegate, src, dst) -> {
+                engine.wrapStep = null;
+                return new SSLEngineResult(SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NEED_WRAP, 0, 0);
+            };
+            final var wireBefore = client.wireSize();
+            client.keyUpdate();
+            assertEquals("a key update carries no data", 0, server.recv(buf, MEMORY_BUF_SIZE));
+            assertFalse("the engine wrapped no answer", server.wantsTlsWrite());
+            final var data = "next".getBytes(StandardCharsets.UTF_8);
+            client.write(data);
+            assertEquals(data.length, server.recv(buf, MEMORY_BUF_SIZE));
+            assertNativeBytes(data, buf);
+            assertTrue("the answer waits in the output buffer", server.wantsTlsWrite());
+            assertEquals(0, server.tlsIO(Socket.WRITE_FLAG));
+            client.pump();
+            client.assertHealthy();
+            assertEquals("one answer", 1, countRecords(client.wire(), wireBefore));
+        });
+    }
+
+    @Test
     public void testKeyUpdateAnswersGrowBufferConfiguredSmall() throws Exception {
         // In a buffer configured to one packet the second answer to a key update no longer fits behind the first.
         // With the socket taking nothing, the buffer grows rather than giving the connection up, and the answers go
@@ -839,6 +1050,31 @@ public class JavaTlsServerSocketTest {
             client.pump();
             client.assertHealthy();
             assertArrayEquals(after, client.plaintext());
+        });
+    }
+
+    @Test
+    public void testKeyUpdateOwedBySendGoesOutAheadOfData() throws Exception {
+        // A TLS 1.3 engine that owes the peer a key update wraps it ahead of the data send() gives it, and consumes
+        // none of the data on that wrap. send() goes on to the data. When the socket takes only part of the key
+        // update, send() reports nothing sent, since none of the data is encrypted yet.
+        final var engine = new ScriptedEngine();
+        assertWithMemoryHandshake(engine.context(), -1, TLS_13, (client, server, transport, buf) -> {
+            final var wireBefore = client.wireSize();
+            // on an established TLS 1.3 session the engine queues a key update
+            engine.delegate.beginHandshake();
+            final var data = pattern(100, 0);
+            putBytes(buf, data);
+            transport.sendBudget = 5;
+            assertEquals("the socket took part of the key update and none of the data", 0, server.send(buf, data.length));
+            assertTrue(server.wantsTlsWrite());
+            transport.sendBudget = Long.MAX_VALUE;
+            assertEquals(data.length, server.send(buf, data.length));
+            assertFalse(server.wantsTlsWrite());
+            client.pump();
+            client.assertHealthy();
+            assertArrayEquals(data, client.plaintext());
+            assertEquals("the key update, then the data", 2, countRecords(client.wire(), wireBefore));
         });
     }
 
@@ -1103,6 +1339,30 @@ public class JavaTlsServerSocketTest {
             client.assertHealthy();
             assertArrayEquals(concat(firstAndSecond, third), client.plaintext());
             assertEquals("one record per send() that encrypted", 3, countRecords(client.wire(), wireBefore));
+        });
+    }
+
+    @Test
+    public void testSendGrowsOutputBufferOnEngineRequest() throws Exception {
+        // The handshake grows the output buffer to the packet size the JDK engine wraps every record into. An engine
+        // whose records outgrow it after the handshake asks for room when send() wraps data: send() doubles the
+        // buffer and wraps again.
+        final var engine = new ScriptedEngine();
+        final var packetSize = packetBufferSize();
+        assertWithMemoryHandshake(engine.context(), packetSize, TLS_13, (client, server, transport, buf) -> {
+            engine.wrapStep = (delegate, src, dst) -> {
+                engine.wrapStep = null;
+                return new SSLEngineResult(SSLEngineResult.Status.BUFFER_OVERFLOW, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 0, 0);
+            };
+            final var tlsMem = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
+            final var data = pattern(100, 0);
+            putBytes(buf, data);
+            assertEquals(data.length, server.send(buf, data.length));
+            assertEquals("the output buffer doubles", packetSize, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS) - tlsMem);
+            assertFalse(server.wantsTlsWrite());
+            client.pump();
+            client.assertHealthy();
+            assertArrayEquals(data, client.plaintext());
         });
     }
 
@@ -1463,36 +1723,20 @@ public class JavaTlsServerSocketTest {
     }
 
     /**
-     * Runs {@code scenario} on a TLS connection that lives in the test: the socket reads and writes through a
+     * Runs {@code scenario} on a connection that lives in the test: the socket reads and writes through a
      * {@link MemoryTransport}, and a JDK {@link SSLEngine} client sits on its other end, so every byte that moves is
-     * the test's decision and nothing depends on timing. The handshake is complete when the scenario starts. The
-     * connection is closed after it, and close() must close the fd once and free every TLS buffer.
-     *
-     * @param bufferSize the size the socket starts its buffers at, or -1 for the default
+     * the test's decision and nothing depends on timing. The TLS session has not started when the scenario starts.
+     * The connection is closed after it, and close() must close the fd once and free every TLS buffer.
      */
-    private static void assertWithMemoryHandshake(int bufferSize, String clientProtocol, MemoryScenario scenario) throws Exception {
+    private static void assertWithMemoryConnection(SSLContext serverContext, String clientProtocol, MemoryScenario scenario) throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final var transport = new MemoryTransport();
-            final var server = new JavaTlsServerSocket(transport, LOG, TlsFuzzSupport.newServerContext());
+            final var server = new JavaTlsServerSocket(transport, LOG, serverContext);
             final var client = new MemoryClient(TlsFuzzSupport.newTrustAllContext(), transport, clientProtocol);
             final var tlsMemBefore = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS);
             final var buf = Unsafe.malloc(MEMORY_BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
             try {
                 server.of(MEMORY_FD);
-                startTls(server, bufferSize);
-                for (var steps = 0; !client.isHandshakeDone() || server.isHandshakeInProgress(); steps++) {
-                    assertTrue("the handshake did not complete", steps < 1_000);
-                    client.pump();
-                    client.assertHealthy();
-                    assertEquals("no application data during the handshake", 0, server.recv(buf, MEMORY_BUF_SIZE));
-                    if (server.wantsTlsWrite()) {
-                        assertEquals(0, server.tlsIO(Socket.WRITE_FLAG));
-                    }
-                }
-                // the client takes what the server sends when its side of the handshake ends: the TLS 1.3 session
-                // ticket
-                client.pump();
-                client.assertHealthy();
                 scenario.run(client, server, transport, buf);
             } finally {
                 Unsafe.free(buf, MEMORY_BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
@@ -1500,6 +1744,35 @@ public class JavaTlsServerSocketTest {
             }
             assertEquals("close() must close the fd exactly once", 1, transport.closeCalls);
             assertEquals("close() must free every TLS buffer", tlsMemBefore, Unsafe.getMemUsedByTag(MemoryTag.NATIVE_TLS_RSS));
+        });
+    }
+
+    private static void assertWithMemoryHandshake(int bufferSize, String clientProtocol, MemoryScenario scenario) throws Exception {
+        assertWithMemoryHandshake(TlsFuzzSupport.newServerContext(), bufferSize, clientProtocol, scenario);
+    }
+
+    /**
+     * Runs {@code scenario} as {@link #assertWithMemoryConnection} does, with the handshake complete when the
+     * scenario starts.
+     *
+     * @param bufferSize the size the socket starts its buffers at, or -1 for the default
+     */
+    private static void assertWithMemoryHandshake(SSLContext serverContext, int bufferSize, String clientProtocol, MemoryScenario scenario) throws Exception {
+        assertWithMemoryConnection(serverContext, clientProtocol, (client, server, transport, buf) -> {
+            startTls(server, bufferSize);
+            for (var steps = 0; !client.isHandshakeDone() || server.isHandshakeInProgress(); steps++) {
+                assertTrue("the handshake did not complete", steps < 1_000);
+                client.pump();
+                client.assertHealthy();
+                assertEquals("no application data during the handshake", 0, server.recv(buf, MEMORY_BUF_SIZE));
+                if (server.wantsTlsWrite()) {
+                    assertEquals(0, server.tlsIO(Socket.WRITE_FLAG));
+                }
+            }
+            // the client takes what the server sends when its side of the handshake ends: the TLS 1.3 session ticket
+            client.pump();
+            client.assertHealthy();
+            scenario.run(client, server, transport, buf);
         });
     }
 
@@ -1691,6 +1964,21 @@ public class JavaTlsServerSocketTest {
         }
     }
 
+    /**
+     * Steps the handshake until the client has sent its Finished, which the server has not read yet.
+     */
+    private static void stepUntilClientFinished(MemoryClient client, JavaTlsServerSocket server, long buf) {
+        for (var steps = 0; ; steps++) {
+            assertTrue("the client's side of the handshake did not complete", steps < 1_000);
+            client.pump();
+            client.assertHealthy();
+            if (client.isHandshakeDone()) {
+                return;
+            }
+            assertEquals("no application data during the handshake", 0, server.recv(buf, MEMORY_BUF_SIZE));
+        }
+    }
+
     private static SSLContext trustAllContext() throws Exception {
         final var context = SSLContext.getInstance("TLS");
         context.init(null, new TrustManager[]{new X509TrustManager() {
@@ -1708,6 +1996,11 @@ public class JavaTlsServerSocketTest {
             }
         }}, new SecureRandom());
         return context;
+    }
+
+    @FunctionalInterface
+    private interface EngineStep {
+        SSLEngineResult apply(SSLEngine engine, ByteBuffer src, ByteBuffer dst) throws SSLException;
     }
 
     @FunctionalInterface
@@ -2212,6 +2505,210 @@ public class JavaTlsServerSocketTest {
                 shutdownWriteCalls++;
             }
             return 0;
+        }
+    }
+
+    /**
+     * A server engine that passes every call to a JDK engine, except where a test scripts it: a step decides the
+     * result of a wrap or unwrap, and a mapper changes the handshake status the engine reports. The JDK engine never
+     * gives the socket such results; the steps stand in for an engine that does.
+     */
+    private static final class ScriptedEngine extends SSLEngine {
+        final SSLEngine delegate;
+        // maps the handshake status the engine reports, in results and from getHandshakeStatus(); null keeps it
+        UnaryOperator<SSLEngineResult.HandshakeStatus> handshakeStatusMapper;
+        // makes isOutboundDone() report false, whatever the engine's state
+        boolean isOutboundNeverDone;
+        // decides the results of unwrap(src, dst) in place of the engine; null passes the calls on
+        EngineStep unwrapStep;
+        // decides the results of wrap(src, dst) in place of the engine; null passes the calls on
+        EngineStep wrapStep;
+
+        ScriptedEngine() throws Exception {
+            delegate = TlsFuzzSupport.newServerContext().createSSLEngine();
+        }
+
+        @Override
+        public void beginHandshake() throws SSLException {
+            delegate.beginHandshake();
+        }
+
+        @Override
+        public void closeInbound() throws SSLException {
+            delegate.closeInbound();
+        }
+
+        @Override
+        public void closeOutbound() {
+            delegate.closeOutbound();
+        }
+
+        @Override
+        public Runnable getDelegatedTask() {
+            return delegate.getDelegatedTask();
+        }
+
+        @Override
+        public boolean getEnableSessionCreation() {
+            return delegate.getEnableSessionCreation();
+        }
+
+        @Override
+        public String[] getEnabledCipherSuites() {
+            return delegate.getEnabledCipherSuites();
+        }
+
+        @Override
+        public String[] getEnabledProtocols() {
+            return delegate.getEnabledProtocols();
+        }
+
+        @Override
+        public SSLEngineResult.HandshakeStatus getHandshakeStatus() {
+            return map(delegate.getHandshakeStatus());
+        }
+
+        @Override
+        public boolean getNeedClientAuth() {
+            return delegate.getNeedClientAuth();
+        }
+
+        @Override
+        public SSLSession getSession() {
+            return delegate.getSession();
+        }
+
+        @Override
+        public String[] getSupportedCipherSuites() {
+            return delegate.getSupportedCipherSuites();
+        }
+
+        @Override
+        public String[] getSupportedProtocols() {
+            return delegate.getSupportedProtocols();
+        }
+
+        @Override
+        public boolean getUseClientMode() {
+            return delegate.getUseClientMode();
+        }
+
+        @Override
+        public boolean getWantClientAuth() {
+            return delegate.getWantClientAuth();
+        }
+
+        @Override
+        public boolean isInboundDone() {
+            return delegate.isInboundDone();
+        }
+
+        @Override
+        public boolean isOutboundDone() {
+            return !isOutboundNeverDone && delegate.isOutboundDone();
+        }
+
+        @Override
+        public void setEnableSessionCreation(boolean flag) {
+            delegate.setEnableSessionCreation(flag);
+        }
+
+        @Override
+        public void setEnabledCipherSuites(String[] suites) {
+            delegate.setEnabledCipherSuites(suites);
+        }
+
+        @Override
+        public void setEnabledProtocols(String[] protocols) {
+            delegate.setEnabledProtocols(protocols);
+        }
+
+        @Override
+        public void setNeedClientAuth(boolean need) {
+            delegate.setNeedClientAuth(need);
+        }
+
+        @Override
+        public void setUseClientMode(boolean mode) {
+            delegate.setUseClientMode(mode);
+        }
+
+        @Override
+        public void setWantClientAuth(boolean want) {
+            delegate.setWantClientAuth(want);
+        }
+
+        @Override
+        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer dst) throws SSLException {
+            return map(unwrapStep != null ? unwrapStep.apply(delegate, src, dst) : delegate.unwrap(src, dst));
+        }
+
+        @Override
+        public SSLEngineResult unwrap(ByteBuffer src, ByteBuffer[] dsts, int offset, int length) throws SSLException {
+            return delegate.unwrap(src, dsts, offset, length);
+        }
+
+        @Override
+        public SSLEngineResult wrap(ByteBuffer src, ByteBuffer dst) throws SSLException {
+            return map(wrapStep != null ? wrapStep.apply(delegate, src, dst) : delegate.wrap(src, dst));
+        }
+
+        @Override
+        public SSLEngineResult wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst) throws SSLException {
+            return delegate.wrap(srcs, offset, length, dst);
+        }
+
+        /**
+         * @return a context that hands out this engine: the socket asks for one engine per TLS session
+         */
+        SSLContext context() {
+            final var engine = this;
+            return new SSLContext(new SSLContextSpi() {
+                @Override
+                protected SSLEngine engineCreateSSLEngine() {
+                    return engine;
+                }
+
+                @Override
+                protected SSLEngine engineCreateSSLEngine(String host, int port) {
+                    return engine;
+                }
+
+                @Override
+                protected SSLSessionContext engineGetClientSessionContext() {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                protected SSLSessionContext engineGetServerSessionContext() {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                protected SSLServerSocketFactory engineGetServerSocketFactory() {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                protected SSLSocketFactory engineGetSocketFactory() {
+                    throw new UnsupportedOperationException();
+                }
+
+                @Override
+                protected void engineInit(KeyManager[] keyManagers, TrustManager[] trustManagers, SecureRandom random) {
+                }
+            }, null, "TLS") {
+            };
+        }
+
+        private SSLEngineResult.HandshakeStatus map(SSLEngineResult.HandshakeStatus status) {
+            return handshakeStatusMapper != null ? handshakeStatusMapper.apply(status) : status;
+        }
+
+        private SSLEngineResult map(SSLEngineResult result) {
+            return handshakeStatusMapper != null
+                    ? new SSLEngineResult(result.getStatus(), map(result.getHandshakeStatus()), result.bytesConsumed(), result.bytesProduced())
+                    : result;
         }
     }
 }
