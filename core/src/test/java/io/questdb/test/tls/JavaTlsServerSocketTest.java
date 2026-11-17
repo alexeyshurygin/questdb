@@ -427,6 +427,52 @@ public class JavaTlsServerSocketTest {
     }
 
     @Test
+    public void testEngineUnderflowOnHandshakeWrapFailsStart() throws Exception {
+        // A wrap has no input to run short of, so an engine that reports an underflow on a handshake wrap is broken:
+        // the handshake fails, as on any other handshake error, instead of throwing an Error at the caller.
+        final var engine = new ScriptedEngine();
+        engine.wrapStep = (delegate, src, dst) -> new SSLEngineResult(
+                SSLEngineResult.Status.BUFFER_UNDERFLOW,
+                SSLEngineResult.HandshakeStatus.NEED_WRAP,
+                0,
+                0
+        );
+        assertWithMemoryConnection(engine.context(), TLS_13, (client, server, transport, buf) -> {
+            // the ClientHello
+            client.pump();
+            try {
+                server.startTlsSession(null);
+                fail("the handshake must fail");
+            } catch (TlsSessionInitFailedException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "Buffer underflow during TLS handshake wrap");
+            }
+            assertFalse(server.isTlsSessionStarted());
+            assertFalse(server.isHandshakeInProgress());
+            assertEquals("nothing goes out", 0, transport.toClient.totalWritten);
+        });
+    }
+
+    @Test
+    public void testEngineUnderflowOnSendWrapFailsSend() throws Exception {
+        // A wrap of data has all the input it needs, so an engine that reports an underflow there is broken: send()
+        // fails the connection, as on any other engine error, instead of throwing an Error at the caller.
+        final var engine = new ScriptedEngine();
+        assertWithMemoryHandshake(engine.context(), -1, TLS_13, (client, server, transport, buf) -> {
+            engine.wrapStep = (delegate, src, dst) -> new SSLEngineResult(
+                    SSLEngineResult.Status.BUFFER_UNDERFLOW,
+                    SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING,
+                    0,
+                    0
+            );
+            final var sentBefore = transport.toClient.totalWritten;
+            putBytes(buf, pattern(100, 0));
+            assertEquals(-1, server.send(buf, 100));
+            assertEquals("nothing goes out", sentBefore, transport.toClient.totalWritten);
+            assertFalse(server.wantsTlsWrite());
+        });
+    }
+
+    @Test
     public void testEofInsideRecordAfterDataDeliversDataFirst() throws Exception {
         // One recv() reads a whole record, half of the next and the end of the stream: it returns the data of the
         // whole record, and the next call reports the disconnect.

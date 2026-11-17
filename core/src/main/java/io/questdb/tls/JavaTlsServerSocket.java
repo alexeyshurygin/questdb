@@ -363,7 +363,8 @@ public final class JavaTlsServerSocket implements Socket {
                 }
                 switch (result.getStatus()) {
                     case BUFFER_UNDERFLOW:
-                        throw new AssertionError("Underflow while reading a plain text. This should not happen, please report as a bug");
+                        // an SSLException, not an Error, so that the catch below fails the connection
+                        throw new SSLException("Underflow while reading a plain text. This should not happen, please report as a bug");
                     case BUFFER_OVERFLOW:
                         // the buffer was empty before the wrap: the record is larger than the whole buffer
                         growWrapOutputBuffer();
@@ -589,7 +590,8 @@ public final class JavaTlsServerSocket implements Socket {
                             flushHandshakeBytes();
                             throw TlsSessionInitFailedException.instance("TLS handshake failed: engine closed");
                         default:
-                            throw new AssertionError("Buffer underflow during TLS handshake wrap. This should not happen, please report as a bug");
+                            // a handshake failure, not an Error, so that the callers fail the connection
+                            throw TlsSessionInitFailedException.instance("Buffer underflow during TLS handshake wrap. This should not happen, please report as a bug");
                     }
                     break;
                 }
