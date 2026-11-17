@@ -46,9 +46,11 @@ import io.questdb.replication.codec.ReplicationIndex;
 import io.questdb.replication.store.ByteSink;
 import io.questdb.replication.store.ObjectStore;
 import io.questdb.replication.store.ObjectStoreException;
+import io.questdb.std.CharSequenceLongHashMap;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.FlyweightMessageContainer;
 import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
 import io.questdb.std.QuietCloseable;
 import io.questdb.std.Unsafe;
 import io.questdb.std.str.LPSZ;
@@ -63,6 +65,7 @@ import org.junit.Test;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
@@ -94,6 +97,31 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     private static final String FOREIGN_OWNER = "another-primary";
     private static final String LEASE_KEEPER_THREAD = "qdb-replication-lease";
     private static final String SEQUENCER_LOG = '/' + WalUtils.SEQ_DIR + '/' + WalUtils.TXNLOG_FILE_NAME;
+
+    @Test
+    public void testCheckpointHistoryLeavesOutTablesWithoutATransaction() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            try (Node node = newNode("r", replicaConfig(), store)) {
+                node.service.start();
+                final CharSequenceLongHashMap tables = new CharSequenceLongHashMap();
+                tables.put("a~1", 5);
+                // tables the checkpoint holds no transaction of
+                tables.put("b~2", Numbers.LONG_NULL);
+                tables.put("c~3", -1);
+                node.service.onCheckpointReleased(1_000_000L, tables);
+                final String key = StoreKeys.checkpointHistory(node.service.getInstanceId());
+                TestUtils.assertEventually(() -> Assert.assertTrue(store.contains(key)), 30);
+                final byte[] text = readObject(store, key);
+                final CheckpointHistory history = CheckpointHistory.decode(text, 0, text.length);
+                Assert.assertEquals(1, history.getCheckpoints().size());
+                final CheckpointHistory.Checkpoint checkpoint = history.getCheckpoints().get(0);
+                Assert.assertEquals(1_000_000L, checkpoint.getTimestamp());
+                Assert.assertEquals(1, checkpoint.getTables().size());
+                Assert.assertEquals(5, checkpoint.getSeqTxn("a~1"));
+            }
+        });
+    }
 
     @Test
     public void testCleanerCommitsItsPlanBeforeItDeletesAnything() throws Exception {
@@ -413,6 +441,94 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testCleanerSkipsDeleteListsItCannotReadAndObjectsOutsideTables() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final String own = "own-instance";
+            final String vanishing = StoreKeys.deleteList("vanishing");
+            store.setFaultHook((op, key) -> {
+                if (op.equals("get") && key.equals(vanishing)) {
+                    // the list goes between the listing and its read
+                    store.delete(key);
+                }
+            });
+            // what the cleaners of earlier runs left: objects to delete, and the lists that name them
+            store.putRaw("t/1_1/seq/0", new byte[]{1});
+            store.putRaw("t/2_2/seq/0", new byte[]{2});
+            store.putRaw("x/object", new byte[]{3});
+            store.putRaw(StoreKeys.deleteList("other"), envelope("t/1_1/seq/0\nx/object".getBytes(StandardCharsets.UTF_8)));
+            store.putRaw(StoreKeys.deleteList(own), envelope("t/2_2/seq/0".getBytes(StandardCharsets.UTF_8)));
+            store.putRaw(vanishing, envelope("t/1_1/seq/0".getBytes(StandardCharsets.UTF_8)));
+            store.putRaw(StoreKeys.deleteList("corrupt"), new byte[]{1, 2, 3});
+            // the node whose cleaner left its own list comes back
+            final java.nio.file.Path instanceFile = Paths.get(nodeDir("p"), ".replication", "instance");
+            Files.createDirectories(instanceFile.getParent());
+            Files.writeString(instanceFile, own);
+            final ReplicationConfigurationImpl config = primaryConfig()
+                    .setCleanerEnabled(true)
+                    .setCleanerInterval(20)
+                    .setCleanerCheckpointSource(false);
+            try (Node node = newNode("p", config, store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                Assert.assertEquals(own, node.service.getInstanceId());
+                // the cleaner deletes the table objects the lists name, then the lists, its own included
+                TestUtils.assertEventually(() -> {
+                    Assert.assertFalse(store.contains("t/1_1/seq/0"));
+                    Assert.assertFalse(store.contains("t/2_2/seq/0"));
+                    Assert.assertFalse(store.contains(StoreKeys.deleteList("other")));
+                    Assert.assertFalse(store.contains(StoreKeys.deleteList(own)));
+                }, 30);
+                // it deletes nothing outside the tables, whatever a list says, and leaves an unreadable list alone
+                Assert.assertTrue(store.contains("x/object"));
+                Assert.assertTrue(store.contains(StoreKeys.deleteList("corrupt")));
+                Assert.assertFalse(store.contains(vanishing));
+                Assert.assertEquals(EngineRole.PRIMARY, node.engine.getRole());
+            }
+        });
+    }
+
+    @Test
+    public void testDroppedTableOfAnEarlierTermStaysWhileItCoolsOff() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicInteger cleanerRuns = new AtomicInteger();
+            store.setFaultHook((op, key) -> {
+                // each cleaner run begins with a listing of the checkpoint histories
+                if (op.equals("list") && key.startsWith(StoreKeys.CHECKPOINTS_PREFIX)) {
+                    cleanerRuns.incrementAndGet();
+                }
+            });
+            final String prefix;
+            try (Node node = newNode("p", primaryConfig(), store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE gone (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                node.engine.execute("INSERT INTO gone VALUES ('2024-01-01', 1)");
+                awaitUploaded(node, store, "gone", 1);
+                prefix = StoreKeys.tablePrefix(entry(readIndex(store), "gone").getKey());
+                node.engine.execute("DROP TABLE gone");
+                TestUtils.assertEventually(() -> Assert.assertTrue(entry(readIndex(store), "gone").isDropped()), 30);
+            }
+            final int objects = countKeys(store, prefix);
+            Assert.assertTrue(objects > 0);
+
+            // the next term inherits the dropped table from the index; for an hour its cleaner keeps it
+            final ReplicationConfigurationImpl config = primaryConfig()
+                    .setCleanerEnabled(true)
+                    .setCleanerInterval(20);
+            try (Node node = newNode("p", config, store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                final int runs = cleanerRuns.get();
+                TestUtils.assertEventually(() -> Assert.assertTrue(cleanerRuns.get() >= runs + 2), 30);
+                Assert.assertTrue(entry(readIndex(store), "gone").isDropped());
+                Assert.assertEquals(objects, countKeys(store, prefix));
+            }
+        });
+    }
+
+    @Test
     public void testFailedSetupOfANewTableIsRetried() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
@@ -468,6 +584,33 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testFailedSetupsOfTwoNewTablesAreRetried() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final SequencerLogFacade ff = new SequencerLogFacade();
+            try (Node node = newNode("p", primaryConfig(), store, ff, false)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                // round after round, neither new table's sequencer log can be opened
+                ff.failOpens("/late");
+                node.engine.execute("CREATE TABLE late1 (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                node.engine.execute("CREATE TABLE late2 (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                node.engine.execute("INSERT INTO late1 VALUES ('2024-01-01', 1)");
+                node.engine.execute("INSERT INTO late2 VALUES ('2024-01-01', 2)");
+                // a round in progress fails at most both tables; four failures more mean a later round failed both
+                final int failures = ff.openFailures.get();
+                TestUtils.assertEventually(() -> Assert.assertTrue(ff.openFailures.get() >= failures + 4), 30);
+                ff.stopFailing();
+                // a later round sets both tables up and uploads them
+                awaitUploaded(node, store, "late1", 1);
+                awaitUploaded(node, store, "late2", 1);
+                Assert.assertEquals(EngineRole.PRIMARY, node.engine.getRole());
+            }
+            Assert.assertTrue(readIndex(store).isReleased());
+        });
+    }
+
+    @Test
     public void testForcedReplicaRoundBeforeTheStoreHasAnIndexAppliesNothing() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
@@ -490,6 +633,70 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
                 Assert.assertEquals(0, replica.service.syncReplicaOnce());
                 Assert.assertTrue(replica.engine.getDataID().isInitialized());
             }
+        });
+    }
+
+    @Test
+    public void testInterruptedStopDuringTheCleanersDeletesKeepsTheRestListed() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicReference<String> watchedPrefix = new AtomicReference<>();
+            final AtomicReference<Thread> coordinator = new AtomicReference<>();
+            final AtomicReference<Thread> heldDelete = new AtomicReference<>();
+            final CountDownLatch held = new CountDownLatch(1);
+            final CountDownLatch resume = new CountDownLatch(1);
+            store.setFaultHook((op, key) -> {
+                final String prefix = watchedPrefix.get();
+                if (prefix == null) {
+                    return;
+                }
+                if (op.equals("put") && key.startsWith(StoreKeys.DELETES_PREFIX) && COORDINATOR_THREAD.equals(Thread.currentThread().getName())) {
+                    coordinator.set(Thread.currentThread());
+                } else if (op.equals("delete") && key.startsWith(prefix) && heldDelete.compareAndSet(null, Thread.currentThread())) {
+                    // the cleaner's first delete outlasts the stop, interrupts included
+                    held.countDown();
+                    holdRequestThroughInterrupts(resume);
+                }
+            });
+            final ReplicationConfigurationImpl config = primaryConfig()
+                    .setSequencerPartTxnCount(2)
+                    .setCleanerEnabled(true)
+                    .setCleanerInterval(20)
+                    .setCleanerDroppedTableCooloff(0)
+                    .setCleanerDeleteConcurrency(4);
+            final String prefix;
+            final String list;
+            try (Node node = newNode("p", config, store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE gone (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                for (int i = 1; i <= 6; i++) {
+                    node.engine.execute("INSERT INTO gone VALUES ('2024-01-0" + i + "', " + i + ')');
+                    awaitUploaded(node, store, "gone", i);
+                }
+                prefix = StoreKeys.tablePrefix(entry(readIndex(store), "gone").getKey());
+                // the create manifest, three log parts and six deltas: more than one batch of four deletes
+                Assert.assertTrue(countKeys(store, prefix) > 8);
+                list = StoreKeys.deleteList(node.service.getInstanceId());
+                watchedPrefix.set(prefix);
+                node.engine.execute("DROP TABLE gone");
+                try {
+                    Assert.assertTrue(held.await(30, TimeUnit.SECONDS));
+                    // a stop asked for on an interrupted thread interrupts the coordinator, which stops waiting for
+                    // the delete, and the stop keeps its interrupt
+                    Assert.assertTrue(runInterrupted(node.service::close));
+                } finally {
+                    resume.countDown();
+                }
+                heldDelete.get().join(60_000);
+                Assert.assertFalse(heldDelete.get().isAlive());
+                coordinator.get().join(60_000);
+                Assert.assertFalse(coordinator.get().isAlive());
+            }
+            // the cleaner stopped after that batch: its delete list still names the objects it had not deleted
+            Assert.assertTrue(countKeys(store, prefix) > 0);
+            Assert.assertTrue(store.contains(list));
+            Assert.assertNull(entry(readIndex(store), "gone"));
         });
     }
 
@@ -1408,6 +1615,42 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
     }
 
     @Test
+    public void testStructuralChangeDuringHousekeepingIsUploadedAtOnce() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicReference<Runnable> onHistoryWrite = new AtomicReference<>();
+            store.setFaultHook((op, key) -> {
+                if (op.equals("put") && key.startsWith(StoreKeys.CHECKPOINTS_PREFIX) && COORDINATOR_THREAD.equals(Thread.currentThread().getName())) {
+                    final Runnable action = onHistoryWrite.getAndSet(null);
+                    if (action != null) {
+                        action.run();
+                    }
+                }
+            });
+            // between its checks for uploads, the coordinator waits a quarter of the throttle window: 150 s here
+            final ReplicationConfigurationImpl config = primaryConfig()
+                    .setKeepaliveInterval(600_000)
+                    .setThrottleWindowDuration(600_000);
+            try (Node node = newNode("p", config, store)) {
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                awaitUploaded(node, store, "t", 0);
+                // data waits for the throttle window
+                node.engine.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                // A structural change commits while the coordinator records a checkpoint, after it checked for
+                // uploads and before it waits: the wake-up the change sends finds nobody waiting. The coordinator
+                // does not wait, and uploads what the change asks for, with the data before it.
+                final TableToken token = node.engine.verifyTableName("t");
+                onHistoryWrite.set(() -> node.service.onCommit(token, 2, true));
+                node.service.onCheckpointReleased(1_000_000L, new CharSequenceLongHashMap());
+                awaitUploaded(node, store, "t", 1);
+                Assert.assertNull(onHistoryWrite.get());
+            }
+        });
+    }
+
+    @Test
     public void testTableCreatedWhileTheNodeDrainsKeepsTheLeaseHeld() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final MemoryObjectStore store = new MemoryObjectStore();
@@ -1604,6 +1847,47 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
         });
     }
 
+    @Test
+    public void testUploadRoundWithNothingNewSendsADueKeepalive() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final MemoryObjectStore store = new MemoryObjectStore();
+            final AtomicLong clockOffset = new AtomicLong();
+            final AtomicReference<Runnable> onHistoryWrite = new AtomicReference<>();
+            store.setFaultHook((op, key) -> {
+                if (op.equals("put") && key.startsWith(StoreKeys.CHECKPOINTS_PREFIX) && COORDINATOR_THREAD.equals(Thread.currentThread().getName())) {
+                    final Runnable action = onHistoryWrite.getAndSet(null);
+                    if (action != null) {
+                        action.run();
+                    }
+                }
+            });
+            try (Node node = newNode("p", primaryConfig(), store)) {
+                node.engine.setNanoClockForTesting(() -> System.nanoTime() + clockOffset.get());
+                // the lease keeper renews nothing: only the coordinator writes the index
+                node.service.setStallLimitForTesting(0);
+                node.service.start();
+                awaitRole(node, EngineRole.PRIMARY);
+                node.engine.execute("CREATE TABLE t (ts TIMESTAMP, v LONG) TIMESTAMP(ts) PARTITION BY DAY WAL");
+                node.engine.execute("INSERT INTO t VALUES ('2024-01-01', 1)");
+                awaitUploaded(node, store, "t", 1);
+                final long sequence = readIndex(store).getSequence();
+                final TableToken token = node.engine.verifyTableName("t");
+                // While the coordinator records a checkpoint, the keepalive interval passes, and a change of the
+                // table is reported that brings nothing new to upload. The upload round that follows uploads
+                // nothing, and commits the index all the same: the keepalive is due.
+                onHistoryWrite.set(() -> {
+                    clockOffset.set(TimeUnit.SECONDS.toNanos(61));
+                    node.service.onCommit(token, 1, true);
+                });
+                node.service.onCheckpointReleased(1_000_000L, new CharSequenceLongHashMap());
+                TestUtils.assertEventually(() -> Assert.assertEquals(sequence + 1, readIndex(store).getSequence()), 30);
+                Assert.assertNull(onHistoryWrite.get());
+                Assert.assertEquals(1, entry(readIndex(store), "t").getLastTxn());
+                Assert.assertEquals(EngineRole.PRIMARY, node.engine.getRole());
+            }
+        });
+    }
+
     // lets the node take over a store it does not own or is behind, on its next start
     private static void allowPromotion(Node node) throws IOException {
         Files.createFile(node.marker());
@@ -1722,6 +2006,27 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
         return idx;
     }
 
+    // holds a store request until the latch opens, through any interrupt, which the thread keeps
+    private static void holdRequestThroughInterrupts(CountDownLatch latch) {
+        boolean isInterrupted = false;
+        try {
+            while (true) {
+                try {
+                    if (!latch.await(60, TimeUnit.SECONDS)) {
+                        throw new AssertionError("the test did not release the request");
+                    }
+                    return;
+                } catch (InterruptedException e) {
+                    isInterrupted = true;
+                }
+            }
+        } finally {
+            if (isInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
     private static Node newNode(String name, ReplicationConfigurationImpl config, ObjectStore store) {
         return newNode(name, config, store, TestFilesFacadeImpl.INSTANCE, false);
     }
@@ -1797,7 +2102,13 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
 
     // the index the store holds, read past its fault hook
     private static ReplicationIndex readIndex(MemoryObjectStore store) {
-        final byte[] stored = store.getBytes(IndexClient.INDEX_KEY);
+        final byte[] text = readObject(store, IndexClient.INDEX_KEY);
+        return text != null ? ReplicationIndex.decode(text, 0, text.length) : null;
+    }
+
+    // the content of an object the replication services wrote, read past the store's fault hook; null when absent
+    private static byte[] readObject(MemoryObjectStore store, String key) {
+        final byte[] stored = store.getBytes(key);
         if (stored == null) {
             return null;
         }
@@ -1805,7 +2116,7 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
             envelope.decode(stored, stored.length, raw);
             final byte[] text = new byte[(int) raw.size()];
             Unsafe.copyMemory(null, raw.ptr(), text, Unsafe.BYTE_OFFSET, text.length);
-            return ReplicationIndex.decode(text, 0, text.length);
+            return text;
         }
     }
 
@@ -1815,6 +2126,30 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
                 .setReplicaPollInterval(10)
                 .setRetryInterval(10)
                 .setRequestBaseTimeout(100);
+    }
+
+    // runs the action on a thread whose interrupt is set; true when the interrupt is still set afterwards
+    private static boolean runInterrupted(Runnable action) throws InterruptedException {
+        final AtomicBoolean isStillInterrupted = new AtomicBoolean();
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        final Thread thread = new Thread(() -> {
+            Thread.currentThread().interrupt();
+            try {
+                action.run();
+            } catch (Throwable th) {
+                failure.set(th);
+            } finally {
+                isStillInterrupted.set(Thread.interrupted());
+                io.questdb.std.str.Path.clearThreadLocals();
+            }
+        }, "test-interrupted-caller");
+        thread.start();
+        thread.join(60_000);
+        Assert.assertFalse(thread.isAlive());
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        return isStillInterrupted.get();
     }
 
     // the transaction log parts of a table in the store
@@ -1917,6 +2252,10 @@ public class ReplicationRoundEdgeCaseTest extends AbstractTest {
             isOpenFailing = false;
             isOpenFailingAlways = false;
             this.tableDirPart = tableDirPart;
+        }
+
+        private void stopFailing() {
+            tableDirPart = null;
         }
     }
 }
