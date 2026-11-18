@@ -1,7 +1,19 @@
 FROM debian:bookworm AS builder
 
 ARG tag_name
-ARG GRAAL_JDK_VERSION=25.0.2
+# Oracle GraalVM for JDK 25, licensed under the GraalVM Free Terms and
+# Conditions (GFTC). 25.0.5.1 is the November 2026 Critical Security Patch
+# Update, built on Oracle JDK 25.0.5.1+4; it fixes CVE-2026-114938, which
+# affects JDK 25.0.5.0.3 and earlier, including GraalVM CE 25.0.2.
+# Oracle serves these archives from the GraalVM Download Service (GDS), the
+# same source SDKMAN uses for 25.0.5.1-graal. The artifact ids and SHA-256
+# values below come from the GDS artifact listing for release 25.0.5.1; a
+# version bump needs all four values replaced together.
+ARG GRAAL_JDK_VERSION=25.0.5.1
+ARG GRAAL_GDS_ARTIFACT_AMD64=3463261B18A64C2A9362B37B7B3CE4A2
+ARG GRAAL_SHA256_AMD64=b3505b8e8f73726885044820f7de593c7b0273c691286655cdb7ece2a23ad75a
+ARG GRAAL_GDS_ARTIFACT_ARM64=9ECF73F3B5474400B4A1441B688B1438
+ARG GRAAL_SHA256_ARM64=a851787f392e43da695531cd3fc6b889cfa7d1b9d71503c9e6adbfcdafd0c83d
 ARG TARGETARCH
 
 ENV GOSU_VERSION=1.19-go1.25.14
@@ -16,42 +28,30 @@ RUN apt-get update \
        git curl wget gnupg2 ca-certificates lsb-release software-properties-common unzip maven \
     && rm -rf /var/lib/apt/lists/*
 
-# 2) Download GraalVM CE archive + SHA256, arch-aware
+# 2) Download Oracle GraalVM, verify the pinned SHA256 and install it.
+# The checksum is pinned in this file rather than fetched next to the archive,
+# so a replaced or tampered download fails the build instead of passing.
 RUN set -eux; \
     : "${TARGETARCH:=amd64}"; \
     case "$TARGETARCH" in \
-      amd64) ARCH_SUFFIX="linux-x64" ;; \
-      arm64) ARCH_SUFFIX="linux-aarch64" ;; \
+      amd64) ARTIFACT="${GRAAL_GDS_ARTIFACT_AMD64}"; HASH="${GRAAL_SHA256_AMD64}" ;; \
+      arm64) ARTIFACT="${GRAAL_GDS_ARTIFACT_ARM64}"; HASH="${GRAAL_SHA256_ARM64}" ;; \
       *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    echo "Building for TARGETARCH=${TARGETARCH}, using GraalVM suffix ${ARCH_SUFFIX}"; \
-    TAG="jdk-${GRAAL_JDK_VERSION}"; \
-    FILENAME="graalvm-community-jdk-${GRAAL_JDK_VERSION}_${ARCH_SUFFIX}_bin.tar.gz"; \
-    BASE_URL="https://github.com/graalvm/graalvm-ce-builds/releases/download/${TAG}"; \
+    echo "Building for TARGETARCH=${TARGETARCH}, using Oracle GraalVM ${GRAAL_JDK_VERSION} (GDS artifact ${ARTIFACT})"; \
+    FILENAME="graalvm-jdk-${GRAAL_JDK_VERSION}.tar.gz"; \
     mkdir -p /tmp/graalvm; \
     cd /tmp/graalvm; \
-    curl -L -o "${FILENAME}" "${BASE_URL}/${FILENAME}"; \
-    curl -L -o "${FILENAME}.sha256" "${BASE_URL}/${FILENAME}.sha256"
-
-# 3) Verify SHA256 and install GraalVM CE
-RUN set -eux; \
-    : "${TARGETARCH:=amd64}"; \
-    case "$TARGETARCH" in \
-      amd64) ARCH_SUFFIX="linux-x64" ;; \
-      arm64) ARCH_SUFFIX="linux-aarch64" ;; \
-      *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
-    esac; \
-    cd /tmp/graalvm; \
-    FILENAME="graalvm-community-jdk-${GRAAL_JDK_VERSION}_${ARCH_SUFFIX}_bin.tar.gz"; \
-    # .sha256 contains only the hash, so wrap it with filename for sha256sum -c
-    HASH="$(cut -d ' ' -f1 "${FILENAME}.sha256")"; \
+    curl -fL -o "${FILENAME}" "https://gds.oracle.com/api/20220101/artifacts/${ARTIFACT}/content"; \
     echo "${HASH}  ${FILENAME}" | sha256sum -c -; \
-    INSTALL_DIR="/usr/lib/jvm/graalvm-community-jdk-${GRAAL_JDK_VERSION}"; \
+    INSTALL_DIR="/usr/lib/jvm/graalvm-jdk-${GRAAL_JDK_VERSION}"; \
     mkdir -p "${INSTALL_DIR}"; \
     tar -xzf "${FILENAME}" -C "${INSTALL_DIR}" --strip-components=1; \
-    rm -rf /tmp/graalvm
+    cd /; \
+    rm -rf /tmp/graalvm; \
+    "${INSTALL_DIR}/bin/java" -version
 
-ENV JAVA_HOME=/usr/lib/jvm/graalvm-community-jdk-${GRAAL_JDK_VERSION}
+ENV JAVA_HOME=/usr/lib/jvm/graalvm-jdk-${GRAAL_JDK_VERSION}
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 RUN echo tag_name ${tag_name:-master}
